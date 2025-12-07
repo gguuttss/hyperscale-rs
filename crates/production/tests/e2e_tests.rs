@@ -5,6 +5,7 @@
 
 mod fixtures;
 
+use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_production::{
     ProductionRunner, RocksDbStorage, ThreadPoolConfig, ThreadPoolManager,
@@ -12,7 +13,6 @@ use hyperscale_production::{
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
-use fixtures::TestFixtures;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;

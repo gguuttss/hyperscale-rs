@@ -112,7 +112,7 @@ pub enum Action {
         block_hash: Hash,
     },
 
-    /// Execute a batch of transactions.
+    /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
     /// Returns `Event::TransactionsExecuted` when complete.
@@ -120,6 +120,20 @@ pub enum Action {
         block_hash: Hash,
         transactions: Vec<RoutableTransaction>,
         state_root: Hash,
+    },
+
+    /// Execute a cross-shard transaction with provisioned state.
+    ///
+    /// Used after 2PC provisioning completes. The runner executes the transaction
+    /// using the provided provisions and returns the result.
+    /// Returns `Event::CrossShardTransactionExecuted` when complete.
+    ExecuteCrossShardTransaction {
+        /// Transaction hash (for correlation).
+        tx_hash: Hash,
+        /// The transaction to execute.
+        transaction: RoutableTransaction,
+        /// State provisions from other shards.
+        provisions: Vec<StateProvision>,
     },
 
     /// Compute a merkle root from state changes.
@@ -229,6 +243,7 @@ impl Action {
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::ExecuteTransactions { .. }
+                | Action::ExecuteCrossShardTransaction { .. }
                 | Action::ComputeMerkleRoot { .. }
                 | Action::FetchStateEntries { .. }
                 | Action::FetchBlock { .. }

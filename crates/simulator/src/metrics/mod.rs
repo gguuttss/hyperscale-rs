@@ -2,8 +2,8 @@
 //!
 //! Provides latency histograms, TPS tracking, lock contention stats, and comprehensive reports.
 
-use hyperscale_mempool::LockContentionStats;
 use hdrhistogram::Histogram;
+use hyperscale_mempool::LockContentionStats;
 use std::time::Duration;
 
 /// Collects metrics during a simulation run.

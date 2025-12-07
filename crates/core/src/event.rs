@@ -217,10 +217,18 @@ pub enum Event {
         valid: bool,
     },
 
-    /// Transaction execution completed.
+    /// Single-shard transaction execution completed.
     TransactionsExecuted {
         block_hash: Hash,
         results: Vec<ExecutionResult>,
+    },
+
+    /// Cross-shard transaction execution completed.
+    ///
+    /// Callback from `Action::ExecuteCrossShardTransaction`.
+    CrossShardTransactionExecuted {
+        tx_hash: Hash,
+        result: ExecutionResult,
     },
 
     /// Merkle root computation completed.
@@ -332,6 +340,7 @@ impl Event {
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
             | Event::TransactionsExecuted { .. }
+            | Event::CrossShardTransactionExecuted { .. }
             | Event::MerkleRootComputed { .. }
             | Event::StateEntriesFetched { .. }
             | Event::BlockFetched { .. }

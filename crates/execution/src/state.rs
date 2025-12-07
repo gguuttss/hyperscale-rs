@@ -779,24 +779,52 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Execute a cross-shard transaction with provisioned state (Phase 3).
+    ///
+    /// Emits `Action::ExecuteCrossShardTransaction` to delegate execution to the runner.
+    /// When execution completes, `on_cross_shard_execution_complete` handles the result.
     fn execute_with_provisions(&mut self, tx: RoutableTransaction) -> Vec<Action> {
-        let mut actions = Vec::new();
         let tx_hash = tx.hash();
         let local_shard = self.local_shard();
 
         tracing::debug!(tx_hash = ?tx_hash, shard = local_shard.0, "Executing with provisions");
 
+        // Get the provisions we collected
+        let provisions = self
+            .completed_provisions
+            .remove(&tx_hash)
+            .unwrap_or_default();
+
         // Emit status change: Provisioned → Executing
-        actions.push(self.emit_status_change(tx_hash, TransactionStatus::Executing));
+        let mut actions = vec![self.emit_status_change(tx_hash, TransactionStatus::Executing)];
 
-        // In a real implementation, we'd execute the transaction here
-        // For now, create a vote with success=true and zero merkle root
+        // Delegate execution to the runner
+        actions.push(Action::ExecuteCrossShardTransaction {
+            tx_hash,
+            transaction: tx,
+            provisions,
+        });
 
-        let merkle_root = Hash::from_bytes(&[0u8; 32]); // Would be computed from actual execution
-        let success = true;
+        actions
+    }
 
-        // Create vote
-        let vote = self.create_vote(tx_hash, merkle_root, success);
+    /// Handle cross-shard transaction execution completion.
+    ///
+    /// Called when the runner completes `Action::ExecuteCrossShardTransaction`.
+    /// Creates and broadcasts a vote based on the execution result.
+    pub fn on_cross_shard_execution_complete(&mut self, result: ExecutionResult) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let tx_hash = result.transaction_hash;
+        let local_shard = self.local_shard();
+
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            success = result.success,
+            state_root = ?result.state_root,
+            "Cross-shard execution complete, creating vote"
+        );
+
+        // Create vote from execution result
+        let vote = self.create_vote(tx_hash, result.state_root, result.success);
 
         // Broadcast vote to local shard
         let gossip = StateVoteBlockGossip { vote: vote.clone() };
@@ -1389,6 +1417,9 @@ impl SubStateMachine for ExecutionState {
                 block_hash,
                 results,
             } => Some(self.on_execution_complete(*block_hash, results.clone())),
+            Event::CrossShardTransactionExecuted { result, .. } => {
+                Some(self.on_cross_shard_execution_complete(result.clone()))
+            }
             Event::StateProvisionReceived { provision } => {
                 Some(self.on_provision(provision.clone()))
             }

@@ -100,6 +100,8 @@ pub struct ProductionRunner {
     sync_manager: Option<SyncManager>,
     /// Local shard for network broadcasts.
     local_shard: ShardGroupId,
+    /// Network topology (needed for cross-shard execution).
+    topology: Arc<dyn Topology>,
     /// Block storage (optional - None for testing without persistence).
     /// Wrapped in RwLock for thread-safe mutable access from execution thread pool.
     storage: Option<Arc<RwLock<RocksDbStorage>>>,
@@ -167,7 +169,7 @@ impl ProductionRunner {
         let (event_tx, event_rx) = mpsc::channel(channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let local_shard = topology.local_shard();
-        let state = NodeStateMachine::new(node_index, topology, signing_key, bft_config);
+        let state = NodeStateMachine::new(node_index, topology.clone(), signing_key, bft_config);
         let timer_manager = TimerManager::new(event_tx.clone());
 
         Ok(Self {
@@ -182,6 +184,7 @@ impl ProductionRunner {
             network: None,
             sync_manager: None,
             local_shard,
+            topology,
             storage: None,
             executor: None,
             sync_request_rx: None,
@@ -256,6 +259,7 @@ impl ProductionRunner {
             network: Some(network),
             sync_manager: Some(sync_manager),
             local_shard,
+            topology,
             storage,
             executor,
             sync_request_rx: Some(sync_request_rx),
@@ -651,6 +655,84 @@ impl ProductionRunner {
                     let _ = event_tx.blocking_send(Event::TransactionsExecuted {
                         block_hash,
                         results,
+                    });
+                });
+            }
+
+            // Cross-shard transaction execution with provisions
+            Action::ExecuteCrossShardTransaction {
+                tx_hash,
+                transaction,
+                provisions,
+            } => {
+                let event_tx = self.event_tx.clone();
+                let storage = self.storage.clone();
+                let executor = self.executor.clone();
+                let topology = self.topology.clone();
+                let local_shard = self.local_shard;
+
+                self.thread_pools.spawn_execution(move || {
+                    let result = match (storage, executor) {
+                        (Some(storage), Some(executor)) => {
+                            // Determine which nodes are local to this shard
+                            let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
+                                topology.shard_for_node_id(node_id) == local_shard
+                            };
+
+                            // Execute with provisions
+                            let mut storage_guard = storage.write();
+                            match executor.execute_cross_shard(
+                                &mut *storage_guard,
+                                &[transaction],
+                                &provisions,
+                                is_local_node,
+                            ) {
+                                Ok(output) => {
+                                    if let Some(r) = output.results().first() {
+                                        hyperscale_types::ExecutionResult {
+                                            transaction_hash: r.tx_hash,
+                                            success: r.success,
+                                            state_root: r.outputs_merkle_root,
+                                            writes: r.state_writes.clone(),
+                                            error: r.error.clone(),
+                                        }
+                                    } else {
+                                        hyperscale_types::ExecutionResult {
+                                            transaction_hash: tx_hash,
+                                            success: false,
+                                            state_root: hyperscale_types::Hash::ZERO,
+                                            writes: vec![],
+                                            error: Some("No execution result".to_string()),
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
+                                    hyperscale_types::ExecutionResult {
+                                        transaction_hash: tx_hash,
+                                        success: false,
+                                        state_root: hyperscale_types::Hash::ZERO,
+                                        writes: vec![],
+                                        error: Some(format!("{}", e)),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::warn!("No storage/executor configured for cross-shard execution");
+                            hyperscale_types::ExecutionResult {
+                                transaction_hash: tx_hash,
+                                success: false,
+                                state_root: hyperscale_types::Hash::ZERO,
+                                writes: vec![],
+                                error: Some("No executor configured".to_string()),
+                            }
+                        }
+                    };
+
+                    let _ = event_tx.blocking_send(Event::CrossShardTransactionExecuted {
+                        tx_hash,
+                        result,
                     });
                 });
             }

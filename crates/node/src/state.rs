@@ -290,8 +290,7 @@ impl StateMachine for NodeStateMachine {
                 let deferred = self.livelock.get_pending_deferrals();
                 // Get timed-out transactions from mempool
                 // Config: 30 blocks timeout, max 3 retries (per design Decision #27)
-                let current_height =
-                    hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
+                let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
                 let aborted = self.mempool.get_timed_out_transactions(
                     current_height,
                     30, // execution_timeout_blocks
@@ -328,8 +327,7 @@ impl StateMachine for NodeStateMachine {
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let txs = self.mempool.ready_transactions(max_txs);
                 let deferred = self.livelock.get_pending_deferrals();
-                let current_height =
-                    hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
+                let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
                 let aborted = self.mempool.get_timed_out_transactions(
                     current_height,
                     30, // execution_timeout_blocks
@@ -418,6 +416,7 @@ impl StateMachine for NodeStateMachine {
 
             // Other execution events
             Event::TransactionsExecuted { .. }
+            | Event::CrossShardTransactionExecuted { .. }
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
             | Event::MerkleRootComputed { .. }

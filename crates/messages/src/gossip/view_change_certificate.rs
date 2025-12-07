@@ -39,9 +39,7 @@ impl ShardMessage for ViewChangeCertificateGossip {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{
-        BlockHeight, QuorumCertificate, Signature, SignerBitfield, VotePower,
-    };
+    use hyperscale_types::{BlockHeight, QuorumCertificate, Signature, SignerBitfield, VotePower};
 
     fn make_test_certificate() -> ViewChangeCertificate {
         let mut signers = SignerBitfield::new(4);

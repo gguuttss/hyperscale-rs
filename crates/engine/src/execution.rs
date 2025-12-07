@@ -3,9 +3,7 @@
 //! Provides an overlay that combines local storage with provisions from other shards.
 
 use crate::error::ExecutionError;
-use hyperscale_types::{
-    Hash, NodeId, PartitionNumber, StateEntry, StateProvision, SubstateWrite,
-};
+use hyperscale_types::{Hash, NodeId, PartitionNumber, StateEntry, StateProvision, SubstateWrite};
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::DatabaseUpdate;
 use radix_engine::transaction::{

@@ -265,10 +265,7 @@ impl SimulationRunner {
     pub fn has_committed_block(&self, node: NodeIndex, height: u64) -> bool {
         self.node_storage
             .get(node as usize)
-            .map(|s| {
-                s.get_block(hyperscale_types::BlockHeight(height))
-                    .is_some()
-            })
+            .map(|s| s.get_block(hyperscale_types::BlockHeight(height)).is_some())
             .unwrap_or(false)
     }
 
@@ -730,6 +727,68 @@ impl SimulationRunner {
                         block_hash,
                         results,
                     },
+                );
+            }
+
+            Action::ExecuteCrossShardTransaction {
+                tx_hash,
+                transaction,
+                provisions,
+            } => {
+                // Execute cross-shard transaction with provisions using the node's Radix Engine
+                let storage = &mut self.node_storage[from as usize];
+                let executor = &self.node_executor[from as usize];
+
+                // Determine which nodes are local to this shard
+                let local_shard = self.nodes[from as usize].shard();
+                let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
+                    self.nodes[from as usize]
+                        .topology()
+                        .shard_for_node_id(node_id)
+                        == local_shard
+                };
+
+                let result = match executor.execute_cross_shard(
+                    storage,
+                    &[transaction],
+                    &provisions,
+                    is_local_node,
+                ) {
+                    Ok(output) => {
+                        if let Some(r) = output.results().first() {
+                            hyperscale_types::ExecutionResult {
+                                transaction_hash: r.tx_hash,
+                                success: r.success,
+                                state_root: r.outputs_merkle_root,
+                                writes: r.state_writes.clone(),
+                                error: r.error.clone(),
+                            }
+                        } else {
+                            hyperscale_types::ExecutionResult {
+                                transaction_hash: tx_hash,
+                                success: false,
+                                state_root: hyperscale_types::Hash::ZERO,
+                                writes: vec![],
+                                error: Some("No execution result".to_string()),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(node = from, ?tx_hash, error = %e, "Cross-shard transaction execution failed");
+                        hyperscale_types::ExecutionResult {
+                            transaction_hash: tx_hash,
+                            success: false,
+                            state_root: hyperscale_types::Hash::ZERO,
+                            writes: vec![],
+                            error: Some(format!("{}", e)),
+                        }
+                    }
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::CrossShardTransactionExecuted { tx_hash, result },
                 );
             }
 

@@ -10,9 +10,9 @@ use super::codec::{decode_message, encode_message, CodecError};
 use super::config::Libp2pConfig;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
+use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_types::{ShardGroupId, ValidatorId};
-use futures::StreamExt;
 use libp2p::{
     gossipsub, identity, kad,
     request_response::{self, ProtocolSupport, ResponseChannel},
