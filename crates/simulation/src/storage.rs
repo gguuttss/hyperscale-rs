@@ -155,6 +155,32 @@ impl SimStorage {
         self.certificates.get(hash).cloned()
     }
 
+    /// Atomically commit a certificate and its state writes.
+    ///
+    /// This is the deferred commit operation that applies state writes when
+    /// a `TransactionCertificate` is included in a committed block. It mirrors
+    /// the production `RocksDbStorage::commit_certificate_with_writes()` to
+    /// ensure DST catches timing bugs where code incorrectly assumes state
+    /// is available before certificate persistence.
+    ///
+    /// # Arguments
+    ///
+    /// * `certificate` - The transaction certificate to store
+    /// * `writes` - The state writes from the certificate's shard_proofs for the local shard
+    pub fn commit_certificate_with_writes(
+        &mut self,
+        certificate: &TransactionCertificate,
+        writes: &[hyperscale_types::SubstateWrite],
+    ) {
+        // 1. Commit state writes
+        let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
+        self.commit(&updates);
+
+        // 2. Store certificate
+        self.certificates
+            .insert(certificate.transaction_hash, certificate.clone());
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Own vote storage (BFT safety)
     // ═══════════════════════════════════════════════════════════════════════

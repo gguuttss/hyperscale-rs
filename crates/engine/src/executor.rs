@@ -10,14 +10,23 @@
 //! `Event::TransactionsExecuted`. The runner owns the storage and executor,
 //! calling the executor methods to handle these actions.
 //!
+//! **IMPORTANT**: The executor is READ-ONLY. It does NOT commit state changes
+//! to storage. Writes are collected in the execution result and committed later
+//! by the runner when a `TransactionCertificate` is included in a committed block.
+//! This ensures all validators agree on the state before it's persisted.
+//!
 //! ```text
 //! State Machine → Action::ExecuteTransactions { ... }
 //!      ↓
 //! Runner (owns storage + executor)
 //!      ↓
-//!      → executor.execute_single_shard(&storage, &transactions)
+//!      → executor.execute_single_shard(&storage, &transactions)  // READ-ONLY
 //!      ↓
-//! Runner → Event::TransactionsExecuted { results }
+//! Runner → Event::TransactionsExecuted { results }  // results contain writes
+//!      ↓
+//! ... voting, certificate creation, block inclusion ...
+//!      ↓
+//! Runner → Action::PersistTransactionCertificate  // WRITES COMMITTED HERE
 //! ```
 
 use crate::error::ExecutionError;
@@ -33,7 +42,6 @@ use hyperscale_types::{
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::VmModules;
-use radix_substate_store_interface::interface::DatabaseUpdates;
 use radix_transactions::validation::TransactionValidator;
 
 /// Synchronous Radix Engine executor for deterministic simulation.
@@ -95,14 +103,17 @@ impl RadixExecutor {
         Ok(())
     }
 
-    /// Execute single-shard transactions.
+    /// Execute single-shard transactions (READ-ONLY).
     ///
     /// Optimized path for transactions that only touch local shard state.
-    /// Each transaction is executed against the current state, and successful
-    /// results are committed to storage.
+    /// Each transaction is executed against a snapshot of the current state.
+    ///
+    /// **IMPORTANT**: This method does NOT commit state changes. The writes
+    /// are returned in the `ExecutionOutput` and should be committed later
+    /// when the `TransactionCertificate` is included in a committed block.
     pub fn execute_single_shard<S: SubstateStore>(
         &self,
-        storage: &mut S,
+        storage: &S,
         transactions: &[RoutableTransaction],
     ) -> Result<ExecutionOutput, ExecutionError> {
         let mut results = Vec::with_capacity(transactions.len());
@@ -115,16 +126,22 @@ impl RadixExecutor {
         Ok(ExecutionOutput::new(results))
     }
 
-    /// Execute cross-shard transactions with provisions.
+    /// Execute cross-shard transactions with provisions (READ-ONLY).
     ///
-    /// Layers provisions on top of local storage, executes, and commits
-    /// only local shard state changes.
+    /// Layers provisions on top of local storage and executes transactions.
+    ///
+    /// **IMPORTANT**: This method does NOT commit state changes. The writes
+    /// are returned in the `ExecutionOutput` and should be committed later
+    /// when the `TransactionCertificate` is included in a committed block.
+    ///
+    /// Note: The `is_local_node` parameter is kept for future use when we
+    /// need to filter writes in the result, but commits are now deferred.
     pub fn execute_cross_shard<S: SubstateStore>(
         &self,
-        storage: &mut S,
+        storage: &S,
         transactions: &[RoutableTransaction],
         provisions: &[StateProvision],
-        is_local_node: impl Fn(&NodeId) -> bool,
+        _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let mut results = Vec::with_capacity(transactions.len());
 
@@ -150,10 +167,8 @@ impl RadixExecutor {
             let result =
                 self.receipt_to_cross_shard_result(tx.hash(), &receipt, &tx.declared_writes);
 
-            // Commit local shard writes if successful
-            if result.success {
-                self.commit_local_writes(storage, &receipt, &is_local_node);
-            }
+            // NO COMMIT HERE - writes are returned in result.state_writes
+            // They will be committed later when TransactionCertificate is included in a block
 
             results.push(result);
         }
@@ -161,10 +176,13 @@ impl RadixExecutor {
         Ok(ExecutionOutput::new(results))
     }
 
-    /// Execute a single transaction.
+    /// Execute a single transaction (READ-ONLY).
+    ///
+    /// Executes against a snapshot and returns the result with collected writes.
+    /// Does NOT commit to storage - that happens later during certificate persistence.
     fn execute_one<S: SubstateStore>(
         &self,
-        storage: &mut S,
+        storage: &S,
         tx: &RoutableTransaction,
     ) -> Result<SingleTxResult, ExecutionError> {
         // Take a snapshot for isolated execution
@@ -187,10 +205,8 @@ impl RadixExecutor {
 
         let result = self.receipt_to_result(tx.hash(), &receipt);
 
-        // Commit to live storage if successful
-        if result.success {
-            self.commit_all_writes(storage, &receipt);
-        }
+        // NO COMMIT HERE - writes are returned in result.state_writes
+        // They will be committed later when TransactionCertificate is included in a block
 
         Ok(result)
     }
@@ -248,48 +264,10 @@ impl RadixExecutor {
         }
     }
 
-    /// Commit all state writes to storage.
-    fn commit_all_writes<S: SubstateStore>(&self, storage: &mut S, receipt: &TransactionReceipt) {
-        use crate::execution::extract_state_updates;
-
-        if let Some(updates) = extract_state_updates(receipt) {
-            storage.commit(&updates);
-        }
-    }
-
-    /// Commit only local shard writes to storage.
-    fn commit_local_writes<S: SubstateStore>(
-        &self,
-        storage: &mut S,
-        receipt: &TransactionReceipt,
-        is_local_node: impl Fn(&NodeId) -> bool,
-    ) {
-        use crate::execution::extract_state_updates;
-
-        let Some(updates) = extract_state_updates(receipt) else {
-            return;
-        };
-
-        // Filter to local shard
-        let mut filtered = DatabaseUpdates::default();
-        for (db_node_key, node_updates) in &updates.node_updates {
-            if db_node_key.len() >= 50 {
-                let mut node_id_bytes = [0u8; 30];
-                node_id_bytes.copy_from_slice(&db_node_key[20..50]);
-                let node_id = NodeId(node_id_bytes);
-
-                if is_local_node(&node_id) {
-                    filtered
-                        .node_updates
-                        .insert(db_node_key.clone(), node_updates.clone());
-                }
-            }
-        }
-
-        if !filtered.node_updates.is_empty() {
-            storage.commit(&filtered);
-        }
-    }
+    // NOTE: commit_all_writes and commit_local_writes have been removed.
+    // The executor is now READ-ONLY. State writes are collected in the
+    // ExecutionOutput and committed later by the runner when a
+    // TransactionCertificate is included in a committed block.
 
     /// Fetch state entries for the given nodes from storage.
     ///

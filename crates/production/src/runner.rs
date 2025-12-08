@@ -256,9 +256,17 @@ impl ProductionRunner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
-        // TODO: Load RecoveredState from storage for crash recovery.
-        // For now, start fresh (unsafe for production restarts).
-        let recovered = RecoveredState::default();
+
+        // Load RecoveredState from storage for crash recovery
+        // Falls back to default (fresh start) if no storage configured
+        let recovered = match &storage {
+            Some(s) => {
+                let storage_guard = s.read();
+                storage_guard.load_recovered_state()
+            }
+            None => RecoveredState::default(),
+        };
+
         let state = NodeStateMachine::new(
             node_index,
             topology.clone(),
@@ -895,6 +903,8 @@ impl ProductionRunner {
             }
 
             // Transaction execution on dedicated execution thread pool
+            // NOTE: Execution is READ-ONLY. State writes are collected in the results
+            // and committed later when TransactionCertificate is included in a block.
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,
@@ -907,9 +917,9 @@ impl ProductionRunner {
                 self.thread_pools.spawn_execution(move || {
                     let results = match (storage, executor) {
                         (Some(storage), Some(executor)) => {
-                            // Execute transactions with write lock on storage
-                            let mut storage_guard = storage.write();
-                            match executor.execute_single_shard(&mut *storage_guard, &transactions) {
+                            // Execute transactions with READ lock - execution is read-only
+                            let storage_guard = storage.read();
+                            match executor.execute_single_shard(&*storage_guard, &transactions) {
                                 Ok(output) => output
                                     .results()
                                     .iter()
@@ -959,6 +969,8 @@ impl ProductionRunner {
             }
 
             // Cross-shard transaction execution with provisions
+            // NOTE: Execution is READ-ONLY. State writes are collected in the results
+            // and committed later when TransactionCertificate is included in a block.
             Action::ExecuteCrossShardTransaction {
                 tx_hash,
                 transaction,
@@ -978,10 +990,10 @@ impl ProductionRunner {
                                 topology.shard_for_node_id(node_id) == local_shard
                             };
 
-                            // Execute with provisions
-                            let mut storage_guard = storage.write();
+                            // Execute with provisions - READ lock since execution is read-only
+                            let storage_guard = storage.read();
                             match executor.execute_cross_shard(
-                                &mut *storage_guard,
+                                &*storage_guard,
                                 &[transaction],
                                 &provisions,
                                 is_local_node,
@@ -1095,65 +1107,145 @@ impl ProductionRunner {
                 // TODO: Notify subscribers
             }
 
+            // ═══════════════════════════════════════════════════════════════════════
             // Storage writes
-            Action::PersistBlock { block: _, qc: _ } => {
-                // TODO: self.storage.persist_block(&block, &qc).await;
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::PersistBlock { block, qc } => {
+                // Fire-and-forget block persistence - not latency critical
+                if let Some(storage) = &self.storage {
+                    let storage = storage.clone();
+                    let height = block.height();
+                    tokio::spawn(async move {
+                        let guard = storage.write();
+                        guard.put_block(height, &block, &qc);
+                        // Update chain metadata
+                        guard.set_chain_metadata(height, None, None);
+                        // Prune old votes - we no longer need votes at or below committed height
+                        guard.prune_own_votes(height.0);
+                    });
+                }
             }
 
-            Action::PersistTransactionCertificate { certificate: _ } => {
-                // TODO: self.storage.persist_certificate(&certificate).await;
+            Action::PersistTransactionCertificate { certificate } => {
+                // Commit certificate + state writes atomically
+                // This is durability-critical: we await completion
+                if let Some(storage) = &self.storage {
+                    let storage = storage.clone();
+                    let local_shard = self.local_shard;
+
+                    // Extract writes for local shard from the certificate's shard_proofs
+                    let writes: Vec<_> = certificate
+                        .shard_proofs
+                        .get(&local_shard)
+                        .map(|p| p.state_writes.clone())
+                        .unwrap_or_default();
+
+                    // Run on blocking thread since RocksDB write is sync
+                    tokio::task::spawn_blocking(move || {
+                        let mut guard = storage.write();
+                        guard.commit_certificate_with_writes(&certificate, &writes);
+                    })
+                    .await
+                    .ok();
+                }
             }
 
             Action::PersistOwnVote {
-                height: _,
-                round: _,
-                block_hash: _,
+                height,
+                round,
+                block_hash,
             } => {
-                // TODO: **BFT Safety Critical** - Implement vote persistence in RocksDbStorage.
-                // This MUST be persisted synchronously before the vote is broadcast.
-                // After crash/restart, votes must be loaded to prevent equivocation.
-                // self.storage.persist_own_vote(height, round, block_hash).await;
+                // **BFT Safety Critical**: Must persist before broadcasting vote
+                // Prevents equivocation after crash/restart
+                if let Some(storage) = &self.storage {
+                    let storage = storage.clone();
+
+                    // Use spawn_blocking since we need sync writes for BFT safety
+                    // We await completion to ensure vote is persisted before returning
+                    tokio::task::spawn_blocking(move || {
+                        let guard = storage.read();
+                        guard.put_own_vote(height.0, round, block_hash);
+                    })
+                    .await
+                    .ok();
+                }
             }
 
-            Action::PersistSubstateWrites {
-                tx_hash: _,
-                writes: _,
-            } => {
-                // TODO: self.storage.persist_substate_writes(&tx_hash, &writes).await;
-            }
-
+            // ═══════════════════════════════════════════════════════════════════════
             // Storage reads - delegate to async storage, send callback event
-            Action::FetchStateEntries { tx_hash, nodes: _ } => {
-                // TODO: Implement async storage fetch
-                // let entries = self.storage.fetch_state_entries(&nodes).await;
-                let entries = vec![];
-                let _ = self
-                    .event_tx
-                    .send(Event::StateEntriesFetched { tx_hash, entries })
-                    .await;
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::FetchStateEntries { tx_hash, nodes } => {
+                let event_tx = self.event_tx.clone();
+
+                if let (Some(storage), Some(executor)) = (&self.storage, &self.executor) {
+                    let storage = storage.clone();
+                    let executor = executor.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let guard = storage.read();
+                        let entries = executor.fetch_state_entries(&*guard, &nodes);
+                        let _ =
+                            event_tx.blocking_send(Event::StateEntriesFetched { tx_hash, entries });
+                    });
+                } else {
+                    // No storage configured - return empty
+                    let _ = self
+                        .event_tx
+                        .send(Event::StateEntriesFetched {
+                            tx_hash,
+                            entries: vec![],
+                        })
+                        .await;
+                }
             }
 
             Action::FetchBlock { height } => {
-                // TODO: Implement async storage fetch
-                // let block = self.storage.fetch_block(height).await;
-                let block = None;
-                let _ = self
-                    .event_tx
-                    .send(Event::BlockFetched { height, block })
-                    .await;
+                let event_tx = self.event_tx.clone();
+
+                if let Some(storage) = &self.storage {
+                    let storage = storage.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let guard = storage.read();
+                        let block = guard.get_block(height).map(|(b, _qc)| b);
+                        let _ = event_tx.blocking_send(Event::BlockFetched { height, block });
+                    });
+                } else {
+                    let _ = self
+                        .event_tx
+                        .send(Event::BlockFetched {
+                            height,
+                            block: None,
+                        })
+                        .await;
+                }
             }
 
             Action::FetchChainMetadata => {
-                // TODO: Implement async storage fetch
-                // let (height, hash, qc) = self.storage.fetch_chain_metadata().await;
-                let _ = self
-                    .event_tx
-                    .send(Event::ChainMetadataFetched {
-                        height: hyperscale_types::BlockHeight(0),
-                        hash: None,
-                        qc: None,
-                    })
-                    .await;
+                let event_tx = self.event_tx.clone();
+
+                if let Some(storage) = &self.storage {
+                    let storage = storage.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let guard = storage.read();
+                        let (height, hash, qc) = guard.get_chain_metadata();
+                        let _ = event_tx.blocking_send(Event::ChainMetadataFetched {
+                            height,
+                            hash,
+                            qc,
+                        });
+                    });
+                } else {
+                    let _ = self
+                        .event_tx
+                        .send(Event::ChainMetadataFetched {
+                            height: hyperscale_types::BlockHeight(0),
+                            hash: None,
+                            qc: None,
+                        })
+                        .await;
+                }
             }
         }
 

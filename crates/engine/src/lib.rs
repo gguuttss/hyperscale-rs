@@ -55,7 +55,7 @@ mod result;
 mod storage;
 
 pub use error::ExecutionError;
-pub use execution::ProvisionedExecutionContext;
+pub use execution::{substate_writes_to_database_updates, ProvisionedExecutionContext};
 pub use executor::RadixExecutor;
 pub use genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 pub use result::{ExecutionOutput, SingleTxResult};

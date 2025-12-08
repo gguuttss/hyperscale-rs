@@ -765,7 +765,11 @@ impl SimulationRunner {
             } => {
                 // Execute transactions using the node's own Radix Engine and storage
                 // Each node has independent storage - this runs inline (synchronously)
-                let storage = &mut self.node_storage[from as usize];
+                //
+                // NOTE: Execution is READ-ONLY. State writes are collected in the results
+                // and committed later when TransactionCertificate is included in a block
+                // (via PersistTransactionCertificate handler).
+                let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
 
                 let results = match executor.execute_single_shard(storage, &transactions) {
@@ -812,7 +816,11 @@ impl SimulationRunner {
                 provisions,
             } => {
                 // Execute cross-shard transaction with provisions using the node's Radix Engine
-                let storage = &mut self.node_storage[from as usize];
+                //
+                // NOTE: Execution is READ-ONLY. State writes are collected in the results
+                // and committed later when TransactionCertificate is included in a block
+                // (via PersistTransactionCertificate handler).
+                let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
 
                 // Determine which nodes are local to this shard
@@ -918,11 +926,25 @@ impl SimulationRunner {
                 if height > storage.committed_height() {
                     storage.set_committed_height(height);
                 }
+                // Prune old votes - we no longer need votes at or below committed height
+                storage.prune_own_votes(height.0);
             }
             Action::PersistTransactionCertificate { certificate } => {
-                // Store certificate in this node's storage
+                // Store certificate AND commit state writes in this node's storage
+                // This is the deferred commit - state writes are only applied when
+                // the certificate is included in a committed block.
                 let storage = &mut self.node_storage[from as usize];
-                storage.put_certificate(certificate.transaction_hash, certificate);
+                let local_shard = self.nodes[from as usize].shard();
+
+                // Extract writes for local shard from the certificate's shard_proofs
+                let writes = certificate
+                    .shard_proofs
+                    .get(&local_shard)
+                    .map(|p| p.state_writes.as_slice())
+                    .unwrap_or(&[]);
+
+                // Commit certificate + writes atomically (mirrors production behavior)
+                storage.commit_certificate_with_writes(&certificate, writes);
             }
             Action::PersistOwnVote {
                 height,
@@ -941,8 +963,6 @@ impl SimulationRunner {
                     "Persisted own vote"
                 );
             }
-            Action::PersistSubstateWrites { .. } => {}
-
             // Storage reads - immediately return callback events in simulation
             // In production, these would be async operations
             Action::FetchStateEntries { tx_hash, nodes } => {

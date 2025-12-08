@@ -3,8 +3,8 @@
 use crate::{message::OutboundMessage, Event, RequestId, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Hash, NodeId, PublicKey, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, SubstateWrite,
-    TransactionCertificate, TransactionDecision, ViewChangeCertificate, ViewChangeVote,
+    ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
+    TransactionDecision, ViewChangeCertificate, ViewChangeVote,
 };
 use std::time::Duration;
 
@@ -252,19 +252,15 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Persist a finalized transaction certificate.
+    /// Persist a finalized transaction certificate with its state writes.
+    ///
+    /// This is the deferred commit operation - state writes are only applied when
+    /// a `TransactionCertificate` is included in a committed block. The runner
+    /// extracts writes from `certificate.shard_proofs[local_shard]` and commits
+    /// them atomically with the certificate.
     ///
     /// Stored so we don't re-execute if we crash and recover.
     PersistTransactionCertificate { certificate: TransactionCertificate },
-
-    /// Persist substate writes from transaction execution.
-    ///
-    /// These are the actual state changes to be applied to the ledger.
-    /// Key format: `radix:` + node_key + partition + sort_key → value
-    PersistSubstateWrites {
-        tx_hash: Hash,
-        writes: Vec<SubstateWrite>,
-    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback Event)
@@ -300,7 +296,6 @@ impl Action {
                 | Action::PersistBlock { .. }
                 | Action::PersistOwnVote { .. }
                 | Action::PersistTransactionCertificate { .. }
-                | Action::PersistSubstateWrites { .. }
         )
     }
 
@@ -337,7 +332,6 @@ impl Action {
             Action::PersistBlock { .. }
                 | Action::PersistOwnVote { .. }
                 | Action::PersistTransactionCertificate { .. }
-                | Action::PersistSubstateWrites { .. }
         )
     }
 
@@ -393,7 +387,6 @@ impl Action {
 
             // Storage - Execution
             Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
-            Action::PersistSubstateWrites { .. } => "PersistSubstateWrites",
 
             // Storage - Read Requests
             Action::FetchStateEntries { .. } => "FetchStateEntries",

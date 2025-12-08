@@ -38,6 +38,11 @@ pub struct Metrics {
     // === Storage ===
     pub rocksdb_read_latency: Histogram,
     pub rocksdb_write_latency: Histogram,
+    pub storage_operation_latency: HistogramVec,
+    pub storage_batch_size: Histogram,
+    pub storage_votes_persisted: Counter,
+    pub storage_certificates_persisted: Counter,
+    pub storage_blocks_persisted: Counter,
 
     // === Network ===
     pub libp2p_peers_connected: Gauge,
@@ -162,6 +167,39 @@ impl Metrics {
                 "hyperscale_rocksdb_write_latency_seconds",
                 "RocksDB write operation latency",
                 vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            )
+            .unwrap(),
+
+            storage_operation_latency: register_histogram_vec!(
+                "hyperscale_storage_operation_latency_seconds",
+                "Storage operation latency by type",
+                &["operation"],
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+            )
+            .unwrap(),
+
+            storage_batch_size: register_histogram!(
+                "hyperscale_storage_batch_size",
+                "Number of writes in atomic batches",
+                vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+            )
+            .unwrap(),
+
+            storage_votes_persisted: register_counter!(
+                "hyperscale_storage_votes_persisted_total",
+                "Total number of votes persisted to storage"
+            )
+            .unwrap(),
+
+            storage_certificates_persisted: register_counter!(
+                "hyperscale_storage_certificates_persisted_total",
+                "Total number of transaction certificates persisted"
+            )
+            .unwrap(),
+
+            storage_blocks_persisted: register_counter!(
+                "hyperscale_storage_blocks_persisted_total",
+                "Total number of blocks persisted to storage"
             )
             .unwrap(),
 
@@ -310,6 +348,45 @@ pub fn record_rocksdb_read(latency_secs: f64) {
 /// Record RocksDB write latency.
 pub fn record_rocksdb_write(latency_secs: f64) {
     metrics().rocksdb_write_latency.observe(latency_secs);
+}
+
+/// Record storage operation latency by type.
+///
+/// **Cardinality control**: Use only these predefined operation types:
+/// - `"put_block"` - persisting a committed block
+/// - `"put_vote"` - persisting own vote (BFT safety critical)
+/// - `"put_certificate"` - persisting a transaction certificate
+/// - `"commit_cert_writes"` - atomic certificate + state writes
+/// - `"get_block"` - fetching a block by height
+/// - `"get_certificate"` - fetching a certificate by hash
+/// - `"get_chain_metadata"` - fetching chain height/hash/qc
+/// - `"get_state_entries"` - fetching state for provisioning
+/// - `"load_recovered_state"` - crash recovery state load
+pub fn record_storage_operation(operation: &str, latency_secs: f64) {
+    metrics()
+        .storage_operation_latency
+        .with_label_values(&[operation])
+        .observe(latency_secs);
+}
+
+/// Record the size of an atomic write batch.
+pub fn record_storage_batch_size(size: usize) {
+    metrics().storage_batch_size.observe(size as f64);
+}
+
+/// Record a vote persisted.
+pub fn record_vote_persisted() {
+    metrics().storage_votes_persisted.inc();
+}
+
+/// Record a certificate persisted.
+pub fn record_certificate_persisted() {
+    metrics().storage_certificates_persisted.inc();
+}
+
+/// Record a block persisted.
+pub fn record_block_persisted() {
+    metrics().storage_blocks_persisted.inc();
 }
 
 /// Update libp2p peer count.
