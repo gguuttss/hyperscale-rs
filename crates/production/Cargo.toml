@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "Production runner with async I/O"
 
+[[bin]]
+name = "hyperscale-validator"
+path = "src/bin/validator.rs"
+
 [features]
 default = []
 # Enable cross-node trace context propagation in messages.
@@ -59,6 +63,13 @@ serde_json = "1.0"
 
 # HTTP server for metrics endpoint
 axum = "0.8.7"
+
+# CLI and configuration (for validator binary)
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+hex = "0.4"
+rand = "0.8"
 
 # Core pinning support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

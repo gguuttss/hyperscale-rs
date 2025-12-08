@@ -1,0 +1,157 @@
+# Hyperscale Validator Configuration
+#
+# Copy this file to validator.toml and customize for your deployment.
+#
+# Usage:
+#   hyperscale-validator --config validator.toml
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Node Identity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[node]
+# Unique validator ID (must match genesis configuration)
+validator_id = 0
+
+# Shard group this validator participates in
+shard = 0
+
+# Total number of shards in the network
+num_shards = 1
+
+# Path to the signing key file (32-byte seed)
+# If not specified, a key will be generated
+key_path = "./keys/validator.key"
+
+# Directory for RocksDB storage
+data_dir = "./data"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Network Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[network]
+# Listen address (multiaddr format)
+# QUIC transport for low-latency, multiplexed connections
+listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
+
+# Bootstrap peers to connect to on startup
+# Format: /ip4/<addr>/udp/<port>/quic-v1/p2p/<peer_id>
+bootstrap_peers = [
+    # "/ip4/10.0.0.1/udp/9000/quic-v1/p2p/12D3KooW...",
+]
+
+# Request-response timeout (milliseconds)
+request_timeout_ms = 30000
+
+# Maximum message size (bytes)
+max_message_size = 65536
+
+# Gossipsub heartbeat interval (milliseconds)
+gossipsub_heartbeat_ms = 1000
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Consensus Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[consensus]
+# Block proposal interval (milliseconds)
+# Lower = faster finality, higher network load
+proposal_interval_ms = 300
+
+# View change timeout (milliseconds)
+# How long to wait before triggering leader rotation
+view_change_timeout_ms = 3000
+
+# Maximum transactions per block
+max_transactions_per_block = 4096
+
+# Maximum certificates per block
+max_certificates_per_block = 4096
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Thread Pool Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[threads]
+# Threads for BLS signature verification (0 = auto-detect)
+crypto_threads = 0
+
+# Threads for transaction execution (0 = auto-detect)
+execution_threads = 0
+
+# Threads for async I/O (network, storage) (0 = auto-detect)
+io_threads = 0
+
+# Pin threads to specific CPU cores for better cache locality
+# Only effective on Linux
+pin_cores = false
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Storage Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[storage]
+# RocksDB background compaction jobs
+max_background_jobs = 4
+
+# Write buffer size (MB)
+write_buffer_mb = 128
+
+# Block cache size (MB) - 0 to disable
+block_cache_mb = 512
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Metrics Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[metrics]
+# Enable Prometheus metrics endpoint
+enabled = true
+
+# Address to listen for metrics scraping
+listen_addr = "0.0.0.0:9090"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Telemetry Configuration (OpenTelemetry)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[telemetry]
+# Enable OpenTelemetry tracing
+enabled = false
+
+# OTLP collector endpoint
+# otlp_endpoint = "http://localhost:4317"
+
+# Service name for traces
+service_name = "hyperscale-validator"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Genesis Configuration
+#
+# Define the validator set for the network.
+# For development/testing, you can leave this empty for single-validator mode.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[genesis]
+# Example validator set for a 4-validator network:
+#
+# [[genesis.validators]]
+# id = 0
+# public_key = "0123456789abcdef..." # 64 hex chars (32 bytes Ed25519)
+# voting_power = 1
+#
+# [[genesis.validators]]
+# id = 1
+# public_key = "fedcba9876543210..."
+# voting_power = 1
+#
+# [[genesis.validators]]
+# id = 2
+# public_key = "abcdef0123456789..."
+# voting_power = 1
+#
+# [[genesis.validators]]
+# id = 3
+# public_key = "9876543210abcdef..."
+# voting_power = 1

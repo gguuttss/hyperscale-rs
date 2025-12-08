@@ -39,3 +39,7 @@ IDENTITY
 LOCK
 OPTIONS-*
 LOG*
+
+# Validator data
+data/
+keys/
