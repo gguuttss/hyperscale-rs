@@ -15,7 +15,10 @@ use hyperscale_types::BlockHeight;
 use hyperscale_core::{Action, Event, RequestId, StateMachine};
 pub use hyperscale_node::NodeIndex;
 use hyperscale_node::NodeStateMachine;
-use hyperscale_types::{KeyPair, RoutableTransaction, ShardGroupId, Topology};
+use hyperscale_types::{
+    BlockVote, KeyPair, PublicKey, RoutableTransaction, ShardGroupId, Signature, StateVoteBlock,
+    Topology, ViewChangeVote,
+};
 use libp2p::identity;
 use parking_lot::RwLock;
 use sbor::prelude::*;
@@ -37,6 +40,32 @@ pub enum RunnerError {
     SendError(String),
     #[error("Network error: {0}")]
     NetworkError(#[from] NetworkError),
+}
+
+/// Pending signature verifications that can be batched.
+///
+/// Collects verification actions and processes them together using
+/// batch verification for better performance (2-8x speedup for large batches).
+#[derive(Default)]
+struct PendingVerifications {
+    /// Block votes waiting for verification (public key and signing message included).
+    block_votes: Vec<(BlockVote, PublicKey, Vec<u8>)>,
+    /// View change votes waiting for verification.
+    view_change_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)>,
+    /// State votes waiting for verification (cross-shard execution).
+    state_votes: Vec<(StateVoteBlock, PublicKey)>,
+}
+
+impl PendingVerifications {
+    fn is_empty(&self) -> bool {
+        self.block_votes.is_empty()
+            && self.view_change_votes.is_empty()
+            && self.state_votes.is_empty()
+    }
+
+    fn total_count(&self) -> usize {
+        self.block_votes.len() + self.view_change_votes.len() + self.state_votes.len()
+    }
 }
 
 /// Handle for shutting down a running ProductionRunner.
@@ -430,12 +459,66 @@ impl ProductionRunner {
                             // Record action count
                             Span::current().record("actions.count", actions.len());
 
-                            // Execute actions
+                            // Collect signature verifications for batching, process others immediately
+                            let mut pending = PendingVerifications::default();
+
                             for action in actions {
-                                if let Err(e) = self.process_action(action).await {
-                                    tracing::error!(error = ?e, "Error processing action");
+                                match action {
+                                    Action::VerifyVoteSignature { vote, public_key, signing_message } => {
+                                        pending.block_votes.push((vote, public_key, signing_message));
+                                    }
+                                    Action::VerifyViewChangeVoteSignature { vote, public_key, signing_message } => {
+                                        pending.view_change_votes.push((vote, public_key, signing_message));
+                                    }
+                                    Action::VerifyStateVoteSignature { vote, public_key } => {
+                                        pending.state_votes.push((vote, public_key));
+                                    }
+                                    other => {
+                                        if let Err(e) = self.process_action(other).await {
+                                            tracing::error!(error = ?e, "Error processing action");
+                                        }
+                                    }
                                 }
                             }
+
+                            // Try to collect more verifications from queued events
+                            // This drains any immediately available events to maximize batch size
+                            while let Ok(more_event) = self.event_rx.try_recv() {
+                                consensus_batch_count += 1;
+
+                                // Update time for each event
+                                let now = self.start_time.elapsed();
+                                self.state.set_time(now);
+
+                                let more_actions = self.state.handle(more_event);
+
+                                for action in more_actions {
+                                    match action {
+                                        Action::VerifyVoteSignature { vote, public_key, signing_message } => {
+                                            pending.block_votes.push((vote, public_key, signing_message));
+                                        }
+                                        Action::VerifyViewChangeVoteSignature { vote, public_key, signing_message } => {
+                                            pending.view_change_votes.push((vote, public_key, signing_message));
+                                        }
+                                        Action::VerifyStateVoteSignature { vote, public_key } => {
+                                            pending.state_votes.push((vote, public_key));
+                                        }
+                                        other => {
+                                            if let Err(e) = self.process_action(other).await {
+                                                tracing::error!(error = ?e, "Error processing action");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Respect batch limit
+                                if consensus_batch_count >= CONSENSUS_BATCH_SIZE {
+                                    break;
+                                }
+                            }
+
+                            // Dispatch collected verifications as batches
+                            self.dispatch_batched_verifications(pending);
 
                             // If this was a sync request, start the sync manager
                             if let Some((target_height, target_hash)) = sync_target {
@@ -1075,6 +1158,225 @@ impl ProductionRunner {
         }
 
         Ok(())
+    }
+
+    /// Dispatch batched signature verifications to the crypto thread pool.
+    ///
+    /// This method takes collected verifications and processes them in a single
+    /// crypto thread pool task, using batch verification when possible for better
+    /// performance (2-8x speedup for batches of 8+ signatures).
+    ///
+    /// Results are sent back as individual events to maintain compatibility
+    /// with the state machine's expectations.
+    fn dispatch_batched_verifications(&self, pending: PendingVerifications) {
+        if pending.is_empty() {
+            return;
+        }
+
+        let event_tx = self.event_tx.clone();
+        let batch_size = pending.total_count();
+
+        self.thread_pools.spawn_crypto(move || {
+            let start = std::time::Instant::now();
+
+            // === BLOCK VOTES ===
+            if !pending.block_votes.is_empty() {
+                // Separate by key type for appropriate batch verification
+                let mut ed25519_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
+                let mut bls_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
+
+                for (vote, pk, msg) in pending.block_votes {
+                    match &pk {
+                        PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
+                        PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
+                    }
+                }
+
+                // Process Ed25519 block votes using batch verification
+                if !ed25519_votes.is_empty() {
+                    let messages: Vec<&[u8]> =
+                        ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
+                    let signatures: Vec<Signature> = ed25519_votes
+                        .iter()
+                        .map(|(v, _, _)| v.signature.clone())
+                        .collect();
+                    let pubkeys: Vec<PublicKey> =
+                        ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
+
+                    let batch_valid =
+                        PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
+
+                    if batch_valid {
+                        for (vote, _, _) in ed25519_votes {
+                            let _ = event_tx
+                                .blocking_send(Event::VoteSignatureVerified { vote, valid: true });
+                        }
+                    } else {
+                        // Fallback to individual verification to find which ones failed
+                        for (vote, pk, msg) in ed25519_votes {
+                            let valid = pk.verify(&msg, &vote.signature);
+                            if !valid {
+                                crate::metrics::record_signature_verification_failure();
+                            }
+                            let _ = event_tx
+                                .blocking_send(Event::VoteSignatureVerified { vote, valid });
+                        }
+                    }
+                }
+
+                // Process BLS block votes individually (different messages)
+                for (vote, pk, msg) in bls_votes {
+                    let valid = pk.verify(&msg, &vote.signature);
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
+                    let _ = event_tx.blocking_send(Event::VoteSignatureVerified { vote, valid });
+                }
+            }
+
+            // === VIEW CHANGE VOTES ===
+            if !pending.view_change_votes.is_empty() {
+                let mut ed25519_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)> = Vec::new();
+                let mut bls_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)> = Vec::new();
+
+                for (vote, pk, msg) in pending.view_change_votes {
+                    match &pk {
+                        PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
+                        PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
+                    }
+                }
+
+                // Process Ed25519 view change votes using batch verification
+                if !ed25519_votes.is_empty() {
+                    let messages: Vec<&[u8]> =
+                        ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
+                    let signatures: Vec<Signature> = ed25519_votes
+                        .iter()
+                        .map(|(v, _, _)| v.signature.clone())
+                        .collect();
+                    let pubkeys: Vec<PublicKey> =
+                        ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
+
+                    let batch_valid =
+                        PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
+
+                    if batch_valid {
+                        for (vote, _, _) in ed25519_votes {
+                            let _ =
+                                event_tx.blocking_send(Event::ViewChangeVoteSignatureVerified {
+                                    vote,
+                                    valid: true,
+                                });
+                        }
+                    } else {
+                        for (vote, pk, msg) in ed25519_votes {
+                            let valid = pk.verify(&msg, &vote.signature);
+                            if !valid {
+                                crate::metrics::record_signature_verification_failure();
+                            }
+                            let _ =
+                                event_tx.blocking_send(Event::ViewChangeVoteSignatureVerified {
+                                    vote,
+                                    valid,
+                                });
+                        }
+                    }
+                }
+
+                // Process BLS view change votes individually
+                for (vote, pk, msg) in bls_votes {
+                    let valid = pk.verify(&msg, &vote.signature);
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
+                    let _ = event_tx
+                        .blocking_send(Event::ViewChangeVoteSignatureVerified { vote, valid });
+                }
+            }
+
+            // === STATE VOTES (cross-shard execution) ===
+            if !pending.state_votes.is_empty() {
+                // Build signing messages for state votes (must match ExecutionState::create_vote)
+                let votes_with_msgs: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = pending
+                    .state_votes
+                    .into_iter()
+                    .map(|(vote, pk)| {
+                        let mut msg = Vec::new();
+                        msg.extend_from_slice(b"EXEC_VOTE");
+                        msg.extend_from_slice(vote.transaction_hash.as_bytes());
+                        msg.extend_from_slice(vote.state_root.as_bytes());
+                        msg.extend_from_slice(&vote.shard_group_id.0.to_le_bytes());
+                        msg.push(if vote.success { 1 } else { 0 });
+                        (vote, pk, msg)
+                    })
+                    .collect();
+
+                let mut ed25519_votes: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = Vec::new();
+                let mut bls_votes: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = Vec::new();
+
+                for (vote, pk, msg) in votes_with_msgs {
+                    match &pk {
+                        PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
+                        PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
+                    }
+                }
+
+                // Process Ed25519 state votes using batch verification
+                if !ed25519_votes.is_empty() {
+                    let messages: Vec<&[u8]> =
+                        ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
+                    let signatures: Vec<Signature> = ed25519_votes
+                        .iter()
+                        .map(|(v, _, _)| v.signature.clone())
+                        .collect();
+                    let pubkeys: Vec<PublicKey> =
+                        ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
+
+                    let batch_valid =
+                        PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
+
+                    if batch_valid {
+                        for (vote, _, _) in ed25519_votes {
+                            let _ = event_tx.blocking_send(Event::StateVoteSignatureVerified {
+                                vote,
+                                valid: true,
+                            });
+                        }
+                    } else {
+                        for (vote, pk, msg) in ed25519_votes {
+                            let valid = pk.verify(&msg, &vote.signature);
+                            if !valid {
+                                crate::metrics::record_signature_verification_failure();
+                            }
+                            let _ = event_tx
+                                .blocking_send(Event::StateVoteSignatureVerified { vote, valid });
+                        }
+                    }
+                }
+
+                // Process BLS state votes individually
+                for (vote, pk, msg) in bls_votes {
+                    let valid = pk.verify(&msg, &vote.signature);
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
+                    let _ =
+                        event_tx.blocking_send(Event::StateVoteSignatureVerified { vote, valid });
+                }
+            }
+
+            // Record batch metrics
+            let elapsed = start.elapsed().as_secs_f64();
+            crate::metrics::record_signature_verification_latency(elapsed);
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    elapsed_ms = elapsed * 1000.0,
+                    "Batch verified signatures"
+                );
+            }
+        });
     }
 
     /// Submit a transaction and wait for result.
