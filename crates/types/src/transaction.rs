@@ -517,7 +517,7 @@ impl RetryDetails {
 ///
 /// **Normal Flow** (both single-shard and cross-shard):
 /// ```text
-/// Pending → Committed → Finalized → Completed
+/// Pending → Committed → Executed → Completed
 /// ```
 ///
 /// **Cross-Shard with Conflict (Livelock Prevention)**:
@@ -531,8 +531,8 @@ impl RetryDetails {
 ///
 /// - **Pending**: Transaction has been submitted but not yet included in a committed block
 /// - **Committed**: Block containing transaction has been committed; execution is in progress
-/// - **Finalized**: TransactionCertificate created with Accept/Reject decision
-/// - **Completed**: Transaction fully processed, can be evicted from mempool
+/// - **Executed**: Execution complete, TransactionCertificate created, waiting for block inclusion
+/// - **Completed**: Certificate committed in block, transaction fully processed
 /// - **Blocked**: Transaction was deferred due to cross-shard conflict, waiting for winner
 /// - **Retried**: Transaction was superseded by a retry transaction (terminal)
 ///
@@ -540,7 +540,7 @@ impl RetryDetails {
 ///
 /// The execution state machine internally tracks finer-grained progress (provisioning,
 /// executing, collecting votes/certificates), but the mempool only needs to know:
-/// - Is the transaction holding state locks? (Committed, Finalized)
+/// - Is the transaction holding state locks? (Committed, Executed)
 /// - Is it done? (Completed, Retried)
 /// - Is it blocked? (Blocked)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
@@ -551,7 +551,7 @@ pub enum TransactionStatus {
     /// Block containing transaction has been committed.
     ///
     /// The transaction is now being executed. This state holds locks on all
-    /// declared nodes until execution completes (Finalized) or the transaction
+    /// declared nodes until execution completes (Executed) or the transaction
     /// is deferred (Blocked/Retried).
     ///
     /// For cross-shard transactions, this encompasses:
@@ -561,14 +561,14 @@ pub enum TransactionStatus {
     /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
 
-    /// TransactionCertificate has been created with final decision.
+    /// Execution complete, TransactionCertificate has been created.
     ///
     /// All StateCertificates have been collected and aggregated into a
     /// TransactionCertificate with Accept or Reject decision.
     ///
     /// The transaction is waiting for the certificate to be included in a block.
     /// Still holds state locks until Completed.
-    Finalized(TransactionDecision),
+    Executed(TransactionDecision),
 
     /// Transaction has been fully processed and can be evicted.
     ///
@@ -634,7 +634,7 @@ impl TransactionStatus {
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Committed(_) | TransactionStatus::Finalized(_)
+            TransactionStatus::Committed(_) | TransactionStatus::Executed(_)
         )
     }
 
@@ -643,7 +643,7 @@ impl TransactionStatus {
         match self {
             TransactionStatus::Pending => "Pending",
             TransactionStatus::Committed(_) => "Committed",
-            TransactionStatus::Finalized(_) => "Finalized",
+            TransactionStatus::Executed(_) => "Executed",
             TransactionStatus::Completed => "Completed",
             TransactionStatus::Blocked { .. } => "Blocked",
             TransactionStatus::Retried { .. } => "Retried",
@@ -681,7 +681,7 @@ impl TransactionStatus {
     /// Transactions can be deferred if they are in Committed state (executing).
     /// States that cannot be deferred:
     /// - Pre-lock states: Pending (no locks held yet)
-    /// - Terminal states: Finalized, Completed (too late to defer)
+    /// - Terminal states: Executed, Completed (too late to defer)
     /// - Already deferred: Blocked, Retried (already handled)
     pub fn is_deferrable(&self) -> bool {
         matches!(self, TransactionStatus::Committed(_))
@@ -694,14 +694,14 @@ impl TransactionStatus {
     /// (e.g., Blocked/Retried can happen from multiple states), but it helps identify
     /// clearly stale updates.
     ///
-    /// Ordering: Pending(0) < Committed(1) < Finalized(2) < Completed(3)
+    /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
     ///
     /// Blocked and Retried are terminal side-branches and get high ordinals (4, 5).
     pub fn ordinal(&self) -> u8 {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
-            TransactionStatus::Finalized(_) => 2,
+            TransactionStatus::Executed(_) => 2,
             TransactionStatus::Completed => 3,
             TransactionStatus::Blocked { .. } => 4,
             TransactionStatus::Retried { .. } => 5,
@@ -722,8 +722,8 @@ impl TransactionStatus {
             // Pending → Blocked (cross-shard livelock prevention)
             (Pending, Blocked { .. }) => true,
 
-            // Committed → Finalized (execution complete, certificate created)
-            (Committed(_), Finalized(_)) => true,
+            // Committed → Executed (execution complete, certificate created)
+            (Committed(_), Executed(_)) => true,
 
             // Committed → Blocked (deferred due to conflict)
             (Committed(_), Blocked { .. }) => true,
@@ -731,8 +731,8 @@ impl TransactionStatus {
             // Committed → Retried (superseded by retry from another shard)
             (Committed(_), Retried { .. }) => true,
 
-            // Finalized → Completed (certificate committed in block)
-            (Finalized(_), Completed) => true,
+            // Executed → Completed (certificate committed in block)
+            (Executed(_), Completed) => true,
 
             // Blocked → Retried (when winner completes, loser gets a retry)
             (Blocked { .. }, Retried { .. }) => true,
@@ -748,11 +748,11 @@ impl std::fmt::Display for TransactionStatus {
         match self {
             TransactionStatus::Pending => write!(f, "Pending"),
             TransactionStatus::Committed(height) => write!(f, "Committed({})", height.0),
-            TransactionStatus::Finalized(TransactionDecision::Accept) => {
-                write!(f, "Finalized(Accept)")
+            TransactionStatus::Executed(TransactionDecision::Accept) => {
+                write!(f, "Executed(Accept)")
             }
-            TransactionStatus::Finalized(TransactionDecision::Reject) => {
-                write!(f, "Finalized(Reject)")
+            TransactionStatus::Executed(TransactionDecision::Reject) => {
+                write!(f, "Executed(Reject)")
             }
             TransactionStatus::Completed => write!(f, "Completed"),
             TransactionStatus::Blocked { by } => write!(f, "Blocked(by: {})", by),

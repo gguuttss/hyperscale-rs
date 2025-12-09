@@ -255,7 +255,7 @@ impl Simulator {
                                     "Transaction completed"
                                 );
                             }
-                            TransactionStatus::Finalized(TransactionDecision::Reject) => {
+                            TransactionStatus::Executed(TransactionDecision::Reject) => {
                                 // Transaction was rejected - record rejection (no latency)
                                 self.metrics.record_rejection();
                                 self.in_flight.remove(&hash);

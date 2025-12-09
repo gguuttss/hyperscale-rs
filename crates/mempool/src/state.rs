@@ -334,7 +334,7 @@ impl MempoolState {
             } else {
                 TransactionDecision::Reject
             };
-            entry.status = TransactionStatus::Finalized(decision);
+            entry.status = TransactionStatus::Executed(decision);
         }
 
         // Check if any blocked transactions were waiting for this winner to finalize.
@@ -402,7 +402,7 @@ impl MempoolState {
     /// Update transaction status to a new state.
     ///
     /// This is used by the execution state machine to update status during
-    /// the transaction lifecycle (Committed, Finalized, etc.).
+    /// the transaction lifecycle (Committed, Executed, etc.).
     pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
             // Case 1: Idempotent update - already in the target state
@@ -452,7 +452,7 @@ impl MempoolState {
     /// Get all NodeIds that are currently locked by in-flight transactions.
     ///
     /// A node is locked if any transaction that declares it (read or write)
-    /// is in a lock-holding state (Accepted through Finalized).
+    /// is in a lock-holding state (Committed or Executed).
     fn locked_nodes(&self) -> HashSet<NodeId> {
         self.pool
             .values()
@@ -581,7 +581,7 @@ impl MempoolState {
             .filter(|(_, entry)| {
                 !matches!(
                     entry.status,
-                    TransactionStatus::Finalized(_) | TransactionStatus::Completed
+                    TransactionStatus::Executed(_) | TransactionStatus::Completed
                 )
             })
             .map(|(hash, entry)| (*hash, entry.status.clone(), entry.tx.clone()))
@@ -612,7 +612,7 @@ impl MempoolState {
             // Skip transactions that are already finalized or completed
             if matches!(
                 entry.status,
-                TransactionStatus::Finalized(_) | TransactionStatus::Completed
+                TransactionStatus::Executed(_) | TransactionStatus::Completed
             ) {
                 continue;
             }
@@ -638,9 +638,9 @@ impl MempoolState {
                 }
             }
 
-            // Note: Finalized transactions also hold locks but don't have a
+            // Note: Executed transactions also hold locks but don't have a
             // committed height embedded. For simplicity, we only timeout from
-            // Committed state. Finalized→Completed should happen quickly anyway.
+            // Committed state. Executed→Completed should happen quickly anyway.
 
             // Check for too many retries
             if entry.tx.exceeds_max_retries(max_retries) {

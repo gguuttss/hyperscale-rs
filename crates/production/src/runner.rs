@@ -1064,9 +1064,9 @@ impl ProductionRunner {
             // Client responses
             Action::EmitTransactionResult { request_id, result } => {
                 if let Some(tx) = self.pending_requests.remove(&request_id) {
-                    // Map TransactionDecision to TransactionStatus::Finalized
-                    // Finalized means the decision (Accept/Reject) has been made
-                    let _ = tx.send(TransactionStatus::Finalized(result));
+                    // Map TransactionDecision to TransactionStatus::Executed
+                    // Executed means the decision (Accept/Reject) has been made
+                    let _ = tx.send(TransactionStatus::Executed(result));
                 }
                 tracing::debug!(?request_id, ?result, "Transaction result");
             }
