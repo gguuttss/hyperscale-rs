@@ -46,7 +46,9 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
+use hyperscale_core::Event;
 use hyperscale_production::network::Libp2pConfig;
+use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
     init_telemetry, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
     ThreadPoolConfig, ThreadPoolManager,
@@ -63,7 +65,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Hyperscale Validator Node
@@ -659,54 +661,6 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     }
 }
 
-/// Start the metrics HTTP server.
-async fn start_metrics_server(addr: &str) -> Result<()> {
-    use axum::{response::IntoResponse, routing::get, Router};
-    use prometheus::{Encoder, TextEncoder};
-
-    async fn metrics_handler() -> impl axum::response::IntoResponse {
-        let encoder = TextEncoder::new();
-        let metric_families = prometheus::gather();
-
-        let mut buffer = Vec::new();
-        if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-            tracing::error!(error = ?e, "Failed to encode metrics");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to encode metrics",
-            )
-                .into_response();
-        }
-
-        (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                encoder.format_type().to_string(),
-            )],
-            buffer,
-        )
-            .into_response()
-    }
-
-    let app = Router::new()
-        .route("/metrics", get(metrics_handler))
-        .route("/health", get(|| async { "OK" }));
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind metrics server to {}", addr))?;
-
-    info!("Metrics server listening on {}", addr);
-
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            error!("Metrics server error: {}", e);
-        }
-    });
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -794,10 +748,39 @@ async fn main() -> Result<()> {
     let storage = Arc::new(RwLock::new(storage));
     info!("Storage opened at {}", db_path.display());
 
-    // Start metrics server
-    if config.metrics.enabled {
-        start_metrics_server(&config.metrics.listen_addr).await?;
-    }
+    // Create transaction submission channel for RPC server
+    let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(1000);
+
+    // Start RPC server
+    let rpc_handle = if config.metrics.enabled {
+        let rpc_config = RpcServerConfig {
+            listen_addr: config.metrics.listen_addr.parse().with_context(|| {
+                format!(
+                    "Invalid metrics listen address: {}",
+                    config.metrics.listen_addr
+                )
+            })?,
+            metrics_enabled: true,
+        };
+
+        let rpc_server = RpcServer::new(rpc_config, tx_sender);
+        let handle = rpc_server
+            .start()
+            .await
+            .context("Failed to start RPC server")?;
+
+        // Update node status with initial values
+        {
+            let mut status = handle.node_status().write().await;
+            status.validator_id = config.node.validator_id;
+            status.shard = config.node.shard;
+            status.num_shards = config.node.num_shards;
+        }
+
+        Some(handle)
+    } else {
+        None
+    };
 
     // Create production runner
     let mut runner = ProductionRunner::builder()
@@ -811,8 +794,24 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create production runner")?;
 
+    // Get event sender for transaction injection
+    let event_sender = runner.event_sender();
+
     // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();
+
+    // Spawn transaction forwarder (RPC -> event loop)
+    tokio::spawn(async move {
+        while let Some(tx) = tx_receiver.recv().await {
+            // Inject transaction as if received via gossip
+            if let Err(e) = event_sender
+                .send(Event::TransactionGossipReceived { tx })
+                .await
+            {
+                warn!("Failed to forward RPC transaction: {}", e);
+            }
+        }
+    });
 
     // Spawn shutdown signal handler
     tokio::spawn(async move {
@@ -844,11 +843,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Mark node as ready
+    if let Some(ref handle) = rpc_handle {
+        handle.set_ready(true);
+    }
+
     info!("Validator node started, press Ctrl+C to stop");
 
     // Run the main event loop
     if let Err(e) = runner.run().await {
         bail!("Runner error: {}", e);
+    }
+
+    // Cleanup RPC server
+    if let Some(handle) = rpc_handle {
+        handle.abort();
     }
 
     info!("Validator shutdown complete");

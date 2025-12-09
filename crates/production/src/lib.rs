@@ -72,6 +72,7 @@
 
 pub mod metrics;
 pub mod network;
+pub mod rpc;
 mod runner;
 mod storage;
 mod sync;
