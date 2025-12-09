@@ -47,6 +47,9 @@ pub struct MetricsCollector {
 
     /// Peak contention ratio observed.
     peak_contention_ratio: f64,
+
+    /// In-flight transactions at simulation end.
+    in_flight_at_end: u64,
 }
 
 impl MetricsCollector {
@@ -66,6 +69,7 @@ impl MetricsCollector {
             peak_locked_nodes: 0,
             peak_blocked: 0,
             peak_contention_ratio: 0.0,
+            in_flight_at_end: 0,
         }
     }
 
@@ -95,6 +99,11 @@ impl MetricsCollector {
     /// Set the submission end time for accurate TPS calculation.
     pub fn set_submission_end_time(&mut self, time: Duration) {
         self.submission_end_time = Some(time);
+    }
+
+    /// Set the number of in-flight transactions at simulation end.
+    pub fn set_in_flight_at_end(&mut self, count: u64) {
+        self.in_flight_at_end = count;
     }
 
     /// Take a sample for time-series tracking.
@@ -175,6 +184,7 @@ impl MetricsCollector {
             total_submitted: self.submissions,
             total_finalized: self.finalizations,
             total_rejected: self.rejections,
+            in_flight_at_end: self.in_flight_at_end,
             average_tps,
             peak_tps: self.peak_tps,
             latency_histogram: self.latency_histogram,
@@ -219,6 +229,8 @@ pub struct SimulationReport {
     pub total_finalized: u64,
     /// Total transactions rejected.
     pub total_rejected: u64,
+    /// Transactions still in-flight at simulation end.
+    pub in_flight_at_end: u64,
     /// Average TPS over the submission period.
     pub average_tps: f64,
     /// Peak instantaneous TPS observed.
@@ -270,10 +282,12 @@ impl SimulationReport {
         Duration::from_micros(self.latency_histogram.min())
     }
 
-    /// Success rate (finalized / submitted).
-    pub fn success_rate(&self) -> f64 {
-        if self.total_submitted > 0 {
-            self.total_finalized as f64 / self.total_submitted as f64
+    /// Rejection rate (rejected / (finalized + rejected)).
+    /// This is the meaningful failure rate - how many completed transactions failed.
+    pub fn rejection_rate(&self) -> f64 {
+        let completed = self.total_finalized + self.total_rejected;
+        if completed > 0 {
+            self.total_rejected as f64 / completed as f64
         } else {
             0.0
         }
@@ -289,13 +303,13 @@ impl SimulationReport {
         println!("  Submitted:  {}", self.total_submitted);
         println!("  Finalized:  {}", self.total_finalized);
         println!("  Rejected:   {}", self.total_rejected);
-        println!("  Success:    {:.2}%", self.success_rate() * 100.0);
+        println!("  In-flight:  {} (at cutoff)", self.in_flight_at_end);
         println!();
         println!("Throughput:");
         println!("  Average TPS: {:.2}", self.average_tps);
         println!("  Peak TPS:    {:.2}", self.peak_tps);
         println!();
-        println!("Latency:");
+        println!("Latency (finalized txs):");
         println!("  P50:  {:?}", self.p50_latency());
         println!("  P90:  {:?}", self.p90_latency());
         println!("  P99:  {:?}", self.p99_latency());
@@ -310,9 +324,7 @@ impl SimulationReport {
             self.peak_contention_ratio * 100.0
         );
         println!();
-        println!("Duration:");
-        println!("  Submission: {:?}", self.submission_duration);
-        println!("  Total:      {:?}", self.total_duration);
+        println!("Duration: {:?}", self.total_duration);
         println!("═══════════════════════════════════════════\n");
     }
 }

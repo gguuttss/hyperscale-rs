@@ -54,10 +54,6 @@ struct Args {
     #[arg(long)]
     cross_shard_ratio: Option<f64>,
 
-    /// Ramp-down time in seconds (wait for in-flight to complete)
-    #[arg(long, default_value = "30")]
-    ramp_down: u64,
-
     /// Show livelock analysis at end
     #[arg(long)]
     analyze_livelocks: bool,
@@ -135,20 +131,15 @@ fn main() {
     let mut simulator = Simulator::new(config).expect("Failed to create simulator");
     simulator.initialize();
 
-    // Run simulation
-    // Total time = submission duration + ramp-down
-    let total_duration = Duration::from_secs(args.duration + args.ramp_down);
-    let report = simulator.run_for(total_duration);
+    // Run simulation for the specified duration (hard stop, no ramp-down)
+    let report = simulator.run_for(Duration::from_secs(args.duration));
 
     // Print summary
     println!("\n=== Simulation Complete ===");
     println!("Submitted:  {}", report.total_submitted);
     println!("Finalized:  {}", report.total_finalized);
     println!("Rejected:   {}", report.total_rejected);
-    println!(
-        "Completion: {:.2}%",
-        report.total_finalized as f64 / report.total_submitted.max(1) as f64 * 100.0
-    );
+    println!("In-flight:  {}", report.in_flight_at_end);
     println!("TPS:        {:.2}", report.average_tps);
 
     // Livelock analysis

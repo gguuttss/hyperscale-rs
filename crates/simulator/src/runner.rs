@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Main simulator that orchestrates workload generation and metrics collection.
 pub struct Simulator {
@@ -211,33 +211,11 @@ impl Simulator {
             }
         }
 
-        // Submission phase complete
-        self.metrics.set_submission_end_time(self.runner.now());
-        info!(
-            in_flight = self.in_flight.len(),
-            "Submission phase complete, entering ramp-down"
-        );
-
-        // Ramp-down: wait for in-flight transactions to complete
-        let ramp_down_timeout = Duration::from_secs(30);
-        let ramp_down_deadline = self.runner.now() + ramp_down_timeout;
-
-        while !self.in_flight.is_empty() && self.runner.now() < ramp_down_deadline {
-            let step = Duration::from_millis(100);
-            self.runner.run_until(self.runner.now() + step);
-            self.check_completions();
-        }
-
-        if !self.in_flight.is_empty() {
-            warn!(
-                remaining = self.in_flight.len(),
-                "Ramp-down timeout reached with in-flight transactions"
-            );
-            // Debug: dump status of remaining transactions
-            self.dump_in_flight_status();
-        }
-
+        // Simulation complete
         let end_time = self.runner.now();
+        self.metrics.set_submission_end_time(end_time);
+        self.metrics
+            .set_in_flight_at_end(self.in_flight.len() as u64);
         info!(
             total_time_secs = (end_time - start_time).as_secs_f64(),
             "Simulation complete"
@@ -405,56 +383,6 @@ impl Simulator {
             self.config.validators_per_shard,
         );
         analyzer.analyze()
-    }
-
-    /// Debug helper: dump the status of all in-flight transactions.
-    fn dump_in_flight_status(&self) {
-        use std::collections::BTreeMap;
-
-        // Group by status for cleaner output
-        let mut by_status: BTreeMap<String, Vec<Hash>> = BTreeMap::new();
-        let mut not_found = Vec::new();
-
-        for (hash, (submit_time, shard)) in &self.in_flight {
-            let node_idx = self.get_node_for_shard(*shard);
-            if let Some(node) = self.runner.node(node_idx) {
-                if let Some(status) = node.mempool().status(hash) {
-                    let status_str = format!("{:?}", status);
-                    // Truncate long status strings
-                    let status_key = if status_str.len() > 50 {
-                        format!("{}...", &status_str[..50])
-                    } else {
-                        status_str
-                    };
-                    by_status.entry(status_key).or_default().push(*hash);
-                } else {
-                    not_found.push((*hash, *submit_time, *shard));
-                }
-            }
-        }
-
-        warn!("=== In-flight transaction status breakdown ===");
-        for (status, hashes) in &by_status {
-            warn!(
-                status = %status,
-                count = hashes.len(),
-                sample = ?hashes.first(),
-                "Status group"
-            );
-        }
-
-        if !not_found.is_empty() {
-            warn!(count = not_found.len(), "Transactions not found in mempool");
-            // Log a few samples
-            for (hash, submit_time, shard) in not_found.iter().take(3) {
-                warn!(
-                    ?hash,
-                    submit_time_ms = submit_time.as_millis(),
-                    shard = shard.0,
-                    "Not found in mempool"
-                );
-            }
-        }
     }
 }
 
