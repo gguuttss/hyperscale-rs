@@ -361,8 +361,6 @@ mod tests {
         // Simulate BFT committing block 1 - this triggers sending block 2
         let actions = sync.set_committed_height(1);
 
-        // Should try to send block 2 (but we haven't received it yet, so no action)
-        // Actually block 2 isn't received yet, so no SyncBlockReadyToApply
         assert!(
             actions.is_empty()
                 || actions.iter().all(|a| !matches!(

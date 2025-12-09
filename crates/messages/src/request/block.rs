@@ -1,20 +1,23 @@
 //! Block fetch request.
 
 use crate::response::GetBlockResponse;
-use hyperscale_types::{Hash, NetworkMessage, Request};
+use hyperscale_types::{BlockHeight, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
-/// Request to fetch a full Block by hash during sync or catch-up.
+/// Request to fetch a full Block by height during sync or catch-up.
+///
+/// Note: The wire format encodes this as `height.to_le_bytes()` (8 bytes).
+/// This type exists for documentation and type-safety in the message layer.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockRequest {
-    /// Hash of the block being requested
-    pub block_hash: Hash,
+    /// Height of the block being requested.
+    pub height: BlockHeight,
 }
 
 impl GetBlockRequest {
     /// Create a new block fetch request.
-    pub fn new(block_hash: Hash) -> Self {
-        Self { block_hash }
+    pub fn new(height: BlockHeight) -> Self {
+        Self { height }
     }
 }
 
@@ -37,8 +40,7 @@ mod tests {
 
     #[test]
     fn test_get_block_request() {
-        let hash = Hash::from_bytes(b"test_block");
-        let request = GetBlockRequest::new(hash);
-        assert_eq!(request.block_hash, hash);
+        let request = GetBlockRequest::new(BlockHeight(42));
+        assert_eq!(request.height, BlockHeight(42));
     }
 }

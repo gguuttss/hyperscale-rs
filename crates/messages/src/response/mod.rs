@@ -6,4 +6,3 @@ mod block;
 mod sync;
 
 pub use block::GetBlockResponse;
-pub use sync::GetBlockInventoryResponse;

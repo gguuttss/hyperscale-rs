@@ -1,46 +1,7 @@
 //! Sync-related request messages.
 
-use crate::response::GetBlockInventoryResponse;
-use hyperscale_types::{
-    BlockHeight, NetworkMessage, Request, ShardMessage, Signature, ValidatorId,
-};
+use hyperscale_types::{BlockHeight, NetworkMessage, ShardMessage, Signature, ValidatorId};
 use sbor::prelude::BasicSbor;
-
-/// Request for block inventory from a peer starting at a given height.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GetBlockInventoryRequest {
-    /// Validator requesting the inventory
-    pub requester: ValidatorId,
-
-    /// Starting block height for the inventory request.
-    ///
-    /// The peer should return blocks from this height onwards.
-    /// This allows efficient pagination during sync.
-    pub from_height: BlockHeight,
-}
-
-impl GetBlockInventoryRequest {
-    /// Create a new block inventory request.
-    pub fn new(requester: ValidatorId, from_height: BlockHeight) -> Self {
-        Self {
-            requester,
-            from_height,
-        }
-    }
-}
-
-// Network message implementation
-impl NetworkMessage for GetBlockInventoryRequest {
-    fn message_type_id() -> &'static str {
-        "block.inventory.request"
-    }
-}
-
-/// Type-safe request/response pairing.
-/// GetBlockInventoryRequest expects GetBlockInventoryResponse.
-impl Request for GetBlockInventoryRequest {
-    type Response = GetBlockInventoryResponse;
-}
 
 /// Broadcast that validator has caught up to network head and is ready to participate.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -78,13 +39,6 @@ impl ShardMessage for SyncCompleteAnnouncement {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_get_block_inventory_request() {
-        let request = GetBlockInventoryRequest::new(ValidatorId(0), BlockHeight(100));
-        assert_eq!(request.requester, ValidatorId(0));
-        assert_eq!(request.from_height, BlockHeight(100));
-    }
 
     #[test]
     fn test_sync_complete_announcement() {

@@ -53,6 +53,8 @@ pub struct Metrics {
     pub sync_blocks_behind: Gauge,
     pub sync_blocks_downloaded: Counter,
     pub sync_in_progress: Gauge,
+    pub sync_response_errors: CounterVec,
+    pub sync_peers_banned: Counter,
 
     // === Livelock ===
     pub livelock_cycles_detected: Counter,
@@ -241,6 +243,19 @@ impl Metrics {
             )
             .unwrap(),
 
+            sync_response_errors: register_counter_vec!(
+                "hyperscale_sync_response_errors_total",
+                "Total sync response errors by type",
+                &["error_type"]
+            )
+            .unwrap(),
+
+            sync_peers_banned: register_counter!(
+                "hyperscale_sync_peers_banned_total",
+                "Total peers banned for malicious sync responses"
+            )
+            .unwrap(),
+
             // Livelock
             livelock_cycles_detected: register_counter!(
                 "hyperscale_livelock_cycles_detected_total",
@@ -411,6 +426,38 @@ pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
 /// Record a block downloaded during sync.
 pub fn record_sync_block_downloaded() {
     metrics().sync_blocks_downloaded.inc();
+}
+
+/// Record a sync response error by type.
+///
+/// **Cardinality control**: Use only these predefined error types (from `SyncResponseError::metric_label()`):
+///
+/// Non-malicious (retry with different peer):
+/// - `"no_request"` - response when no request pending
+/// - `"peer_mismatch"` - response from unexpected peer
+/// - `"request_id_mismatch"` - wrong request ID
+/// - `"state_mismatch"` - block doesn't extend current state
+/// - `"timeout"` - request timed out
+/// - `"network_error"` - network-level failure
+/// - `"empty_response"` - peer doesn't have the block (may have pruned it)
+///
+/// Malicious (results in peer ban):
+/// - `"qc_hash_mismatch"` - QC doesn't match block
+/// - `"qc_height_mismatch"` - QC height wrong
+/// - `"qc_sig_invalid"` - QC signature invalid
+/// - `"qc_no_quorum"` - QC lacks quorum
+/// - `"block_hash_mismatch"` - block hash mismatch
+/// - `"block_parent_mismatch"` - block parent mismatch
+pub fn record_sync_response_error(error_type: &str) {
+    metrics()
+        .sync_response_errors
+        .with_label_values(&[error_type])
+        .inc();
+}
+
+/// Record a peer banned for malicious sync behavior.
+pub fn record_sync_peer_banned() {
+    metrics().sync_peers_banned.inc();
 }
 
 /// Record a livelock cycle detection event.

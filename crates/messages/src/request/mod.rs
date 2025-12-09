@@ -6,4 +6,4 @@ mod block;
 mod sync;
 
 pub use block::GetBlockRequest;
-pub use sync::{GetBlockInventoryRequest, SyncCompleteAnnouncement};
+pub use sync::SyncCompleteAnnouncement;

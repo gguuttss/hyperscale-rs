@@ -11,6 +11,6 @@ pub use gossip::{
     StateVoteBlockGossip, TransactionGossip, ViewChangeCertificateGossip, ViewChangeVote,
     ViewChangeVoteGossip,
 };
-pub use request::{GetBlockInventoryRequest, GetBlockRequest, SyncCompleteAnnouncement};
-pub use response::{GetBlockInventoryResponse, GetBlockResponse};
+pub use request::{GetBlockRequest, SyncCompleteAnnouncement};
+pub use response::GetBlockResponse;
 pub use trace_context::TraceContext;

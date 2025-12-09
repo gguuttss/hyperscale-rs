@@ -21,6 +21,7 @@ hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-node.workspace = true
+hyperscale-sync.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
 

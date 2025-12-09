@@ -42,7 +42,9 @@
 //! ```
 
 mod config;
+mod error;
 mod state;
 
 pub use config::SyncConfig;
+pub use error::SyncResponseError;
 pub use state::SyncState;

@@ -12,13 +12,83 @@
 use crate::metrics;
 use crate::network::Libp2pAdapter;
 use hyperscale_core::Event;
+use hyperscale_sync::SyncResponseError;
 use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate};
 use libp2p::PeerId;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sync State Types (for Status API)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The current state of the sync protocol.
+///
+/// This enum represents the high-level sync state for external observability.
+/// Note: This lives in `SyncManager` (production-only), not in `SyncState`
+/// (deterministic state machine), as it involves I/O concerns like peer queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncStateKind {
+    /// Not syncing, node is up to date.
+    Idle,
+    /// Actively fetching and applying blocks.
+    Syncing,
+}
+
+impl SyncStateKind {
+    /// Returns a string representation for metrics/logging.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncStateKind::Idle => "idle",
+            SyncStateKind::Syncing => "syncing",
+        }
+    }
+}
+
+/// Sync status for external APIs.
+///
+/// This struct provides a snapshot of the sync manager's current state,
+/// suitable for JSON serialization and exposure via HTTP endpoints.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncStatus {
+    /// Current sync state ("idle" or "syncing").
+    pub state: SyncStateKind,
+    /// Current committed height.
+    pub current_height: u64,
+    /// Target height (if syncing).
+    pub target_height: Option<u64>,
+    /// Number of blocks behind target.
+    pub blocks_behind: u64,
+    /// Number of connected peers capable of sync.
+    pub sync_peers: usize,
+    /// Number of pending fetch requests.
+    pub pending_fetches: usize,
+    /// Number of heights queued for fetch.
+    pub queued_heights: usize,
+}
+
+impl Default for SyncStatus {
+    fn default() -> Self {
+        Self {
+            state: SyncStateKind::Idle,
+            current_height: 0,
+            target_height: None,
+            blocks_behind: 0,
+            sync_peers: 0,
+            pending_fetches: 0,
+            queued_heights: 0,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sync Configuration
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Configuration for the sync manager.
 #[derive(Debug, Clone)]
@@ -33,6 +103,11 @@ pub struct SyncConfig {
     pub max_retries_per_peer: u32,
     /// Cooldown period before retrying a failed peer.
     pub peer_cooldown: Duration,
+    /// Base ban duration for malicious peers.
+    /// Actual ban duration uses exponential backoff: base * 2^(ban_count - 1)
+    pub base_ban_duration: Duration,
+    /// Maximum ban duration (caps the exponential backoff).
+    pub max_ban_duration: Duration,
 }
 
 impl Default for SyncConfig {
@@ -43,19 +118,36 @@ impl Default for SyncConfig {
             max_timeout: Duration::from_secs(30),
             max_retries_per_peer: 3,
             peer_cooldown: Duration::from_secs(60),
+            base_ban_duration: Duration::from_secs(600), // 10 minutes
+            max_ban_duration: Duration::from_secs(86400), // 24 hours
         }
     }
 }
 
-/// Tracks the state of a peer for sync purposes.
-#[derive(Debug, Default)]
-struct PeerState {
-    /// Number of consecutive failures.
-    failure_count: u32,
-    /// Time of last failure (for cooldown).
-    last_failure: Option<Instant>,
+// ═══════════════════════════════════════════════════════════════════════════
+// Peer Reputation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Peer reputation for sync protocol.
+///
+/// Tracks peer behavior to identify reliable peers and ban malicious ones.
+/// Reputation is used for peer selection and malicious peer detection.
+#[derive(Debug, Clone, Default)]
+pub struct PeerReputation {
+    /// Number of successful sync responses.
+    pub successes: u32,
+    /// Number of non-malicious failures (timeouts, network errors).
+    pub failures: u32,
     /// Number of in-flight requests to this peer.
-    in_flight: u32,
+    pub in_flight: u32,
+    /// Whether this peer is currently banned.
+    pub banned_until: Option<Instant>,
+    /// Number of times this peer has been banned (for exponential backoff).
+    pub ban_count: u32,
+    /// Time of last successful response.
+    pub last_success: Option<Instant>,
+    /// Time of last failure (for cooldown calculation).
+    pub last_failure: Option<Instant>,
 }
 
 /// A pending sync fetch request.
@@ -71,6 +163,56 @@ struct PendingFetch {
     /// Current retry count.
     retries: u32,
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Validation Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Validate a sync response (block + QC) before accepting it.
+///
+/// This performs basic structural validation:
+/// - Block height matches the requested height
+/// - QC hash matches the block's hash
+/// - QC height matches the block's height
+///
+/// Note: Full QC signature verification is done later by BftState.
+///
+/// Returns `Ok(())` if valid, or a `SyncResponseError` describing the issue.
+pub fn validate_sync_response(
+    requested_height: u64,
+    block: &Block,
+    qc: &QuorumCertificate,
+) -> Result<(), SyncResponseError> {
+    // Validate block height matches request
+    if block.header.height.0 != requested_height {
+        return Err(SyncResponseError::StateMismatch {
+            height: block.header.height.0,
+            current: requested_height,
+        });
+    }
+
+    // Validate QC certifies this block (hash match)
+    let block_hash = block.hash();
+    if qc.block_hash != block_hash {
+        return Err(SyncResponseError::QcBlockHashMismatch {
+            height: requested_height,
+        });
+    }
+
+    // Validate QC height matches block height
+    if qc.height.0 != requested_height {
+        return Err(SyncResponseError::QcHeightMismatch {
+            block_height: requested_height,
+            qc_height: qc.height.0,
+        });
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SyncManager Implementation
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Manages sync block fetching for the production runner.
 ///
@@ -95,8 +237,8 @@ pub struct SyncManager {
     fetched_heights: HashSet<u64>,
     /// Currently pending fetch requests.
     pending_fetches: HashMap<u64, PendingFetch>,
-    /// Peer states for selection and failure tracking.
-    peer_states: HashMap<PeerId, PeerState>,
+    /// Peer reputations for selection and failure tracking.
+    peer_reputations: HashMap<PeerId, PeerReputation>,
     /// Known peers (connected validators).
     known_peers: Vec<PeerId>,
     /// Our current committed height (updated by state machine).
@@ -118,7 +260,7 @@ impl SyncManager {
             heights_to_fetch: VecDeque::new(),
             fetched_heights: HashSet::new(),
             pending_fetches: HashMap::new(),
-            peer_states: HashMap::new(),
+            peer_reputations: HashMap::new(),
             known_peers: Vec::new(),
             committed_height: 0,
         }
@@ -128,7 +270,8 @@ impl SyncManager {
     pub fn register_peer(&mut self, peer_id: PeerId) {
         if !self.known_peers.contains(&peer_id) {
             self.known_peers.push(peer_id);
-            self.peer_states.insert(peer_id, PeerState::default());
+            self.peer_reputations
+                .insert(peer_id, PeerReputation::default());
             debug!(?peer_id, "Registered sync peer");
         }
     }
@@ -136,7 +279,7 @@ impl SyncManager {
     /// Remove a peer (disconnected).
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.known_peers.retain(|p| p != peer_id);
-        self.peer_states.remove(peer_id);
+        self.peer_reputations.remove(peer_id);
         debug!(?peer_id, "Removed sync peer");
     }
 
@@ -155,6 +298,31 @@ impl SyncManager {
         self.sync_target
             .map(|(target, _)| target.saturating_sub(self.committed_height))
             .unwrap_or(0)
+    }
+
+    /// Get the current sync state kind.
+    pub fn state_kind(&self) -> SyncStateKind {
+        if self.sync_target.is_some() {
+            SyncStateKind::Syncing
+        } else {
+            SyncStateKind::Idle
+        }
+    }
+
+    /// Get a snapshot of the current sync status for external APIs.
+    ///
+    /// This provides a complete view of the sync manager's state,
+    /// suitable for JSON serialization and exposure via HTTP endpoints.
+    pub fn status(&self) -> SyncStatus {
+        SyncStatus {
+            state: self.state_kind(),
+            current_height: self.committed_height,
+            target_height: self.sync_target.map(|(h, _)| h),
+            blocks_behind: self.blocks_behind(),
+            sync_peers: self.known_peers.len(),
+            pending_fetches: self.pending_fetches.len(),
+            queued_heights: self.heights_to_fetch.len(),
+        }
     }
 
     /// Update the committed height (called when state machine commits a block).
@@ -254,10 +422,12 @@ impl SyncManager {
     ) {
         // Remove from pending
         if let Some(_pending) = self.pending_fetches.remove(&height) {
-            // Mark peer as successful
-            if let Some(state) = self.peer_states.get_mut(&from_peer) {
-                state.failure_count = 0;
-                state.in_flight = state.in_flight.saturating_sub(1);
+            // Mark peer as successful - reset failure count and record success
+            if let Some(rep) = self.peer_reputations.get_mut(&from_peer) {
+                rep.successes += 1;
+                rep.failures = 0; // Reset on success
+                rep.in_flight = rep.in_flight.saturating_sub(1);
+                rep.last_success = Some(Instant::now());
             }
 
             trace!(height, ?from_peer, "Block received for sync");
@@ -284,15 +454,26 @@ impl SyncManager {
     }
 
     /// Handle a failed fetch (timeout or error).
+    ///
+    /// This is for non-malicious failures like timeouts and network errors.
+    /// For malicious responses, use `on_sync_response_error()` instead.
     pub fn on_fetch_failed(&mut self, height: u64, peer: PeerId, reason: &str) {
         if let Some(_pending) = self.pending_fetches.remove(&height) {
             warn!(height, ?peer, reason, "Sync fetch failed");
 
-            // Update peer state
-            if let Some(state) = self.peer_states.get_mut(&peer) {
-                state.failure_count += 1;
-                state.last_failure = Some(Instant::now());
-                state.in_flight = state.in_flight.saturating_sub(1);
+            // Record metric for the failure type
+            let error_type = if reason.contains("timeout") {
+                "timeout"
+            } else {
+                "network_error"
+            };
+            metrics::record_sync_response_error(error_type);
+
+            // Update peer reputation (non-malicious failure)
+            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                rep.failures += 1;
+                rep.last_failure = Some(Instant::now());
+                rep.in_flight = rep.in_flight.saturating_sub(1);
             }
 
             // Re-queue the height for retry (with a different peer if possible)
@@ -301,26 +482,38 @@ impl SyncManager {
     }
 
     /// Select the best peer for a sync request.
+    ///
+    /// Selection criteria:
+    /// 1. Skip banned peers
+    /// 2. Skip peers in cooldown (too many failures)
+    /// 3. Skip peers with too many in-flight requests
+    /// 4. Prefer peers with fewer in-flight requests
+    /// 5. Prefer peers with fewer failures
     fn select_peer(&mut self) -> Option<PeerId> {
         let now = Instant::now();
 
-        // Filter out peers that are in cooldown or have too many in-flight requests
+        // Filter out banned, cooldown, and overloaded peers
         let available: Vec<_> = self
             .known_peers
             .iter()
             .filter(|peer| {
-                if let Some(state) = self.peer_states.get(peer) {
-                    // Check cooldown
-                    if state.failure_count >= self.config.max_retries_per_peer {
-                        if let Some(last_failure) = state.last_failure {
+                if let Some(rep) = self.peer_reputations.get(peer) {
+                    // Skip banned peers
+                    if self.is_peer_banned_inner(rep, now) {
+                        return false;
+                    }
+
+                    // Check failure cooldown (for non-banned peers with many failures)
+                    if rep.failures >= self.config.max_retries_per_peer {
+                        if let Some(last_failure) = rep.last_failure {
                             if now.duration_since(last_failure) < self.config.peer_cooldown {
                                 return false;
                             }
-                            // Reset failure count after cooldown
                         }
                     }
+
                     // Allow up to 2 concurrent requests per peer
-                    state.in_flight < 2
+                    rep.in_flight < 2
                 } else {
                     true
                 }
@@ -334,21 +527,107 @@ impl SyncManager {
 
         // Select peer with fewest in-flight requests and lowest failure count
         available.into_iter().min_by_key(|peer| {
-            let state = self
-                .peer_states
+            let rep = self
+                .peer_reputations
                 .get(peer)
-                .map(|s| (s.in_flight, s.failure_count));
-            state.unwrap_or((0, 0))
+                .map(|r| (r.in_flight, r.failures));
+            rep.unwrap_or((0, 0))
         })
+    }
+
+    /// Check if a peer is banned (internal helper using pre-fetched Instant).
+    fn is_peer_banned_inner(&self, rep: &PeerReputation, now: Instant) -> bool {
+        rep.banned_until.is_some_and(|until| now < until)
+    }
+
+    /// Check if a peer is currently banned.
+    pub fn is_peer_banned(&self, peer: &PeerId) -> bool {
+        self.peer_reputations
+            .get(peer)
+            .map(|rep| self.is_peer_banned_inner(rep, Instant::now()))
+            .unwrap_or(false)
+    }
+
+    /// Ban a peer for malicious behavior.
+    ///
+    /// Uses exponential backoff for repeat offenders:
+    /// - 1st ban: base_ban_duration (default 10 min)
+    /// - 2nd ban: base * 2 (20 min)
+    /// - 3rd ban: base * 4 (40 min)
+    /// - ... capped at max_ban_duration (default 24 hours)
+    fn ban_peer(&mut self, peer: PeerId, error: &SyncResponseError) {
+        let rep = self.peer_reputations.entry(peer).or_default();
+
+        // Calculate ban duration with exponential backoff
+        let multiplier = 2u32.saturating_pow(rep.ban_count.min(10));
+        let ban_duration = self
+            .config
+            .base_ban_duration
+            .saturating_mul(multiplier)
+            .min(self.config.max_ban_duration);
+
+        rep.banned_until = Some(Instant::now() + ban_duration);
+        rep.ban_count += 1;
+
+        warn!(
+            ?peer,
+            error = %error,
+            ban_duration_secs = ban_duration.as_secs(),
+            ban_count = rep.ban_count,
+            "Banning peer for malicious sync response"
+        );
+
+        // Record metric
+        metrics::record_sync_peer_banned();
+    }
+
+    /// Handle a sync response error.
+    ///
+    /// This method categorizes errors as malicious or non-malicious:
+    /// - Malicious errors (invalid blocks, bad QCs) result in peer bans
+    /// - Non-malicious errors (timeouts, network issues) just increment failure count
+    ///
+    /// The height is re-queued for retry with a different peer.
+    pub fn on_sync_response_error(&mut self, peer: PeerId, height: u64, error: SyncResponseError) {
+        // Record the error metric
+        metrics::record_sync_response_error(error.metric_label());
+
+        // Remove from pending (if present)
+        self.pending_fetches.remove(&height);
+
+        // Update in-flight count
+        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+            rep.in_flight = rep.in_flight.saturating_sub(1);
+        }
+
+        if error.is_malicious() {
+            // Ban the peer for malicious behavior
+            self.ban_peer(peer, &error);
+        } else {
+            // Non-malicious: just increment failure count
+            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                rep.failures += 1;
+                rep.last_failure = Some(Instant::now());
+            }
+            debug!(
+                ?peer,
+                height,
+                error = %error,
+                "Non-malicious sync error"
+            );
+        }
+
+        // Re-queue the height for retry with a different peer
+        self.heights_to_fetch.push_back(height);
     }
 
     /// Start a fetch request for a specific height.
     async fn start_fetch(&mut self, height: u64, peer: PeerId) {
         trace!(height, ?peer, "Starting sync fetch");
 
-        // Update peer state
-        if let Some(state) = self.peer_states.get_mut(&peer) {
-            state.in_flight += 1;
+        // Update peer reputation
+        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+            rep.in_flight += 1;
         }
 
         // Record pending fetch
@@ -362,13 +641,56 @@ impl SyncManager {
             },
         );
 
-        // Send the request via libp2p request-response
-        // Note: The actual request is sent via the network adapter
-        // For now, we just record the pending state - the network layer
-        // will call on_block_received or on_fetch_failed when done
-        if let Err(e) = self.network.request_block(peer, BlockHeight(height)).await {
-            warn!(height, ?peer, error = ?e, "Failed to send sync request");
-            self.on_fetch_failed(height, peer, "send failed");
+        // Send the request and handle the response
+        match self.network.request_block(peer, BlockHeight(height)).await {
+            Ok(response_bytes) => {
+                self.handle_block_response(height, peer, response_bytes)
+                    .await;
+            }
+            Err(e) => {
+                warn!(height, ?peer, error = ?e, "Failed to send sync request");
+                self.on_fetch_failed(height, peer, &format!("network error: {e}"));
+            }
+        }
+    }
+
+    /// Handle a block response from a peer.
+    ///
+    /// Decodes the response, validates the block and QC, and either:
+    /// - Calls `on_block_received` for valid blocks
+    /// - Calls `on_sync_response_error` for invalid/empty responses
+    async fn handle_block_response(&mut self, height: u64, peer: PeerId, response_bytes: Vec<u8>) {
+        // Decode the response: (Option<Block>, Option<QC>)
+        let decoded: Result<(Option<Block>, Option<QuorumCertificate>), _> =
+            sbor::basic_decode(&response_bytes);
+
+        match decoded {
+            Ok((Some(block), Some(qc))) => {
+                // Validate block and QC
+                match validate_sync_response(height, &block, &qc) {
+                    Ok(()) => {
+                        // Block and QC are valid - deliver to state machine
+                        // Note: Full QC signature verification happens in BftState
+                        self.on_block_received(height, block, qc, peer).await;
+                    }
+                    Err(error) => {
+                        self.on_sync_response_error(peer, height, error);
+                    }
+                }
+            }
+            Ok((None, _)) | Ok((_, None)) => {
+                // Peer doesn't have this block (empty response)
+                let error = SyncResponseError::EmptyResponse { height };
+                self.on_sync_response_error(peer, height, error);
+            }
+            Err(e) => {
+                // Decode error - treat as network error (non-malicious)
+                warn!(height, ?peer, error = ?e, "Failed to decode sync response");
+                let error = SyncResponseError::NetworkError {
+                    reason: format!("decode error: {e:?}"),
+                };
+                self.on_sync_response_error(peer, height, error);
+            }
         }
     }
 
@@ -393,6 +715,164 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::PeerId;
+    use std::time::Duration;
+
+    /// Test-only helper to create a SyncManager without network dependencies.
+    /// This creates a manager with mock/stub internals suitable for unit testing
+    /// the peer reputation, banning, and status logic.
+    fn create_test_sync_manager() -> TestSyncManager {
+        TestSyncManager {
+            config: SyncConfig::default(),
+            sync_target: None,
+            heights_to_fetch: VecDeque::new(),
+            fetched_heights: HashSet::new(),
+            pending_fetches: HashMap::new(),
+            peer_reputations: HashMap::new(),
+            known_peers: Vec::new(),
+            committed_height: 0,
+        }
+    }
+
+    /// A test-only version of SyncManager that doesn't require network.
+    /// Contains the same fields as SyncManager that are relevant for testing
+    /// peer reputation and sync status logic.
+    struct TestSyncManager {
+        config: SyncConfig,
+        sync_target: Option<(u64, Hash)>,
+        heights_to_fetch: VecDeque<u64>,
+        #[allow(dead_code)]
+        fetched_heights: HashSet<u64>,
+        pending_fetches: HashMap<u64, PendingFetch>,
+        peer_reputations: HashMap<PeerId, PeerReputation>,
+        known_peers: Vec<PeerId>,
+        committed_height: u64,
+    }
+
+    impl TestSyncManager {
+        fn register_peer(&mut self, peer_id: PeerId) {
+            if !self.known_peers.contains(&peer_id) {
+                self.known_peers.push(peer_id);
+                self.peer_reputations
+                    .insert(peer_id, PeerReputation::default());
+            }
+        }
+
+        fn is_peer_banned(&self, peer: &PeerId) -> bool {
+            self.peer_reputations
+                .get(peer)
+                .map(|rep| rep.banned_until.is_some_and(|until| Instant::now() < until))
+                .unwrap_or(false)
+        }
+
+        fn ban_peer(&mut self, peer: PeerId, _error: &SyncResponseError) {
+            let rep = self.peer_reputations.entry(peer).or_default();
+
+            let multiplier = 2u32.saturating_pow(rep.ban_count.min(10));
+            let ban_duration = self
+                .config
+                .base_ban_duration
+                .saturating_mul(multiplier)
+                .min(self.config.max_ban_duration);
+
+            rep.banned_until = Some(Instant::now() + ban_duration);
+            rep.ban_count += 1;
+        }
+
+        fn on_sync_response_error(&mut self, peer: PeerId, height: u64, error: SyncResponseError) {
+            self.pending_fetches.remove(&height);
+
+            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                rep.in_flight = rep.in_flight.saturating_sub(1);
+            }
+
+            if error.is_malicious() {
+                self.ban_peer(peer, &error);
+            } else if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                rep.failures += 1;
+                rep.last_failure = Some(Instant::now());
+            }
+
+            self.heights_to_fetch.push_back(height);
+        }
+
+        fn select_peer(&self) -> Option<PeerId> {
+            let now = Instant::now();
+
+            let available: Vec<_> = self
+                .known_peers
+                .iter()
+                .filter(|peer| {
+                    if let Some(rep) = self.peer_reputations.get(peer) {
+                        // Skip banned peers
+                        if rep.banned_until.is_some_and(|until| now < until) {
+                            return false;
+                        }
+
+                        // Check failure cooldown
+                        if rep.failures >= self.config.max_retries_per_peer {
+                            if let Some(last_failure) = rep.last_failure {
+                                if now.duration_since(last_failure) < self.config.peer_cooldown {
+                                    return false;
+                                }
+                            }
+                        }
+
+                        rep.in_flight < 2
+                    } else {
+                        true
+                    }
+                })
+                .copied()
+                .collect();
+
+            if available.is_empty() {
+                return None;
+            }
+
+            available.into_iter().min_by_key(|peer| {
+                let rep = self
+                    .peer_reputations
+                    .get(peer)
+                    .map(|r| (r.in_flight, r.failures));
+                rep.unwrap_or((0, 0))
+            })
+        }
+
+        fn state_kind(&self) -> SyncStateKind {
+            if self.sync_target.is_some() {
+                SyncStateKind::Syncing
+            } else {
+                SyncStateKind::Idle
+            }
+        }
+
+        fn status(&self) -> SyncStatus {
+            SyncStatus {
+                state: self.state_kind(),
+                current_height: self.committed_height,
+                target_height: self.sync_target.map(|(h, _)| h),
+                blocks_behind: self
+                    .sync_target
+                    .map(|(target, _)| target.saturating_sub(self.committed_height))
+                    .unwrap_or(0),
+                sync_peers: self.known_peers.len(),
+                pending_fetches: self.pending_fetches.len(),
+                queued_heights: self.heights_to_fetch.len(),
+            }
+        }
+
+        fn start_sync(&mut self, target_height: u64, target_hash: Hash) {
+            self.sync_target = Some((target_height, target_hash));
+            for h in (self.committed_height + 1)..=target_height {
+                self.heights_to_fetch.push_back(h);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Existing tests
+    // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_sync_config_defaults() {
@@ -407,5 +887,626 @@ mod tests {
         // Can't easily test without a network, but we can test the config
         let config = SyncConfig::default();
         assert!(config.max_concurrent_fetches > 0);
+    }
+
+    #[test]
+    fn test_sync_state_kind_serialization() {
+        // Test that SyncStateKind serializes correctly
+        let idle = SyncStateKind::Idle;
+        let syncing = SyncStateKind::Syncing;
+
+        assert_eq!(idle.as_str(), "idle");
+        assert_eq!(syncing.as_str(), "syncing");
+
+        // Test JSON serialization
+        let idle_json = serde_json::to_string(&idle).unwrap();
+        let syncing_json = serde_json::to_string(&syncing).unwrap();
+
+        assert_eq!(idle_json, "\"idle\"");
+        assert_eq!(syncing_json, "\"syncing\"");
+    }
+
+    #[test]
+    fn test_sync_status_serialization() {
+        let status = SyncStatus {
+            state: SyncStateKind::Syncing,
+            current_height: 100,
+            target_height: Some(200),
+            blocks_behind: 100,
+            sync_peers: 3,
+            pending_fetches: 2,
+            queued_heights: 98,
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+
+        assert_eq!(json["state"], "syncing");
+        assert_eq!(json["current_height"], 100);
+        assert_eq!(json["target_height"], 200);
+        assert_eq!(json["blocks_behind"], 100);
+        assert_eq!(json["sync_peers"], 3);
+        assert_eq!(json["pending_fetches"], 2);
+        assert_eq!(json["queued_heights"], 98);
+    }
+
+    #[test]
+    fn test_sync_status_idle() {
+        let status = SyncStatus {
+            state: SyncStateKind::Idle,
+            current_height: 500,
+            target_height: None,
+            blocks_behind: 0,
+            sync_peers: 5,
+            pending_fetches: 0,
+            queued_heights: 0,
+        };
+
+        let json = serde_json::to_value(&status).unwrap();
+
+        assert_eq!(json["state"], "idle");
+        assert_eq!(json["current_height"], 500);
+        assert!(json["target_height"].is_null());
+        assert_eq!(json["blocks_behind"], 0);
+    }
+
+    #[test]
+    fn test_sync_config_ban_defaults() {
+        let config = SyncConfig::default();
+        assert_eq!(config.base_ban_duration, Duration::from_secs(600));
+        assert_eq!(config.max_ban_duration, Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_peer_reputation_default() {
+        let rep = PeerReputation::default();
+        assert_eq!(rep.successes, 0);
+        assert_eq!(rep.failures, 0);
+        assert_eq!(rep.in_flight, 0);
+        assert!(rep.banned_until.is_none());
+        assert_eq!(rep.ban_count, 0);
+        assert!(rep.last_success.is_none());
+        assert!(rep.last_failure.is_none());
+    }
+
+    #[test]
+    fn test_sync_response_error_malicious_detection() {
+        // Test that malicious errors are correctly identified
+        // These are errors where the peer sent provably invalid data
+        let malicious_errors = [
+            SyncResponseError::QcBlockHashMismatch { height: 1 },
+            SyncResponseError::QcHeightMismatch {
+                block_height: 1,
+                qc_height: 2,
+            },
+            SyncResponseError::QcSignatureInvalid { height: 1 },
+            SyncResponseError::QcInsufficientQuorum {
+                height: 1,
+                voting_power: 50,
+                required: 67,
+            },
+            SyncResponseError::BlockHashMismatch { height: 1 },
+            SyncResponseError::BlockParentMismatch { height: 1 },
+        ];
+
+        for err in malicious_errors {
+            assert!(err.is_malicious(), "{} should be malicious", err);
+        }
+
+        // Test that non-malicious errors are correctly identified
+        // These are transient issues that don't warrant banning
+        let non_malicious_errors = [
+            SyncResponseError::NoRequestPending,
+            SyncResponseError::PeerMismatch,
+            SyncResponseError::RequestIdMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            SyncResponseError::StateMismatch {
+                height: 10,
+                current: 20,
+            },
+            SyncResponseError::Timeout { height: 1 },
+            SyncResponseError::NetworkError {
+                reason: "test".to_string(),
+            },
+            // EmptyResponse is non-malicious - peer may have pruned the block
+            SyncResponseError::EmptyResponse { height: 1 },
+        ];
+
+        for err in non_malicious_errors {
+            assert!(!err.is_malicious(), "{} should not be malicious", err);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Peer banning tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_ban_peer_sets_banned_until() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        let error = SyncResponseError::QcBlockHashMismatch { height: 1 };
+        mgr.ban_peer(peer, &error);
+
+        // Peer should be banned
+        assert!(mgr.is_peer_banned(&peer));
+
+        // Ban count should be 1
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 1);
+        assert!(rep.banned_until.is_some());
+    }
+
+    #[test]
+    fn test_ban_peer_exponential_backoff() {
+        let mut mgr = create_test_sync_manager();
+        // Use short durations for testing
+        mgr.config.base_ban_duration = Duration::from_millis(100);
+        mgr.config.max_ban_duration = Duration::from_secs(10);
+
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        let error = SyncResponseError::QcSignatureInvalid { height: 1 };
+
+        // First ban: base duration (100ms)
+        mgr.ban_peer(peer, &error);
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 1);
+
+        // Second ban: 2x base (200ms)
+        mgr.ban_peer(peer, &error);
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 2);
+
+        // Third ban: 4x base (400ms)
+        mgr.ban_peer(peer, &error);
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 3);
+
+        // Fourth ban: 8x base (800ms)
+        mgr.ban_peer(peer, &error);
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 4);
+    }
+
+    #[test]
+    fn test_ban_duration_capped_at_max() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.base_ban_duration = Duration::from_secs(100);
+        mgr.config.max_ban_duration = Duration::from_secs(500);
+
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        let error = SyncResponseError::BlockHashMismatch { height: 1 };
+
+        // Ban multiple times to exceed max
+        for _ in 0..10 {
+            mgr.ban_peer(peer, &error);
+        }
+
+        // The ban duration should be capped, but we can verify ban_count increases
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.ban_count, 10);
+        // banned_until should be set (we can't easily check the exact duration without mocking time)
+        assert!(rep.banned_until.is_some());
+    }
+
+    #[test]
+    fn test_is_peer_banned_returns_false_for_unknown_peer() {
+        let mgr = create_test_sync_manager();
+        let unknown_peer = PeerId::random();
+
+        // Unknown peer should not be considered banned
+        assert!(!mgr.is_peer_banned(&unknown_peer));
+    }
+
+    #[test]
+    fn test_is_peer_banned_returns_false_for_unbanned_peer() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // Registered but not banned peer should not be banned
+        assert!(!mgr.is_peer_banned(&peer));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Peer selection tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_select_peer_returns_none_when_no_peers() {
+        let mgr = create_test_sync_manager();
+        assert!(mgr.select_peer().is_none());
+    }
+
+    #[test]
+    fn test_select_peer_returns_available_peer() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        let selected = mgr.select_peer();
+        assert_eq!(selected, Some(peer));
+    }
+
+    #[test]
+    fn test_select_peer_skips_banned_peers() {
+        let mut mgr = create_test_sync_manager();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Ban peer1
+        let error = SyncResponseError::QcBlockHashMismatch { height: 1 };
+        mgr.ban_peer(peer1, &error);
+
+        // Should select peer2 (the non-banned one)
+        let selected = mgr.select_peer();
+        assert_eq!(selected, Some(peer2));
+    }
+
+    #[test]
+    fn test_select_peer_returns_none_when_all_banned() {
+        let mut mgr = create_test_sync_manager();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Ban both peers
+        let error = SyncResponseError::QcBlockHashMismatch { height: 1 };
+        mgr.ban_peer(peer1, &error);
+        mgr.ban_peer(peer2, &error);
+
+        // No peers available
+        assert!(mgr.select_peer().is_none());
+    }
+
+    #[test]
+    fn test_select_peer_prefers_fewer_in_flight() {
+        let mut mgr = create_test_sync_manager();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Give peer1 an in-flight request
+        mgr.peer_reputations.get_mut(&peer1).unwrap().in_flight = 1;
+
+        // Should prefer peer2 (fewer in-flight)
+        let selected = mgr.select_peer();
+        assert_eq!(selected, Some(peer2));
+    }
+
+    #[test]
+    fn test_select_peer_skips_peers_at_max_in_flight() {
+        let mut mgr = create_test_sync_manager();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Give peer1 max in-flight requests (2)
+        mgr.peer_reputations.get_mut(&peer1).unwrap().in_flight = 2;
+
+        // Should only return peer2
+        let selected = mgr.select_peer();
+        assert_eq!(selected, Some(peer2));
+    }
+
+    #[test]
+    fn test_select_peer_skips_peers_in_cooldown() {
+        let mut mgr = create_test_sync_manager();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Put peer1 in cooldown (max failures + recent failure)
+        let rep1 = mgr.peer_reputations.get_mut(&peer1).unwrap();
+        rep1.failures = mgr.config.max_retries_per_peer;
+        rep1.last_failure = Some(Instant::now());
+
+        // Should select peer2 (peer1 is in cooldown)
+        let selected = mgr.select_peer();
+        assert_eq!(selected, Some(peer2));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // on_sync_response_error tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_on_sync_response_error_bans_for_malicious() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // Add a pending fetch to be removed
+        mgr.pending_fetches.insert(
+            100,
+            PendingFetch {
+                height: 100,
+                peer,
+                started: Instant::now(),
+                retries: 0,
+            },
+        );
+
+        // Send a malicious error
+        let error = SyncResponseError::QcSignatureInvalid { height: 100 };
+        mgr.on_sync_response_error(peer, 100, error);
+
+        // Peer should be banned
+        assert!(mgr.is_peer_banned(&peer));
+
+        // Height should be re-queued
+        assert!(mgr.heights_to_fetch.contains(&100));
+
+        // Pending fetch should be removed
+        assert!(!mgr.pending_fetches.contains_key(&100));
+    }
+
+    #[test]
+    fn test_on_sync_response_error_no_ban_for_non_malicious() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // Send a non-malicious error
+        let error = SyncResponseError::Timeout { height: 100 };
+        mgr.on_sync_response_error(peer, 100, error);
+
+        // Peer should NOT be banned
+        assert!(!mgr.is_peer_banned(&peer));
+
+        // But failure count should increase
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.failures, 1);
+        assert!(rep.last_failure.is_some());
+
+        // Height should be re-queued
+        assert!(mgr.heights_to_fetch.contains(&100));
+    }
+
+    #[test]
+    fn test_on_sync_response_error_empty_response_not_malicious() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // EmptyResponse is non-malicious (peer may have pruned the block)
+        let error = SyncResponseError::EmptyResponse { height: 100 };
+        mgr.on_sync_response_error(peer, 100, error);
+
+        // Peer should NOT be banned
+        assert!(!mgr.is_peer_banned(&peer));
+
+        // Failure count should increase
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.failures, 1);
+    }
+
+    #[test]
+    fn test_on_sync_response_error_decrements_in_flight() {
+        let mut mgr = create_test_sync_manager();
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // Set in_flight to 2
+        mgr.peer_reputations.get_mut(&peer).unwrap().in_flight = 2;
+
+        let error = SyncResponseError::NetworkError {
+            reason: "test".to_string(),
+        };
+        mgr.on_sync_response_error(peer, 100, error);
+
+        // in_flight should be decremented
+        let rep = mgr.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.in_flight, 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Status API tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_status_when_idle() {
+        let mut mgr = create_test_sync_manager();
+        mgr.committed_height = 100;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        let status = mgr.status();
+
+        assert_eq!(status.state, SyncStateKind::Idle);
+        assert_eq!(status.current_height, 100);
+        assert_eq!(status.target_height, None);
+        assert_eq!(status.blocks_behind, 0);
+        assert_eq!(status.sync_peers, 2);
+        assert_eq!(status.pending_fetches, 0);
+        assert_eq!(status.queued_heights, 0);
+    }
+
+    #[test]
+    fn test_status_when_syncing() {
+        let mut mgr = create_test_sync_manager();
+        mgr.committed_height = 50;
+
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        // Start syncing to height 100
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        let status = mgr.status();
+
+        assert_eq!(status.state, SyncStateKind::Syncing);
+        assert_eq!(status.current_height, 50);
+        assert_eq!(status.target_height, Some(100));
+        assert_eq!(status.blocks_behind, 50);
+        assert_eq!(status.sync_peers, 1);
+        assert_eq!(status.pending_fetches, 0);
+        assert_eq!(status.queued_heights, 50); // heights 51-100
+    }
+
+    #[test]
+    fn test_status_with_pending_fetches() {
+        let mut mgr = create_test_sync_manager();
+        mgr.committed_height = 50;
+
+        let peer = PeerId::random();
+        mgr.register_peer(peer);
+
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Add some pending fetches
+        mgr.pending_fetches.insert(
+            51,
+            PendingFetch {
+                height: 51,
+                peer,
+                started: Instant::now(),
+                retries: 0,
+            },
+        );
+        mgr.pending_fetches.insert(
+            52,
+            PendingFetch {
+                height: 52,
+                peer,
+                started: Instant::now(),
+                retries: 0,
+            },
+        );
+
+        let status = mgr.status();
+
+        assert_eq!(status.pending_fetches, 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync response validation tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    use hyperscale_types::{BlockHeader, Signature, SignerBitfield, ValidatorId, VotePower};
+
+    fn make_test_block(height: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                height: BlockHeight(height),
+                parent_hash: Hash::from_bytes(&[0u8; 32]),
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(0),
+                timestamp: 0,
+                round: 0,
+                is_fallback: false,
+            },
+            transactions: vec![],
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        }
+    }
+
+    fn make_valid_qc_for_block(block: &Block) -> QuorumCertificate {
+        QuorumCertificate {
+            block_hash: block.hash(),
+            height: block.header.height,
+            parent_block_hash: block.header.parent_hash,
+            round: block.header.round,
+            aggregated_signature: Signature::zero(),
+            signers: SignerBitfield::new(0),
+            voting_power: VotePower(u64::MAX),
+            weighted_timestamp_ms: 0,
+        }
+    }
+
+    #[test]
+    fn test_validate_sync_response_valid() {
+        let block = make_test_block(100);
+        let qc = make_valid_qc_for_block(&block);
+
+        let result = validate_sync_response(100, &block, &qc);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_sync_response_wrong_height() {
+        let block = make_test_block(100);
+        let qc = make_valid_qc_for_block(&block);
+
+        // Request height 99, but block is at height 100
+        let result = validate_sync_response(99, &block, &qc);
+        assert!(matches!(
+            result,
+            Err(SyncResponseError::StateMismatch {
+                height: 100,
+                current: 99
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_sync_response_qc_hash_mismatch() {
+        let block = make_test_block(100);
+        let mut qc = make_valid_qc_for_block(&block);
+        // Corrupt the QC's block hash
+        qc.block_hash = Hash::from_bytes(&[0xFFu8; 32]);
+
+        let result = validate_sync_response(100, &block, &qc);
+        assert!(matches!(
+            result,
+            Err(SyncResponseError::QcBlockHashMismatch { height: 100 })
+        ));
+
+        // This should be malicious
+        assert!(result.unwrap_err().is_malicious());
+    }
+
+    #[test]
+    fn test_validate_sync_response_qc_height_mismatch() {
+        let block = make_test_block(100);
+        let mut qc = make_valid_qc_for_block(&block);
+        // Corrupt the QC's height
+        qc.height = BlockHeight(99);
+
+        let result = validate_sync_response(100, &block, &qc);
+        assert!(matches!(
+            result,
+            Err(SyncResponseError::QcHeightMismatch {
+                block_height: 100,
+                qc_height: 99
+            })
+        ));
+
+        // This should be malicious
+        assert!(result.unwrap_err().is_malicious());
+    }
+
+    #[test]
+    fn test_validate_sync_response_all_checks_pass_in_order() {
+        // Height mismatch should be caught first (before QC validation)
+        let block = make_test_block(100);
+        let mut qc = make_valid_qc_for_block(&block);
+        qc.block_hash = Hash::from_bytes(&[0xFFu8; 32]); // Bad hash
+        qc.height = BlockHeight(99); // Bad height
+
+        // Request wrong height - should report StateMismatch, not QC errors
+        let result = validate_sync_response(50, &block, &qc);
+        assert!(matches!(
+            result,
+            Err(SyncResponseError::StateMismatch { .. })
+        ));
     }
 }

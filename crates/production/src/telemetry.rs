@@ -4,6 +4,7 @@
 //! The architecture instruments the production runner while preserving
 //! state machine determinism.
 
+use crate::sync::SyncStatus;
 use axum::{response::IntoResponse, routing::get, Router};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -18,8 +19,15 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+
+/// Provider for sync status, used by the telemetry HTTP server.
+///
+/// This is wrapped in `Arc<RwLock<>>` and updated by the runner,
+/// then read by the HTTP handler.
+pub type SyncStatusProvider = Arc<RwLock<SyncStatus>>;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -132,18 +140,24 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Start Prometheus metrics endpoint if enabled
-    let (prometheus_handle, ready_flag) = if config.prometheus_enabled {
+    let (prometheus_handle, ready_flag, sync_status) = if config.prometheus_enabled {
         let ready_flag = Arc::new(AtomicBool::new(false));
-        let handle = start_metrics_server(config.prometheus_port, ready_flag.clone());
-        (Some(handle), Some(ready_flag))
+        let sync_status = Arc::new(RwLock::new(SyncStatus::default()));
+        let handle = start_metrics_server(
+            config.prometheus_port,
+            ready_flag.clone(),
+            sync_status.clone(),
+        );
+        (Some(handle), Some(ready_flag), Some(sync_status))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     Ok(TelemetryGuard {
         tracer_provider,
         prometheus_handle,
         ready_flag,
+        sync_status,
     })
 }
 
@@ -155,6 +169,7 @@ pub struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
     prometheus_handle: Option<tokio::task::JoinHandle<()>>,
     ready_flag: Option<Arc<AtomicBool>>,
+    sync_status: Option<SyncStatusProvider>,
 }
 
 impl TelemetryGuard {
@@ -205,6 +220,14 @@ impl TelemetryGuard {
             flag.store(ready, Ordering::SeqCst);
         }
     }
+
+    /// Get the sync status provider for updating sync status.
+    ///
+    /// Returns `None` if Prometheus metrics are disabled.
+    /// The runner should call this to get a handle for updating sync status.
+    pub fn sync_status_provider(&self) -> Option<SyncStatusProvider> {
+        self.sync_status.clone()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -217,16 +240,26 @@ impl TelemetryGuard {
 /// - `GET /metrics` - Prometheus metrics in text format
 /// - `GET /health` - Liveness probe (always returns 200 if server is running)
 /// - `GET /ready` - Readiness probe (returns 200 if node is ready, 503 otherwise)
-fn start_metrics_server(port: u16, ready_flag: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+/// - `GET /system/sync-status` - Sync status for operational visibility
+fn start_metrics_server(
+    port: u16,
+    ready_flag: Arc<AtomicBool>,
+    sync_status: SyncStatusProvider,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let ready_flag_metrics = ready_flag.clone();
+        let ready_flag_clone = ready_flag.clone();
+        let sync_status_clone = sync_status.clone();
 
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/health", get(health_handler))
             .route(
                 "/ready",
-                get(move || ready_handler(ready_flag_metrics.clone())),
+                get(move || ready_handler(ready_flag_clone.clone())),
+            )
+            .route(
+                "/system/sync-status",
+                get(move || sync_status_handler(sync_status_clone.clone())),
             );
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -301,6 +334,14 @@ async fn ready_handler(ready_flag: Arc<AtomicBool>) -> impl axum::response::Into
             }),
         )
     }
+}
+
+/// Handler for `/system/sync-status` - sync status endpoint.
+///
+/// Returns the current sync status as JSON.
+async fn sync_status_handler(sync_status: SyncStatusProvider) -> impl axum::response::IntoResponse {
+    let status = sync_status.read().await.clone();
+    axum::Json(status)
 }
 
 /// Response for health endpoint.
@@ -464,6 +505,7 @@ mod tests {
             tracer_provider: None,
             prometheus_handle: None,
             ready_flag: Some(ready_flag.clone()),
+            sync_status: None,
         };
 
         // Initially not ready
@@ -476,5 +518,46 @@ mod tests {
         // Set not ready
         guard.set_ready(false);
         assert!(!ready_flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_sync_status_endpoint() {
+        use crate::sync::{SyncStateKind, SyncStatus};
+
+        let sync_status = Arc::new(RwLock::new(SyncStatus {
+            state: SyncStateKind::Syncing,
+            current_height: 100,
+            target_height: Some(200),
+            blocks_behind: 100,
+            sync_peers: 3,
+            pending_fetches: 2,
+            queued_heights: 98,
+        }));
+
+        let status_clone = sync_status.clone();
+        let app = Router::new().route(
+            "/system/sync-status",
+            get(move || sync_status_handler(status_clone.clone())),
+        );
+
+        let response = axum::http::Request::builder()
+            .uri("/system/sync-status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(response).await.unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["state"], "syncing");
+        assert_eq!(json["current_height"], 100);
+        assert_eq!(json["target_height"], 200);
+        assert_eq!(json["blocks_behind"], 100);
+        assert_eq!(json["sync_peers"], 3);
     }
 }
