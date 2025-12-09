@@ -83,6 +83,7 @@ pub use sync::{SyncConfig, SyncManager};
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};
 pub use timers::TimerManager;
 
+pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError, ShutdownHandle};
 pub use storage::{RocksDbConfig, RocksDbStorage, StorageError};
 pub use thread_pools::{

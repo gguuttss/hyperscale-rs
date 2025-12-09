@@ -106,11 +106,26 @@ impl Drop for ShutdownHandle {
 /// # Example
 ///
 /// ```no_run
-/// use hyperscale_production::{ProductionRunner, Libp2pConfig, RocksDbStorage};
+/// use hyperscale_production::{ProductionRunner, Libp2pConfig, RocksDbStorage, RocksDbConfig};
+/// use hyperscale_bft::BftConfig;
+/// use hyperscale_types::KeyPair;
+/// use libp2p::identity;
 /// use std::sync::Arc;
 /// use parking_lot::RwLock;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create required dependencies
+/// let topology = todo!("Create topology from genesis or config");
+/// let signing_key = KeyPair::generate_bls();
+/// let bft_config = BftConfig::default();
+/// let storage = RocksDbStorage::open_with_config(
+///     "/tmp/hyperscale-db",
+///     RocksDbConfig::default(),
+/// )?;
+/// let network_config = Libp2pConfig::default();
+/// let ed25519_keypair = identity::Keypair::generate_ed25519();
+///
+/// // Build the runner
 /// let runner = ProductionRunner::builder()
 ///     .topology(topology)
 ///     .signing_key(signing_key)
