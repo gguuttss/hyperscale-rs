@@ -800,22 +800,16 @@ async fn main() -> Result<()> {
     }
 
     // Create production runner
-    let node_index = config.node.validator_id as u32;
-    let channel_capacity = 10_000;
-
-    let mut runner = ProductionRunner::with_network(
-        node_index,
-        topology,
-        signing_keypair,
-        bft_config,
-        channel_capacity,
-        thread_pools,
-        network_config,
-        p2p_identity,
-        Some(storage),
-    )
-    .await
-    .context("Failed to create production runner")?;
+    let mut runner = ProductionRunner::builder()
+        .topology(topology)
+        .signing_key(signing_keypair)
+        .bft_config(bft_config)
+        .thread_pools(thread_pools)
+        .storage(storage)
+        .network(network_config, p2p_identity)
+        .build()
+        .await
+        .context("Failed to create production runner")?;
 
     // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();

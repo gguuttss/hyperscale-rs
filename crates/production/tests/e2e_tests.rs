@@ -1,18 +1,21 @@
 //! End-to-end tests for the production runner.
 //!
-//! These tests validate the production runner with real localhost QUIC networking.
-//! All tests use `#[serial]` to avoid port conflicts and state leakage.
+//! These tests validate the production runner with real localhost QUIC networking
+//! and RocksDB storage. All tests use `#[serial]` to avoid port conflicts and
+//! state leakage.
+//!
+//! Note: The ProductionRunner requires both storage and network to be configured.
+//! For simpler tests without full infrastructure, use the simulation crate.
 
 mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
-use hyperscale_production::{
-    ProductionRunner, RocksDbStorage, ThreadPoolConfig, ThreadPoolManager,
-};
+use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
+use parking_lot::RwLock;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,108 +34,8 @@ const SYNC_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const OVERALL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ============================================================================
-// Single Node Tests (no real network)
+// Storage Tests (no runner needed)
 // ============================================================================
-
-#[tokio::test]
-#[serial]
-async fn test_production_runner_starts() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    let fixtures = TestFixtures::new(42, 1);
-    let thread_pools = Arc::new(ThreadPoolManager::auto().unwrap());
-
-    let runner = ProductionRunner::with_thread_pools(
-        0,
-        fixtures.topology(0),
-        fixtures.signing_key(0),
-        BftConfig::default(),
-        1000,
-        thread_pools,
-    )
-    .unwrap();
-
-    // Verify basic state
-    assert_eq!(runner.local_shard(), ShardGroupId(0));
-    assert!(runner.network().is_none()); // No network configured
-    assert!(!runner.is_syncing());
-
-    info!("Production runner created successfully");
-}
-
-#[tokio::test]
-#[serial]
-async fn test_runner_starts_and_stops() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    let fixtures = TestFixtures::new(42, 1);
-    let thread_pools = Arc::new(ThreadPoolManager::auto().unwrap());
-
-    let mut runner = ProductionRunner::with_thread_pools(
-        0,
-        fixtures.topology(0),
-        fixtures.signing_key(0),
-        BftConfig::default(),
-        1000,
-        thread_pools,
-    )
-    .unwrap();
-
-    // Get the shutdown handle before running
-    let shutdown = runner
-        .shutdown_handle()
-        .expect("Should have shutdown handle");
-
-    // Spawn the runner
-    let handle = tokio::spawn(runner.run());
-
-    // Give it a moment to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Gracefully shutdown
-    drop(shutdown);
-
-    // Wait for runner to exit
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "Runner should exit cleanly");
-    assert!(result.unwrap().is_ok(), "Runner should return Ok");
-
-    info!("Runner start/stop test completed");
-}
-
-#[tokio::test]
-#[serial]
-async fn test_crypto_verification_thread_pool() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    let fixtures = TestFixtures::new(42, 1);
-    let config = ThreadPoolConfig::builder()
-        .crypto_threads(2)
-        .execution_threads(2)
-        .io_threads(1)
-        .build()
-        .unwrap();
-
-    let thread_pools = Arc::new(ThreadPoolManager::new(config).unwrap());
-
-    let runner = ProductionRunner::with_thread_pools(
-        0,
-        fixtures.topology(0),
-        fixtures.signing_key(0),
-        BftConfig::default(),
-        1000,
-        thread_pools.clone(),
-    )
-    .unwrap();
-
-    // Verify thread pool configuration
-    let pool_config = runner.thread_pools().config();
-    assert_eq!(pool_config.crypto_threads, 2);
-    assert_eq!(pool_config.execution_threads, 2);
-    assert_eq!(pool_config.io_threads, 1);
-
-    info!("Thread pool configuration verified");
-}
 
 #[tokio::test]
 #[serial]
@@ -353,7 +256,12 @@ async fn test_production_runner_with_network() {
     use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);
-    let thread_pools = Arc::new(ThreadPoolManager::auto().unwrap());
+
+    // Create temp storage
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_db");
+    let storage = RocksDbStorage::open(&db_path).unwrap();
+    let storage = Arc::new(RwLock::new(storage));
 
     let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
@@ -364,17 +272,13 @@ async fn test_production_runner_with_network() {
 
     let runner = timeout(
         CONNECTION_TIMEOUT,
-        ProductionRunner::with_network(
-            0,
-            fixtures.topology(0),
-            fixtures.signing_key(0),
-            BftConfig::default(),
-            1000,
-            thread_pools,
-            network_config,
-            ed25519_keypair,
-            None, // No storage for this test
-        ),
+        ProductionRunner::builder()
+            .topology(fixtures.topology(0))
+            .signing_key(fixtures.signing_key(0))
+            .bft_config(BftConfig::default())
+            .storage(storage)
+            .network(network_config, ed25519_keypair)
+            .build(),
     )
     .await;
 
@@ -382,9 +286,7 @@ async fn test_production_runner_with_network() {
     let mut runner = runner.unwrap().unwrap();
 
     // Verify network is configured
-    assert!(runner.network().is_some(), "Network should be configured");
-
-    let network = runner.network().unwrap();
+    let network = runner.network();
     info!(peer_id = %network.local_peer_id(), "Runner has network");
 
     // Get listen addresses
@@ -420,7 +322,12 @@ async fn test_graceful_shutdown() {
     use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);
-    let thread_pools = Arc::new(ThreadPoolManager::auto().unwrap());
+
+    // Create temp storage
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_db");
+    let storage = RocksDbStorage::open(&db_path).unwrap();
+    let storage = Arc::new(RwLock::new(storage));
 
     let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
@@ -429,19 +336,15 @@ async fn test_graceful_shutdown() {
         ..Default::default()
     };
 
-    let mut runner = ProductionRunner::with_network(
-        0,
-        fixtures.topology(0),
-        fixtures.signing_key(0),
-        BftConfig::default(),
-        1000,
-        thread_pools,
-        network_config,
-        ed25519_keypair,
-        None,
-    )
-    .await
-    .unwrap();
+    let mut runner = ProductionRunner::builder()
+        .topology(fixtures.topology(0))
+        .signing_key(fixtures.signing_key(0))
+        .bft_config(BftConfig::default())
+        .storage(storage)
+        .network(network_config, ed25519_keypair)
+        .build()
+        .await
+        .unwrap();
 
     let shutdown = runner
         .shutdown_handle()

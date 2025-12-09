@@ -5,15 +5,12 @@ use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
-use hyperscale_bft::{BftConfig, RecoveredState};
+use hyperscale_bft::BftConfig;
 use hyperscale_core::TransactionStatus;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_types::BlockHeight;
 
-// Re-export NodeIndex from node crate (simulation-only concept).
-// Production code will use ValidatorId from topology instead.
 use hyperscale_core::{Action, Event, RequestId, StateMachine};
-pub use hyperscale_node::NodeIndex;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     BlockVote, KeyPair, PublicKey, RoutableTransaction, ShardGroupId, Signature, StateVoteBlock,
@@ -93,6 +90,209 @@ impl Drop for ShutdownHandle {
     }
 }
 
+/// Builder for constructing a [`ProductionRunner`].
+///
+/// Required fields:
+/// - `topology` - Network topology defining validators and shards
+/// - `signing_key` - BLS keypair for signing votes and proposals
+/// - `bft_config` - Consensus configuration parameters
+/// - `storage` - RocksDB storage for persistence and crash recovery
+/// - `network` - libp2p configuration for peer-to-peer communication
+///
+/// Optional fields:
+/// - `thread_pools` - Thread pool manager (defaults to auto-configured)
+/// - `channel_capacity` - Event channel capacity (defaults to 10,000)
+///
+/// # Example
+///
+/// ```no_run
+/// use hyperscale_production::{ProductionRunner, Libp2pConfig, RocksDbStorage};
+/// use std::sync::Arc;
+/// use parking_lot::RwLock;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let runner = ProductionRunner::builder()
+///     .topology(topology)
+///     .signing_key(signing_key)
+///     .bft_config(bft_config)
+///     .storage(Arc::new(RwLock::new(storage)))
+///     .network(network_config, ed25519_keypair)
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct ProductionRunnerBuilder {
+    topology: Option<Arc<dyn Topology>>,
+    signing_key: Option<KeyPair>,
+    bft_config: Option<BftConfig>,
+    thread_pools: Option<Arc<ThreadPoolManager>>,
+    storage: Option<Arc<RwLock<RocksDbStorage>>>,
+    network_config: Option<Libp2pConfig>,
+    ed25519_keypair: Option<identity::Keypair>,
+    channel_capacity: usize,
+}
+
+impl Default for ProductionRunnerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProductionRunnerBuilder {
+    /// Create a new builder with default channel capacity.
+    pub fn new() -> Self {
+        Self {
+            topology: None,
+            signing_key: None,
+            bft_config: None,
+            thread_pools: None,
+            storage: None,
+            network_config: None,
+            ed25519_keypair: None,
+            channel_capacity: 10_000,
+        }
+    }
+
+    /// Set the network topology.
+    pub fn topology(mut self, topology: Arc<dyn Topology>) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+
+    /// Set the BLS signing key for votes and proposals.
+    pub fn signing_key(mut self, key: KeyPair) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Set the BFT consensus configuration.
+    pub fn bft_config(mut self, config: BftConfig) -> Self {
+        self.bft_config = Some(config);
+        self
+    }
+
+    /// Set the thread pool manager (optional, defaults to auto-configured pools).
+    pub fn thread_pools(mut self, pools: Arc<ThreadPoolManager>) -> Self {
+        self.thread_pools = Some(pools);
+        self
+    }
+
+    /// Set the RocksDB storage for persistence and crash recovery.
+    pub fn storage(mut self, storage: Arc<RwLock<RocksDbStorage>>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Set the network configuration and Ed25519 keypair for libp2p.
+    pub fn network(mut self, config: Libp2pConfig, keypair: identity::Keypair) -> Self {
+        self.network_config = Some(config);
+        self.ed25519_keypair = Some(keypair);
+        self
+    }
+
+    /// Set the event channel capacity (default: 10,000).
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = capacity;
+        self
+    }
+
+    /// Build the production runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any required field is missing or if network setup fails.
+    pub async fn build(self) -> Result<ProductionRunner, RunnerError> {
+        // Extract required fields
+        let topology = self
+            .topology
+            .ok_or_else(|| RunnerError::SendError("topology is required".into()))?;
+        let signing_key = self
+            .signing_key
+            .ok_or_else(|| RunnerError::SendError("signing_key is required".into()))?;
+        let bft_config = self
+            .bft_config
+            .ok_or_else(|| RunnerError::SendError("bft_config is required".into()))?;
+        let thread_pools = match self.thread_pools {
+            Some(pools) => pools,
+            None => Arc::new(
+                ThreadPoolManager::auto().map_err(|e| RunnerError::SendError(e.to_string()))?,
+            ),
+        };
+        let storage = self
+            .storage
+            .ok_or_else(|| RunnerError::SendError("storage is required".into()))?;
+        let network_config = self
+            .network_config
+            .ok_or_else(|| RunnerError::SendError("network is required".into()))?;
+        let ed25519_keypair = self
+            .ed25519_keypair
+            .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
+
+        let (event_tx, event_rx) = mpsc::channel(self.channel_capacity);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let validator_id = topology.local_validator_id();
+        let local_shard = topology.local_shard();
+
+        // Load RecoveredState from storage for crash recovery
+        let recovered = {
+            let storage_guard = storage.read();
+            storage_guard.load_recovered_state()
+        };
+
+        // NodeIndex is a simulation concept - production uses 0
+        let state = NodeStateMachine::new(
+            0, // node_index not meaningful in production
+            topology.clone(),
+            signing_key,
+            bft_config,
+            recovered,
+        );
+        let timer_manager = TimerManager::new(event_tx.clone());
+
+        // Create network adapter
+        let (network, sync_request_rx) = Libp2pAdapter::new(
+            network_config,
+            ed25519_keypair,
+            validator_id,
+            local_shard,
+            event_tx.clone(),
+        )
+        .await?;
+
+        // Subscribe to local shard topics
+        network.subscribe_shard(local_shard).await?;
+
+        // Create sync manager
+        let sync_manager =
+            SyncManager::new(SyncConfig::default(), network.clone(), event_tx.clone());
+
+        // Create executor
+        // Note: Using simulator network for now - production should use mainnet
+        let executor = Arc::new(RadixExecutor::new(NetworkDefinition::simulator()));
+
+        Ok(ProductionRunner {
+            event_rx,
+            event_tx,
+            state,
+            start_time: Instant::now(),
+            pending_requests: HashMap::new(),
+            next_request_id: 0,
+            thread_pools,
+            timer_manager,
+            network,
+            sync_manager,
+            local_shard,
+            topology,
+            storage,
+            executor,
+            sync_request_rx,
+            shutdown_rx,
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+}
+
 /// Production runner with async I/O.
 ///
 /// Uses the event aggregator pattern: a single task owns the state machine
@@ -105,8 +305,8 @@ impl Drop for ShutdownHandle {
 /// - **Execution Pool**: Transaction execution via Radix Engine (CPU/memory)
 /// - **I/O Pool**: Network, storage, timers (tokio runtime)
 ///
-/// Use `ThreadPoolConfig` to customize core allocation, or use defaults
-/// based on available CPU cores.
+/// Use [`ProductionRunner::builder()`] to construct a runner with all required
+/// dependencies.
 pub struct ProductionRunner {
     /// Receives events from all sources.
     event_rx: mpsc::Receiver<Event>,
@@ -124,21 +324,20 @@ pub struct ProductionRunner {
     thread_pools: Arc<ThreadPoolManager>,
     /// Timer manager for setting/cancelling timers.
     timer_manager: TimerManager,
-    /// Network adapter (optional - None for testing without network).
-    network: Option<Arc<Libp2pAdapter>>,
-    /// Sync manager for fetching blocks from peers (optional - requires network).
-    sync_manager: Option<SyncManager>,
+    /// Network adapter for libp2p communication.
+    network: Arc<Libp2pAdapter>,
+    /// Sync manager for fetching blocks from peers.
+    sync_manager: SyncManager,
     /// Local shard for network broadcasts.
     local_shard: ShardGroupId,
     /// Network topology (needed for cross-shard execution).
     topology: Arc<dyn Topology>,
-    /// Block storage (optional - None for testing without persistence).
-    /// Wrapped in RwLock for thread-safe mutable access from execution thread pool.
-    storage: Option<Arc<RwLock<RocksDbStorage>>>,
-    /// Transaction executor (optional - requires storage).
-    executor: Option<Arc<RadixExecutor>>,
+    /// Block storage for persistence and crash recovery.
+    storage: Arc<RwLock<RocksDbStorage>>,
+    /// Transaction executor.
+    executor: Arc<RadixExecutor>,
     /// Inbound sync request channel (from network adapter).
-    sync_request_rx: Option<mpsc::Receiver<InboundSyncRequest>>,
+    sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
@@ -146,182 +345,11 @@ pub struct ProductionRunner {
 }
 
 impl ProductionRunner {
-    /// Create a new production runner with default thread pool configuration.
+    /// Create a new builder for constructing a production runner.
     ///
-    /// Uses `ThreadPoolConfig::auto()` to detect available cores and allocate
-    /// threads using recommended ratios.
-    pub fn new(
-        node_index: NodeIndex,
-        topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
-        bft_config: BftConfig,
-        channel_capacity: usize,
-    ) -> Result<Self, RunnerError> {
-        let thread_pools =
-            ThreadPoolManager::auto().map_err(|e| RunnerError::SendError(e.to_string()))?;
-        Self::with_thread_pools(
-            node_index,
-            topology,
-            signing_key,
-            bft_config,
-            channel_capacity,
-            Arc::new(thread_pools),
-        )
-    }
-
-    /// Create a new production runner with custom thread pool configuration.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use hyperscale_production::{ProductionRunner, ThreadPoolConfig, ThreadPoolManager};
-    /// use std::sync::Arc;
-    ///
-    /// let config = ThreadPoolConfig::builder()
-    ///     .crypto_threads(4)
-    ///     .execution_threads(8)
-    ///     .io_threads(2)
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// let thread_pools = Arc::new(ThreadPoolManager::new(config).unwrap());
-    ///
-    /// // let runner = ProductionRunner::with_thread_pools(..., thread_pools);
-    /// ```
-    pub fn with_thread_pools(
-        node_index: NodeIndex,
-        topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
-        bft_config: BftConfig,
-        channel_capacity: usize,
-        thread_pools: Arc<ThreadPoolManager>,
-    ) -> Result<Self, RunnerError> {
-        let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let local_shard = topology.local_shard();
-        // TODO: Load RecoveredState from storage for crash recovery.
-        // For now, start fresh (unsafe for production restarts).
-        let recovered = RecoveredState::default();
-        let state = NodeStateMachine::new(
-            node_index,
-            topology.clone(),
-            signing_key,
-            bft_config,
-            recovered,
-        );
-        let timer_manager = TimerManager::new(event_tx.clone());
-
-        Ok(Self {
-            event_rx,
-            event_tx,
-            state,
-            start_time: Instant::now(),
-            pending_requests: HashMap::new(),
-            next_request_id: 0,
-            thread_pools,
-            timer_manager,
-            network: None,
-            sync_manager: None,
-            local_shard,
-            topology,
-            storage: None,
-            executor: None,
-            sync_request_rx: None,
-            shutdown_rx,
-            shutdown_tx: Some(shutdown_tx),
-        })
-    }
-
-    /// Create a new production runner with network support.
-    ///
-    /// This is the full-featured constructor that includes libp2p networking.
-    /// Use this for production deployments.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage` - Optional RocksDB storage for block persistence and serving sync requests
-    #[allow(clippy::too_many_arguments)]
-    pub async fn with_network(
-        node_index: NodeIndex,
-        topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
-        bft_config: BftConfig,
-        channel_capacity: usize,
-        thread_pools: Arc<ThreadPoolManager>,
-        network_config: Libp2pConfig,
-        ed25519_keypair: identity::Keypair,
-        storage: Option<Arc<RwLock<RocksDbStorage>>>,
-    ) -> Result<Self, RunnerError> {
-        let (event_tx, event_rx) = mpsc::channel(channel_capacity);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let validator_id = topology.local_validator_id();
-        let local_shard = topology.local_shard();
-
-        // Load RecoveredState from storage for crash recovery
-        // Falls back to default (fresh start) if no storage configured
-        let recovered = match &storage {
-            Some(s) => {
-                let storage_guard = s.read();
-                storage_guard.load_recovered_state()
-            }
-            None => RecoveredState::default(),
-        };
-
-        let state = NodeStateMachine::new(
-            node_index,
-            topology.clone(),
-            signing_key,
-            bft_config,
-            recovered,
-        );
-        let timer_manager = TimerManager::new(event_tx.clone());
-
-        // Create network adapter (returns both adapter and sync request receiver)
-        let (network, sync_request_rx) = Libp2pAdapter::new(
-            network_config,
-            ed25519_keypair,
-            validator_id,
-            local_shard,
-            event_tx.clone(),
-        )
-        .await?;
-
-        // Subscribe to local shard topics
-        network.subscribe_shard(local_shard).await?;
-
-        // Create sync manager
-        let sync_manager =
-            SyncManager::new(SyncConfig::default(), network.clone(), event_tx.clone());
-
-        // Create executor if storage is provided
-        // Note: Using simulator network for now - production should use mainnet
-        let executor = storage
-            .as_ref()
-            .map(|_| Arc::new(RadixExecutor::new(NetworkDefinition::simulator())));
-
-        // Register all validators for peer validation
-        // Note: In production, we'd derive PeerId from ed25519 public keys in topology
-        // For now, this is a placeholder - validators need to be registered separately
-
-        Ok(Self {
-            event_rx,
-            event_tx,
-            state,
-            start_time: Instant::now(),
-            pending_requests: HashMap::new(),
-            next_request_id: 0,
-            thread_pools,
-            timer_manager,
-            network: Some(network),
-            sync_manager: Some(sync_manager),
-            local_shard,
-            topology,
-            storage,
-            executor,
-            sync_request_rx: Some(sync_request_rx),
-            shutdown_rx,
-            shutdown_tx: Some(shutdown_tx),
-        })
+    /// All fields are required - see [`ProductionRunnerBuilder`] for details.
+    pub fn builder() -> ProductionRunnerBuilder {
+        ProductionRunnerBuilder::new()
     }
 
     /// Get a reference to the thread pool manager.
@@ -329,9 +357,9 @@ impl ProductionRunner {
         &self.thread_pools
     }
 
-    /// Get a reference to the network adapter (if configured).
-    pub fn network(&self) -> Option<&Arc<Libp2pAdapter>> {
-        self.network.as_ref()
+    /// Get a reference to the network adapter.
+    pub fn network(&self) -> &Arc<Libp2pAdapter> {
+        &self.network
     }
 
     /// Get the local shard ID.
@@ -354,14 +382,14 @@ impl ProductionRunner {
             .map(|tx| ShutdownHandle { tx: Some(tx) })
     }
 
-    /// Get a mutable reference to the sync manager (if configured).
-    pub fn sync_manager_mut(&mut self) -> Option<&mut SyncManager> {
-        self.sync_manager.as_mut()
+    /// Get a mutable reference to the sync manager.
+    pub fn sync_manager_mut(&mut self) -> &mut SyncManager {
+        &mut self.sync_manager
     }
 
     /// Check if sync is in progress.
     pub fn is_syncing(&self) -> bool {
-        self.sync_manager.as_ref().is_some_and(|s| s.is_syncing())
+        self.sync_manager.is_syncing()
     }
 
     /// Run the main event loop.
@@ -405,17 +433,6 @@ impl ProductionRunner {
         let mut consensus_batch_count: usize = 0;
 
         loop {
-            // We need to handle the sync_request_rx conditionally since it's Option
-            // Use a helper async block that returns None if the receiver is None
-            let sync_request_future = async {
-                if let Some(rx) = &mut self.sync_request_rx {
-                    rx.recv().await
-                } else {
-                    // Never resolve if there's no receiver
-                    std::future::pending::<Option<InboundSyncRequest>>().await
-                }
-            };
-
             // Use biased select for priority: consensus events are always checked first.
             // After CONSENSUS_BATCH_SIZE events, we yield to sync to prevent starvation.
             tokio::select! {
@@ -530,9 +547,7 @@ impl ProductionRunner {
 
                             // If this was a sync request, start the sync manager
                             if let Some((target_height, target_hash)) = sync_target {
-                                if let Some(sync_mgr) = &mut self.sync_manager {
-                                    sync_mgr.start_sync(target_height, target_hash);
-                                }
+                                self.sync_manager.start_sync(target_height, target_hash);
                             }
                         }
                         None => {
@@ -544,7 +559,7 @@ impl ProductionRunner {
 
                 // LOW PRIORITY: Handle inbound sync requests from peers
                 // This branch is checked when consensus is idle OR after batch limit hit
-                Some(request) = sync_request_future => {
+                Some(request) = self.sync_request_rx.recv() => {
                     let sync_span = span!(
                         Level::DEBUG,
                         "handle_sync_request",
@@ -565,9 +580,7 @@ impl ProductionRunner {
                     let tick_span = span!(Level::TRACE, "sync_tick");
                     let _tick_guard = tick_span.enter();
 
-                    if let Some(sync_mgr) = &mut self.sync_manager {
-                        sync_mgr.tick().await;
-                    }
+                    self.sync_manager.tick().await;
                     // Reset batch counter - we yielded, now back to prioritizing consensus
                     consensus_batch_count = 0;
                 }
@@ -581,18 +594,14 @@ impl ProductionRunner {
                     );
 
                     // Update sync status
-                    if let Some(sync_mgr) = &self.sync_manager {
-                        crate::metrics::set_sync_status(
-                            sync_mgr.blocks_behind(),
-                            sync_mgr.is_syncing(),
-                        );
-                    }
+                    crate::metrics::set_sync_status(
+                        self.sync_manager.blocks_behind(),
+                        self.sync_manager.is_syncing(),
+                    );
 
                     // Update peer count
-                    if let Some(network) = &self.network {
-                        let peer_count = network.connected_peers().await.len();
-                        crate::metrics::set_libp2p_peers(peer_count);
-                    }
+                    let peer_count = self.network.connected_peers().await.len();
+                    crate::metrics::set_libp2p_peers(peer_count);
                 }
             }
         }
@@ -610,31 +619,16 @@ impl ProductionRunner {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                if let Some(network) = &self.network {
-                    network.broadcast_shard(shard, &message).await?;
-                    tracing::debug!(?shard, msg_type = message.type_name(), "Broadcast to shard");
-                } else {
-                    tracing::debug!(
-                        ?shard,
-                        msg_type = message.type_name(),
-                        "Would broadcast to shard (network not configured)"
-                    );
-                }
+                self.network.broadcast_shard(shard, &message).await?;
+                tracing::debug!(?shard, msg_type = message.type_name(), "Broadcast to shard");
             }
 
             Action::BroadcastGlobal { mut message } => {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                if let Some(network) = &self.network {
-                    network.broadcast_global(&message).await?;
-                    tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
-                } else {
-                    tracing::debug!(
-                        msg_type = message.type_name(),
-                        "Would broadcast globally (network not configured)"
-                    );
-                }
+                self.network.broadcast_global(&message).await?;
+                tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
             }
 
             // Timers via timer manager
@@ -915,39 +909,24 @@ impl ProductionRunner {
                 let executor = self.executor.clone();
 
                 self.thread_pools.spawn_execution(move || {
-                    let results = match (storage, executor) {
-                        (Some(storage), Some(executor)) => {
-                            // Execute transactions with READ lock - execution is read-only
-                            let storage_guard = storage.read();
-                            match executor.execute_single_shard(&*storage_guard, &transactions) {
-                                Ok(output) => output
-                                    .results()
-                                    .iter()
-                                    .map(|r| hyperscale_types::ExecutionResult {
-                                        transaction_hash: r.tx_hash,
-                                        success: r.success,
-                                        state_root: r.outputs_merkle_root,
-                                        writes: r.state_writes.clone(),
-                                        error: r.error.clone(),
-                                    })
-                                    .collect(),
-                                Err(e) => {
-                                    tracing::warn!(?block_hash, error = %e, "Transaction execution failed");
-                                    transactions
-                                        .iter()
-                                        .map(|tx| hyperscale_types::ExecutionResult {
-                                            transaction_hash: tx.hash(),
-                                            success: false,
-                                            state_root: hyperscale_types::Hash::ZERO,
-                                            writes: vec![],
-                                            error: Some(format!("{}", e)),
-                                        })
-                                        .collect()
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!("No storage/executor configured, returning failed results");
+                    // Execute transactions with READ lock - execution is read-only
+                    let storage_guard = storage.read();
+                    let results = match executor
+                        .execute_single_shard(&*storage_guard, &transactions)
+                    {
+                        Ok(output) => output
+                            .results()
+                            .iter()
+                            .map(|r| hyperscale_types::ExecutionResult {
+                                transaction_hash: r.tx_hash,
+                                success: r.success,
+                                state_root: r.outputs_merkle_root,
+                                writes: r.state_writes.clone(),
+                                error: r.error.clone(),
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(?block_hash, error = %e, "Transaction execution failed");
                             transactions
                                 .iter()
                                 .map(|tx| hyperscale_types::ExecutionResult {
@@ -955,7 +934,7 @@ impl ProductionRunner {
                                     success: false,
                                     state_root: hyperscale_types::Hash::ZERO,
                                     writes: vec![],
-                                    error: Some("No executor configured".to_string()),
+                                    error: Some(format!("{}", e)),
                                 })
                                 .collect()
                         }
@@ -983,68 +962,52 @@ impl ProductionRunner {
                 let local_shard = self.local_shard;
 
                 self.thread_pools.spawn_execution(move || {
-                    let result = match (storage, executor) {
-                        (Some(storage), Some(executor)) => {
-                            // Determine which nodes are local to this shard
-                            let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-                                topology.shard_for_node_id(node_id) == local_shard
-                            };
+                    // Determine which nodes are local to this shard
+                    let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
+                        topology.shard_for_node_id(node_id) == local_shard
+                    };
 
-                            // Execute with provisions - READ lock since execution is read-only
-                            let storage_guard = storage.read();
-                            match executor.execute_cross_shard(
-                                &*storage_guard,
-                                &[transaction],
-                                &provisions,
-                                is_local_node,
-                            ) {
-                                Ok(output) => {
-                                    if let Some(r) = output.results().first() {
-                                        hyperscale_types::ExecutionResult {
-                                            transaction_hash: r.tx_hash,
-                                            success: r.success,
-                                            state_root: r.outputs_merkle_root,
-                                            writes: r.state_writes.clone(),
-                                            error: r.error.clone(),
-                                        }
-                                    } else {
-                                        hyperscale_types::ExecutionResult {
-                                            transaction_hash: tx_hash,
-                                            success: false,
-                                            state_root: hyperscale_types::Hash::ZERO,
-                                            writes: vec![],
-                                            error: Some("No execution result".to_string()),
-                                        }
-                                    }
+                    // Execute with provisions - READ lock since execution is read-only
+                    let storage_guard = storage.read();
+                    let result = match executor.execute_cross_shard(
+                        &*storage_guard,
+                        &[transaction],
+                        &provisions,
+                        is_local_node,
+                    ) {
+                        Ok(output) => {
+                            if let Some(r) = output.results().first() {
+                                hyperscale_types::ExecutionResult {
+                                    transaction_hash: r.tx_hash,
+                                    success: r.success,
+                                    state_root: r.outputs_merkle_root,
+                                    writes: r.state_writes.clone(),
+                                    error: r.error.clone(),
                                 }
-                                Err(e) => {
-                                    tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
-                                    hyperscale_types::ExecutionResult {
-                                        transaction_hash: tx_hash,
-                                        success: false,
-                                        state_root: hyperscale_types::Hash::ZERO,
-                                        writes: vec![],
-                                        error: Some(format!("{}", e)),
-                                    }
+                            } else {
+                                hyperscale_types::ExecutionResult {
+                                    transaction_hash: tx_hash,
+                                    success: false,
+                                    state_root: hyperscale_types::Hash::ZERO,
+                                    writes: vec![],
+                                    error: Some("No execution result".to_string()),
                                 }
                             }
                         }
-                        _ => {
-                            tracing::warn!("No storage/executor configured for cross-shard execution");
+                        Err(e) => {
+                            tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
                             hyperscale_types::ExecutionResult {
                                 transaction_hash: tx_hash,
                                 success: false,
                                 state_root: hyperscale_types::Hash::ZERO,
                                 writes: vec![],
-                                error: Some("No executor configured".to_string()),
+                                error: Some(format!("{}", e)),
                             }
                         }
                     };
 
-                    let _ = event_tx.blocking_send(Event::CrossShardTransactionExecuted {
-                        tx_hash,
-                        result,
-                    });
+                    let _ = event_tx
+                        .blocking_send(Event::CrossShardTransactionExecuted { tx_hash, result });
                 });
             }
 
@@ -1112,42 +1075,38 @@ impl ProductionRunner {
             // ═══════════════════════════════════════════════════════════════════════
             Action::PersistBlock { block, qc } => {
                 // Fire-and-forget block persistence - not latency critical
-                if let Some(storage) = &self.storage {
-                    let storage = storage.clone();
-                    let height = block.height();
-                    tokio::spawn(async move {
-                        let guard = storage.write();
-                        guard.put_block(height, &block, &qc);
-                        // Update chain metadata
-                        guard.set_chain_metadata(height, None, None);
-                        // Prune old votes - we no longer need votes at or below committed height
-                        guard.prune_own_votes(height.0);
-                    });
-                }
+                let storage = self.storage.clone();
+                let height = block.height();
+                tokio::spawn(async move {
+                    let guard = storage.write();
+                    guard.put_block(height, &block, &qc);
+                    // Update chain metadata
+                    guard.set_chain_metadata(height, None, None);
+                    // Prune old votes - we no longer need votes at or below committed height
+                    guard.prune_own_votes(height.0);
+                });
             }
 
             Action::PersistTransactionCertificate { certificate } => {
                 // Commit certificate + state writes atomically
                 // This is durability-critical: we await completion
-                if let Some(storage) = &self.storage {
-                    let storage = storage.clone();
-                    let local_shard = self.local_shard;
+                let storage = self.storage.clone();
+                let local_shard = self.local_shard;
 
-                    // Extract writes for local shard from the certificate's shard_proofs
-                    let writes: Vec<_> = certificate
-                        .shard_proofs
-                        .get(&local_shard)
-                        .map(|p| p.state_writes.clone())
-                        .unwrap_or_default();
+                // Extract writes for local shard from the certificate's shard_proofs
+                let writes: Vec<_> = certificate
+                    .shard_proofs
+                    .get(&local_shard)
+                    .map(|p| p.state_writes.clone())
+                    .unwrap_or_default();
 
-                    // Run on blocking thread since RocksDB write is sync
-                    tokio::task::spawn_blocking(move || {
-                        let mut guard = storage.write();
-                        guard.commit_certificate_with_writes(&certificate, &writes);
-                    })
-                    .await
-                    .ok();
-                }
+                // Run on blocking thread since RocksDB write is sync
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = storage.write();
+                    guard.commit_certificate_with_writes(&certificate, &writes);
+                })
+                .await
+                .ok();
             }
 
             Action::PersistOwnVote {
@@ -1157,18 +1116,16 @@ impl ProductionRunner {
             } => {
                 // **BFT Safety Critical**: Must persist before broadcasting vote
                 // Prevents equivocation after crash/restart
-                if let Some(storage) = &self.storage {
-                    let storage = storage.clone();
+                let storage = self.storage.clone();
 
-                    // Use spawn_blocking since we need sync writes for BFT safety
-                    // We await completion to ensure vote is persisted before returning
-                    tokio::task::spawn_blocking(move || {
-                        let guard = storage.read();
-                        guard.put_own_vote(height.0, round, block_hash);
-                    })
-                    .await
-                    .ok();
-                }
+                // Use spawn_blocking since we need sync writes for BFT safety
+                // We await completion to ensure vote is persisted before returning
+                tokio::task::spawn_blocking(move || {
+                    let guard = storage.read();
+                    guard.put_own_vote(height.0, round, block_hash);
+                })
+                .await
+                .ok();
             }
 
             // ═══════════════════════════════════════════════════════════════════════
@@ -1176,76 +1133,37 @@ impl ProductionRunner {
             // ═══════════════════════════════════════════════════════════════════════
             Action::FetchStateEntries { tx_hash, nodes } => {
                 let event_tx = self.event_tx.clone();
+                let storage = self.storage.clone();
+                let executor = self.executor.clone();
 
-                if let (Some(storage), Some(executor)) = (&self.storage, &self.executor) {
-                    let storage = storage.clone();
-                    let executor = executor.clone();
-
-                    tokio::task::spawn_blocking(move || {
-                        let guard = storage.read();
-                        let entries = executor.fetch_state_entries(&*guard, &nodes);
-                        let _ =
-                            event_tx.blocking_send(Event::StateEntriesFetched { tx_hash, entries });
-                    });
-                } else {
-                    // No storage configured - return empty
-                    let _ = self
-                        .event_tx
-                        .send(Event::StateEntriesFetched {
-                            tx_hash,
-                            entries: vec![],
-                        })
-                        .await;
-                }
+                tokio::task::spawn_blocking(move || {
+                    let guard = storage.read();
+                    let entries = executor.fetch_state_entries(&*guard, &nodes);
+                    let _ = event_tx.blocking_send(Event::StateEntriesFetched { tx_hash, entries });
+                });
             }
 
             Action::FetchBlock { height } => {
                 let event_tx = self.event_tx.clone();
+                let storage = self.storage.clone();
 
-                if let Some(storage) = &self.storage {
-                    let storage = storage.clone();
-
-                    tokio::task::spawn_blocking(move || {
-                        let guard = storage.read();
-                        let block = guard.get_block(height).map(|(b, _qc)| b);
-                        let _ = event_tx.blocking_send(Event::BlockFetched { height, block });
-                    });
-                } else {
-                    let _ = self
-                        .event_tx
-                        .send(Event::BlockFetched {
-                            height,
-                            block: None,
-                        })
-                        .await;
-                }
+                tokio::task::spawn_blocking(move || {
+                    let guard = storage.read();
+                    let block = guard.get_block(height).map(|(b, _qc)| b);
+                    let _ = event_tx.blocking_send(Event::BlockFetched { height, block });
+                });
             }
 
             Action::FetchChainMetadata => {
                 let event_tx = self.event_tx.clone();
+                let storage = self.storage.clone();
 
-                if let Some(storage) = &self.storage {
-                    let storage = storage.clone();
-
-                    tokio::task::spawn_blocking(move || {
-                        let guard = storage.read();
-                        let (height, hash, qc) = guard.get_chain_metadata();
-                        let _ = event_tx.blocking_send(Event::ChainMetadataFetched {
-                            height,
-                            hash,
-                            qc,
-                        });
-                    });
-                } else {
-                    let _ = self
-                        .event_tx
-                        .send(Event::ChainMetadataFetched {
-                            height: hyperscale_types::BlockHeight(0),
-                            hash: None,
-                            qc: None,
-                        })
-                        .await;
-                }
+                tokio::task::spawn_blocking(move || {
+                    let guard = storage.read();
+                    let (height, hash, qc) = guard.get_chain_metadata();
+                    let _ =
+                        event_tx.blocking_send(Event::ChainMetadataFetched { height, hash, qc });
+                });
             }
         }
 
@@ -1508,38 +1426,30 @@ impl ProductionRunner {
         );
 
         // Look up block from storage
-        let response = if let Some(storage) = &self.storage {
-            if let Some((block, qc)) = storage.read().get_block(height) {
-                // Encode the response as SBOR: (Some(block), Some(qc))
-                match sbor::basic_encode(&(Some(&block), Some(&qc))) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
-                        // Send empty response on encoding failure
-                        sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
-                    }
+        let response = if let Some((block, qc)) = self.storage.read().get_block(height) {
+            // Encode the response as SBOR: (Some(block), Some(qc))
+            match sbor::basic_encode(&(Some(&block), Some(&qc))) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
+                    // Send empty response on encoding failure
+                    sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
                 }
-            } else {
-                tracing::trace!(height = request.height, "Block not found for sync request");
-                // Send "not found" response
-                sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
             }
         } else {
-            tracing::warn!("Received sync request but no storage configured");
-            // Send empty response
+            tracing::trace!(height = request.height, "Block not found for sync request");
+            // Send "not found" response
             sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
         };
 
         // Send response via network adapter
-        if let Some(network) = &self.network {
-            if let Err(e) = network.send_block_response(channel_id, response) {
-                tracing::warn!(
-                    height = request.height,
-                    channel_id = channel_id,
-                    error = ?e,
-                    "Failed to send block response"
-                );
-            }
+        if let Err(e) = self.network.send_block_response(channel_id, response) {
+            tracing::warn!(
+                height = request.height,
+                channel_id = channel_id,
+                error = ?e,
+                "Failed to send block response"
+            );
         }
     }
 }
