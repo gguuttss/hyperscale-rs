@@ -50,9 +50,9 @@ struct Args {
     #[arg(long, default_value = "100")]
     tps: usize,
 
-    /// Ratio of cross-shard transactions (0.0-1.0)
-    #[arg(long, default_value = "0.0")]
-    cross_shard_ratio: f64,
+    /// Ratio of cross-shard transactions (0.0-1.0). Defaults to natural ratio (1 - 1/shards).
+    #[arg(long)]
+    cross_shard_ratio: Option<f64>,
 
     /// Ramp-down time in seconds (wait for in-flight to complete)
     #[arg(long, default_value = "30")]
@@ -78,6 +78,17 @@ fn main() {
 
     let args = Args::parse();
 
+    // Calculate cross-shard ratio: default to natural probability (1 - 1/shards)
+    // With random account selection, probability of same-shard is 1/shards,
+    // so cross-shard probability is (shards-1)/shards = 1 - 1/shards
+    let cross_shard_ratio = args.cross_shard_ratio.unwrap_or_else(|| {
+        if args.shards <= 1 {
+            0.0
+        } else {
+            1.0 - 1.0 / args.shards as f64
+        }
+    });
+
     info!(
         shards = args.shards,
         validators = args.validators,
@@ -85,7 +96,7 @@ fn main() {
         seed = args.seed,
         accounts = args.accounts,
         tps = args.tps,
-        cross_shard_ratio = args.cross_shard_ratio,
+        cross_shard_ratio,
         "Starting simulation"
     );
 
@@ -108,7 +119,7 @@ fn main() {
     let mut workload = WorkloadConfig::transfers_only()
         .with_batch_size(batch_size)
         .with_batch_interval(Duration::from_millis(batch_interval_ms))
-        .with_cross_shard_ratio(args.cross_shard_ratio);
+        .with_cross_shard_ratio(cross_shard_ratio);
 
     if args.no_contention {
         workload = workload.with_no_contention();
