@@ -43,3 +43,6 @@ LOG*
 # Validator data
 data/
 keys/
+
+# Modelling
+tla/
