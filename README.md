@@ -28,6 +28,7 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-simulation` | Deterministic simulator with configurable network conditions |
 | `hyperscale-simulator` | CLI tool for running simulations with metrics |
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
+| `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
 
 ## Building
 
