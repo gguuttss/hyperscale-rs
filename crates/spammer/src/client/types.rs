@@ -91,16 +91,20 @@ pub struct TransactionStatusResponse {
 
 impl TransactionStatusResponse {
     /// Check if the transaction has reached a terminal state.
+    ///
+    /// A transaction is truly terminal when:
+    /// - `completed`: Certificate committed to a block, state locks released
+    /// - `retried`: Superseded by a retry transaction
+    /// - `error`: Processing error
+    ///
+    /// Note: `executed` is NOT terminal - the certificate still needs to be
+    /// committed to a block to release state locks.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status.as_str(),
-            "completed" | "executed" | "retried" | "error"
-        )
+        matches!(self.status.as_str(), "completed" | "retried" | "error")
     }
 
     /// Check if the transaction completed successfully.
     pub fn is_success(&self) -> bool {
         self.status == "completed"
-            || (self.status == "executed" && self.decision.as_deref() == Some("accept"))
     }
 }
