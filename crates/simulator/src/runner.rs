@@ -240,7 +240,7 @@ impl Simulator {
                 if let Some(node) = self.runner.node(node_idx) {
                     if let Some(status) = node.mempool().status(&hash) {
                         match status {
-                            TransactionStatus::Completed => {
+                            TransactionStatus::Completed(TransactionDecision::Accept) => {
                                 // Transaction fully executed - record completion and latency
                                 let latency = current_time.saturating_sub(submit_time);
                                 self.metrics.record_completion(latency);
@@ -251,7 +251,8 @@ impl Simulator {
                                     "Transaction completed"
                                 );
                             }
-                            TransactionStatus::Executed(TransactionDecision::Reject) => {
+                            TransactionStatus::Completed(TransactionDecision::Reject)
+                            | TransactionStatus::Executed(TransactionDecision::Reject) => {
                                 // Transaction was rejected - record rejection (no latency)
                                 self.metrics.record_rejection();
                                 self.in_flight.remove(&hash);

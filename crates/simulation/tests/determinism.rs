@@ -1260,7 +1260,10 @@ fn test_execution_flow() {
     // This is the terminal success state for the full execution flow:
     // Pending → Accepted → Committed → Executing → Finalized → Completed
     assert!(
-        matches!(status, Some(hyperscale_types::TransactionStatus::Completed)),
+        matches!(
+            status,
+            Some(hyperscale_types::TransactionStatus::Completed(_))
+        ),
         "Transaction should be Completed (certificate committed), got {:?}",
         status
     );

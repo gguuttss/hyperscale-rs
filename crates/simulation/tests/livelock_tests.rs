@@ -205,7 +205,7 @@ fn test_two_shard_cycle_detection() {
         // Check TX A status
         if !a_completed {
             if let Some(status) = node0.mempool().status(&hash_a) {
-                if matches!(status, TransactionStatus::Completed) {
+                if matches!(status, TransactionStatus::Completed(_)) {
                     let elapsed = runner.now() - start_time;
                     println!(
                         "  ✓ TX A completed (iteration {}, {:?})",
@@ -219,7 +219,7 @@ fn test_two_shard_cycle_detection() {
         // Check TX B status
         if !b_completed {
             if let Some(status) = node0.mempool().status(&hash_b) {
-                if matches!(status, TransactionStatus::Completed) {
+                if matches!(status, TransactionStatus::Completed(_)) {
                     let elapsed = runner.now() - start_time;
                     println!(
                         "  ✓ TX B completed (iteration {}, {:?})",
@@ -379,7 +379,7 @@ fn test_retry_completion_after_winner() {
                 committed = true;
             }
 
-            if !completed && matches!(status, TransactionStatus::Completed) {
+            if !completed && matches!(status, TransactionStatus::Completed(_)) {
                 let elapsed = runner.now() - start_time;
                 println!(
                     "  ✓ Transaction completed (iteration {}, {:?})",
@@ -492,7 +492,7 @@ fn test_many_cross_shard_transactions() {
     for (i, hash) in tx_hashes.iter().enumerate() {
         let node0 = runner.node(0).unwrap();
         if let Some(status) = node0.mempool().status(hash) {
-            if matches!(status, TransactionStatus::Completed) {
+            if matches!(status, TransactionStatus::Completed(_)) {
                 completed_count += 1;
             }
             println!("  TX {}: {:?}", i, status);
@@ -709,7 +709,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
             last_status_b = status_b.clone();
 
             // Check if TX B completed (it should be the winner)
-            if matches!(status_b, Some(TransactionStatus::Completed)) {
+            if matches!(status_b, Some(TransactionStatus::Completed(_))) {
                 b_completed = true;
                 b_completion_time = Some(elapsed);
                 println!("  ✓ TX B (winner) completed in {:?}", elapsed);
@@ -727,7 +727,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
                 );
                 last_retry_status = retry_status.clone();
 
-                if matches!(retry_status, Some(TransactionStatus::Completed)) {
+                if matches!(retry_status, Some(TransactionStatus::Completed(_))) {
                     retry_completed = true;
                     retry_completion_time = Some(elapsed);
                     println!("  ✓ Retry TX completed in {:?}", elapsed);
@@ -922,7 +922,7 @@ fn test_timeout_abort_mechanism() {
 
         // Check if transaction completed or was aborted
         if let Some(status) = &current_status {
-            if matches!(status, TransactionStatus::Completed) {
+            if matches!(status, TransactionStatus::Completed(_)) {
                 println!("  ✓ Transaction completed (iteration {})", iteration);
                 break;
             }

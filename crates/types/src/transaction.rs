@@ -578,7 +578,9 @@ pub enum TransactionStatus {
     /// The TransactionCertificate has been committed in a block. State changes
     /// have been applied (if accepted). This is the terminal state - the
     /// transaction can now be safely removed from the mempool.
-    Completed,
+    ///
+    /// Contains the final decision (Accept/Reject) from execution.
+    Completed(TransactionDecision),
 
     /// Transaction was deferred due to a cross-shard cycle.
     ///
@@ -599,18 +601,30 @@ pub enum TransactionStatus {
         /// Hash of the retry transaction that supersedes this one.
         new_tx: Hash,
     },
+
+    /// Transaction was aborted due to timeout or too many retries.
+    ///
+    /// This is a terminal state - the transaction will not be retried again.
+    /// This status does NOT hold state locks.
+    Aborted {
+        /// The reason for the abort.
+        reason: AbortReason,
+    },
 }
 
 impl TransactionStatus {
     /// Check if transaction is in a final state (won't transition further).
     ///
-    /// Both `Completed` and `Retried` are terminal states.
+    /// Terminal states:
     /// - `Completed`: Transaction executed and certificate committed
     /// - `Retried`: Transaction was superseded by a retry (original will never execute)
+    /// - `Aborted`: Transaction was aborted due to timeout or too many retries
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Completed | TransactionStatus::Retried { .. }
+            TransactionStatus::Completed(_)
+                | TransactionStatus::Retried { .. }
+                | TransactionStatus::Aborted { .. }
         )
     }
 
@@ -635,6 +649,7 @@ impl TransactionStatus {
     /// - Completed: certificate committed, transaction done
     /// - Blocked: deferred due to conflict, locks released
     /// - Retried: superseded by retry transaction, locks released
+    /// - Aborted: transaction aborted, locks released
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
@@ -648,9 +663,10 @@ impl TransactionStatus {
             TransactionStatus::Pending => "Pending",
             TransactionStatus::Committed(_) => "Committed",
             TransactionStatus::Executed(_) => "Executed",
-            TransactionStatus::Completed => "Completed",
+            TransactionStatus::Completed(_) => "Completed",
             TransactionStatus::Blocked { .. } => "Blocked",
             TransactionStatus::Retried { .. } => "Retried",
+            TransactionStatus::Aborted { .. } => "Aborted",
         }
     }
 
@@ -700,15 +716,16 @@ impl TransactionStatus {
     ///
     /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
     ///
-    /// Blocked and Retried are terminal side-branches and get high ordinals (4, 5).
+    /// Blocked, Retried, and Aborted are terminal side-branches and get high ordinals (4, 5, 6).
     pub fn ordinal(&self) -> u8 {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
             TransactionStatus::Executed(_) => 2,
-            TransactionStatus::Completed => 3,
+            TransactionStatus::Completed(_) => 3,
             TransactionStatus::Blocked { .. } => 4,
             TransactionStatus::Retried { .. } => 5,
+            TransactionStatus::Aborted { .. } => 6,
         }
     }
 
@@ -735,11 +752,20 @@ impl TransactionStatus {
             // Committed → Retried (superseded by retry from another shard)
             (Committed(_), Retried { .. }) => true,
 
+            // Committed → Aborted (timeout or too many retries)
+            (Committed(_), Aborted { .. }) => true,
+
             // Executed → Completed (certificate committed in block)
-            (Executed(_), Completed) => true,
+            (Executed(_), Completed(_)) => true,
+
+            // Executed → Aborted (execution rejected or timeout)
+            (Executed(_), Aborted { .. }) => true,
 
             // Blocked → Retried (when winner completes, loser gets a retry)
             (Blocked { .. }, Retried { .. }) => true,
+
+            // Blocked → Aborted (too many retries)
+            (Blocked { .. }, Aborted { .. }) => true,
 
             // No other transitions are valid
             _ => false,
@@ -758,9 +784,15 @@ impl std::fmt::Display for TransactionStatus {
             TransactionStatus::Executed(TransactionDecision::Reject) => {
                 write!(f, "Executed(Reject)")
             }
-            TransactionStatus::Completed => write!(f, "Completed"),
+            TransactionStatus::Completed(TransactionDecision::Accept) => {
+                write!(f, "Completed(Accept)")
+            }
+            TransactionStatus::Completed(TransactionDecision::Reject) => {
+                write!(f, "Completed(Reject)")
+            }
             TransactionStatus::Blocked { by } => write!(f, "Blocked(by: {})", by),
             TransactionStatus::Retried { new_tx } => write!(f, "Retried(new_tx: {})", new_tx),
+            TransactionStatus::Aborted { reason } => write!(f, "Aborted({})", reason),
         }
     }
 }

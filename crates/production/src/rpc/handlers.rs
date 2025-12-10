@@ -266,7 +266,19 @@ fn format_transaction_status(
                 None,
             )
         }
-        TransactionStatus::Completed => ("completed".to_string(), None, None, None, None),
+        TransactionStatus::Completed(decision) => {
+            let decision_str = match decision {
+                TransactionDecision::Accept => "accept",
+                TransactionDecision::Reject => "reject",
+            };
+            (
+                "completed".to_string(),
+                None,
+                Some(decision_str.to_string()),
+                None,
+                None,
+            )
+        }
         TransactionStatus::Blocked { by } => (
             "blocked".to_string(),
             None,
@@ -280,6 +292,13 @@ fn format_transaction_status(
             None,
             None,
             Some(hex::encode(new_tx.as_bytes())),
+        ),
+        TransactionStatus::Aborted { reason } => (
+            "aborted".to_string(),
+            None,
+            None,
+            None,
+            Some(reason.to_string()),
         ),
     }
 }
@@ -438,12 +457,23 @@ mod tests {
     }
 
     #[test]
-    fn test_format_completed() {
+    fn test_format_completed_accept() {
         let (status, height, decision, blocked_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Completed);
+            format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Accept));
         assert_eq!(status, "completed");
         assert!(height.is_none());
-        assert!(decision.is_none());
+        assert_eq!(decision, Some("accept".to_string()));
+        assert!(blocked_by.is_none());
+        assert!(retry_tx.is_none());
+    }
+
+    #[test]
+    fn test_format_completed_reject() {
+        let (status, height, decision, blocked_by, retry_tx) =
+            format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Reject));
+        assert_eq!(status, "completed");
+        assert!(height.is_none());
+        assert_eq!(decision, Some("reject".to_string()));
         assert!(blocked_by.is_none());
         assert!(retry_tx.is_none());
     }

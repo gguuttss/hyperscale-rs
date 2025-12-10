@@ -194,7 +194,7 @@ fn test_e2e_single_shard_transaction() {
     // If already completed, we can skip the polling loop.
     // Completed status means the certificate was committed in a block,
     // which is the terminal success state for the full execution flow.
-    if initial_status == Some(TransactionStatus::Completed) {
+    if matches!(initial_status, Some(TransactionStatus::Completed(_))) {
         println!("✓ Transaction already completed after initial consensus!\n");
 
         // Print final state
@@ -612,7 +612,7 @@ fn test_e2e_cross_shard_transaction() {
                 committed = true;
             }
             // Also check for Completed status (which implies it was committed)
-            if !completed && matches!(status, TransactionStatus::Completed) {
+            if !completed && matches!(status, TransactionStatus::Completed(_)) {
                 let elapsed = runner.now() - start_time;
                 println!(
                     "  ✓ Transaction completed (iteration {}, {:?})",

@@ -214,9 +214,15 @@ mod tests {
         ));
 
         // Executed -> Completed
-        cache.update(tx_hash, TransactionStatus::Completed);
+        cache.update(
+            tx_hash,
+            TransactionStatus::Completed(TransactionDecision::Accept),
+        );
         let cached = cache.get(&tx_hash).unwrap();
-        assert!(matches!(cached.status, TransactionStatus::Completed));
+        assert!(matches!(
+            cached.status,
+            TransactionStatus::Completed(TransactionDecision::Accept)
+        ));
     }
 
     #[test]

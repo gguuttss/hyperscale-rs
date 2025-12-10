@@ -424,7 +424,7 @@ fn status_name(status: &TransactionStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::BlockHeight;
+    use hyperscale_types::{BlockHeight, TransactionDecision};
 
     #[test]
     fn test_status_name() {
@@ -433,6 +433,9 @@ mod tests {
             status_name(&TransactionStatus::Committed(BlockHeight(1))),
             "Committed"
         );
-        assert_eq!(status_name(&TransactionStatus::Completed), "Completed");
+        assert_eq!(
+            status_name(&TransactionStatus::Completed(TransactionDecision::Accept)),
+            "Completed"
+        );
     }
 }

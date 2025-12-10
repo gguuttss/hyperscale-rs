@@ -191,18 +191,23 @@ impl MempoolState {
 
         // 3. Process certificates - mark completed, trigger retries
         for cert in &block.committed_certificates {
-            actions.extend(self.on_certificate_committed(cert.transaction_hash, height));
+            actions.extend(self.on_certificate_committed(
+                cert.transaction_hash,
+                cert.decision,
+                height,
+            ));
         }
 
-        // 4. Process aborts - mark as terminal state
+        // 4. Process aborts - mark as aborted with reason
         for abort in &block.aborted {
             if let Some(entry) = self.pool.get_mut(&abort.tx_hash) {
-                // Transition to a terminal state (we don't have an Aborted status,
-                // so we'll use Completed for now - the abort info is in the block)
-                entry.status = TransactionStatus::Completed;
+                let status = TransactionStatus::Aborted {
+                    reason: abort.reason.clone(),
+                };
+                entry.status = status.clone();
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: abort.tx_hash,
-                    status: TransactionStatus::Completed,
+                    status,
                 });
             }
         }
@@ -253,15 +258,20 @@ impl MempoolState {
     /// Handle a certificate committed in a block.
     ///
     /// Marks the transaction as completed and triggers retries for any TXs blocked by it.
-    fn on_certificate_committed(&mut self, tx_hash: Hash, height: BlockHeight) -> Vec<Action> {
+    fn on_certificate_committed(
+        &mut self,
+        tx_hash: Hash,
+        decision: TransactionDecision,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Mark the certificate's TX as completed
+        // Mark the certificate's TX as completed with the final decision
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
-            entry.status = TransactionStatus::Completed;
+            entry.status = TransactionStatus::Completed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
-                status: TransactionStatus::Completed,
+                status: TransactionStatus::Completed(decision),
             });
         }
 
@@ -422,12 +432,12 @@ impl MempoolState {
     /// Mark a transaction as completed (certificate committed in block).
     ///
     /// This is the terminal state - the transaction can be evicted from mempool.
-    pub fn mark_completed(&mut self, tx_hash: &Hash) -> Vec<Action> {
+    pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
-            entry.status = TransactionStatus::Completed;
+            entry.status = TransactionStatus::Completed(decision);
             return vec![Action::EmitTransactionStatus {
                 tx_hash: *tx_hash,
-                status: TransactionStatus::Completed,
+                status: TransactionStatus::Completed(decision),
             }];
         }
         vec![]
@@ -621,7 +631,7 @@ impl MempoolState {
             .filter(|(_, entry)| {
                 !matches!(
                     entry.status,
-                    TransactionStatus::Executed(_) | TransactionStatus::Completed
+                    TransactionStatus::Executed(_) | TransactionStatus::Completed(_)
                 )
             })
             .map(|(hash, entry)| (*hash, entry.status.clone(), entry.tx.clone()))
@@ -652,7 +662,7 @@ impl MempoolState {
             // Skip transactions that are already finalized or completed
             if matches!(
                 entry.status,
-                TransactionStatus::Executed(_) | TransactionStatus::Completed
+                TransactionStatus::Executed(_) | TransactionStatus::Completed(_)
             ) {
                 continue;
             }
@@ -987,10 +997,10 @@ mod tests {
         let abort_block = make_test_block(35, vec![], vec![], vec![], vec![abort]);
         mempool.on_block_committed_full(&abort_block);
 
-        // Status should be Completed (terminal)
+        // Status should be Aborted (terminal)
         assert!(matches!(
             mempool.status(&tx_hash),
-            Some(TransactionStatus::Completed)
+            Some(TransactionStatus::Aborted { .. })
         ));
     }
 
