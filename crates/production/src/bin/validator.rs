@@ -777,11 +777,8 @@ async fn main() -> Result<()> {
     // Spawn transaction forwarder (RPC -> event loop)
     tokio::spawn(async move {
         while let Some(tx) = tx_receiver.recv().await {
-            // Inject transaction as if received via gossip
-            if let Err(e) = event_sender
-                .send(Event::TransactionGossipReceived { tx })
-                .await
-            {
+            // Submit transaction via the proper submit path (emits status updates)
+            if let Err(e) = event_sender.send(Event::SubmitTransaction { tx }).await {
                 warn!("Failed to forward RPC transaction: {}", e);
             }
         }

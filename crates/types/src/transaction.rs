@@ -67,7 +67,7 @@ impl RoutableTransaction {
             hasher.update(&details.to_hash_bytes());
         }
 
-        let hash = Hash::from_bytes(hasher.finalize().as_bytes());
+        let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
 
         Self {
             transaction,

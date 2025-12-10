@@ -287,3 +287,27 @@ echo "    --tps 100 \\"
 echo "    --duration 30s"
 echo ""
 echo "PIDs written to: $PID_FILE"
+
+# Run smoke test to verify the cluster is working
+echo ""
+echo "=== Running Smoke Test ==="
+echo "Waiting for cluster to stabilize..."
+sleep 3
+
+"$SPAMMER_BIN" smoke-test \
+    --endpoints "$SPAMMER_ENDPOINTS" \
+    --num-shards "$NUM_SHARDS" \
+    --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+    --wait-ready \
+    --timeout 60s \
+    --poll-interval 100ms
+
+SMOKE_TEST_EXIT=$?
+if [ $SMOKE_TEST_EXIT -eq 0 ]; then
+    echo ""
+    echo "=== Cluster is ready for use ==="
+else
+    echo ""
+    echo "WARNING: Smoke test failed with exit code $SMOKE_TEST_EXIT"
+    echo "Check validator logs for details: tail -f $DATA_DIR/validator-*/output.log"
+fi

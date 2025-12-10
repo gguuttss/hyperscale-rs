@@ -9,11 +9,10 @@ use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
 use hyperscale_bft::BftConfig;
-use hyperscale_core::TransactionStatus;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_types::BlockHeight;
 
-use hyperscale_core::{Action, Event, RequestId, StateMachine};
+use hyperscale_core::{Action, Event, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockVote, Hash, KeyPair, PublicKey, QuorumCertificate,
@@ -23,7 +22,6 @@ use hyperscale_types::{
 use libp2p::identity;
 use parking_lot::RwLock;
 use sbor::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -340,8 +338,6 @@ impl ProductionRunnerBuilder {
             event_tx,
             state,
             start_time: Instant::now(),
-            pending_requests: HashMap::new(),
-            next_request_id: 0,
             thread_pools,
             timer_manager,
             network,
@@ -383,10 +379,6 @@ pub struct ProductionRunner {
     state: NodeStateMachine,
     /// Start time for calculating elapsed duration.
     start_time: Instant,
-    /// Pending client requests awaiting response.
-    pending_requests: HashMap<RequestId, oneshot::Sender<TransactionStatus>>,
-    /// Next request ID.
-    next_request_id: u64,
     /// Thread pool manager for crypto and execution workloads.
     thread_pools: Arc<ThreadPoolManager>,
     /// Timer manager for setting/cancelling timers.
@@ -1224,16 +1216,6 @@ impl ProductionRunner {
                     .map_err(|e| RunnerError::SendError(e.to_string()))?;
             }
 
-            // Client responses
-            Action::EmitTransactionResult { request_id, result } => {
-                if let Some(tx) = self.pending_requests.remove(&request_id) {
-                    // Map TransactionDecision to TransactionStatus::Executed
-                    // Executed means the decision (Accept/Reject) has been made
-                    let _ = tx.send(TransactionStatus::Executed(result));
-                }
-                tracing::debug!(?request_id, ?result, "Transaction result");
-            }
-
             Action::EmitTransactionStatus { tx_hash, status } => {
                 tracing::debug!(?tx_hash, ?status, "Transaction status update");
 
@@ -1590,25 +1572,15 @@ impl ProductionRunner {
         });
     }
 
-    /// Submit a transaction and wait for result.
-    pub async fn submit_transaction(
-        &mut self,
-        tx: RoutableTransaction,
-    ) -> Result<TransactionStatus, RunnerError> {
-        let request_id = RequestId(self.next_request_id);
-        self.next_request_id += 1;
-
-        let (response_tx, response_rx) = oneshot::channel();
-        self.pending_requests.insert(request_id, response_tx);
-
+    /// Submit a transaction.
+    ///
+    /// The transaction status can be queried via the RPC status cache.
+    pub async fn submit_transaction(&mut self, tx: RoutableTransaction) -> Result<(), RunnerError> {
         // Send event to the state machine
         self.event_tx
-            .send(Event::SubmitTransaction { tx, request_id })
+            .send(Event::SubmitTransaction { tx })
             .await
-            .map_err(|e| RunnerError::SendError(e.to_string()))?;
-
-        // Wait for response
-        response_rx.await.map_err(|_| RunnerError::RequestDropped)
+            .map_err(|e| RunnerError::SendError(e.to_string()))
     }
 
     /// Handle an inbound sync request from a peer.

@@ -1,10 +1,10 @@
 //! Action types for the deterministic state machine.
 
-use crate::{message::OutboundMessage, Event, RequestId, TimerId};
+use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Hash, NodeId, PublicKey, QuorumCertificate, RoutableTransaction,
     ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
-    TransactionDecision, ViewChangeCertificate, ViewChangeVote,
+    ViewChangeCertificate, ViewChangeVote,
 };
 use std::time::Duration;
 
@@ -208,12 +208,6 @@ pub enum Action {
     /// Emit a committed block for external observers.
     EmitCommittedBlock { block: Block },
 
-    /// Emit a transaction result to the client.
-    EmitTransactionResult {
-        request_id: RequestId,
-        result: TransactionDecision,
-    },
-
     /// Emit transaction status update for RPC status cache.
     ///
     /// Emitted by the mempool whenever a transaction's status changes:
@@ -389,7 +383,6 @@ impl Action {
 
             // External Notifications
             Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",
-            Action::EmitTransactionResult { .. } => "EmitTransactionResult",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus

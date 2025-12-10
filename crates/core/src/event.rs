@@ -1,6 +1,5 @@
 //! Event types for the deterministic state machine.
 
-use crate::RequestId;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockVote, ExecutionResult, Hash, QuorumCertificate,
     RoutableTransaction, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
@@ -304,16 +303,7 @@ pub enum Event {
     // Client Requests (priority: Client)
     // ═══════════════════════════════════════════════════════════════════════
     /// Client submitted a transaction.
-    SubmitTransaction {
-        tx: RoutableTransaction,
-        request_id: RequestId,
-    },
-
-    /// Client requested transaction status.
-    QueryTransactionStatus {
-        tx_hash: Hash,
-        request_id: RequestId,
-    },
+    SubmitTransaction { tx: RoutableTransaction },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Sync Protocol Events (priority varies by type)
@@ -399,9 +389,7 @@ impl Event {
             | Event::TransactionGossipReceived { .. } => EventPriority::Network,
 
             // Client events (processed last at same time)
-            Event::SubmitTransaction { .. } | Event::QueryTransactionStatus { .. } => {
-                EventPriority::Client
-            }
+            Event::SubmitTransaction { .. } => EventPriority::Client,
 
             // Sync events have varying priorities
             Event::SyncNeeded { .. }
@@ -482,7 +470,6 @@ impl Event {
 
             // Client Requests
             Event::SubmitTransaction { .. } => "SubmitTransaction",
-            Event::QueryTransactionStatus { .. } => "QueryTransactionStatus",
 
             // Sync Protocol
             Event::SyncNeeded { .. } => "SyncNeeded",

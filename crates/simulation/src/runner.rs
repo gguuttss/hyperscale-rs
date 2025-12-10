@@ -903,10 +903,6 @@ impl SimulationRunner {
                 debug!(block_hash = ?block.hash(), "Block committed");
             }
 
-            Action::EmitTransactionResult { request_id, result } => {
-                debug!(?request_id, ?result, "Transaction result");
-            }
-
             Action::EmitTransactionStatus { tx_hash, status } => {
                 debug!(?tx_hash, ?status, "Transaction status");
             }

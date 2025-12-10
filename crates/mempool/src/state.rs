@@ -1,8 +1,6 @@
 //! Mempool state.
 
-use hyperscale_core::{
-    Action, Event, OutboundMessage, RequestId, SubStateMachine, TransactionStatus,
-};
+use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine, TransactionStatus};
 use hyperscale_types::{
     AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, Topology,
     TransactionAbort, TransactionDecision,
@@ -84,11 +82,7 @@ impl MempoolState {
 
     /// Handle transaction submission from client.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_submit_transaction(
-        &mut self,
-        tx: RoutableTransaction,
-        request_id: RequestId,
-    ) -> Vec<Action> {
+    pub fn on_submit_transaction(&mut self, tx: RoutableTransaction) -> Vec<Action> {
         let hash = tx.hash();
 
         // Check for duplicate
@@ -713,9 +707,7 @@ impl MempoolState {
 impl SubStateMachine for MempoolState {
     fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
         match event {
-            Event::SubmitTransaction { tx, request_id } => {
-                Some(self.on_submit_transaction(tx.clone(), *request_id))
-            }
+            Event::SubmitTransaction { tx } => Some(self.on_submit_transaction(tx.clone())),
             Event::TransactionGossipReceived { tx } => Some(self.on_transaction_gossip(tx.clone())),
             Event::BlockCommitted { block, .. } => {
                 // Process block fully including deferrals, certificates, and aborts
@@ -740,7 +732,6 @@ impl SubStateMachine for MempoolState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_core::RequestId;
     use hyperscale_types::{
         test_utils::test_transaction, Block, BlockHeader, DeferReason, KeyPair, QuorumCertificate,
         StaticTopology, TransactionCertificate, TransactionDefer, ValidatorId, ValidatorInfo,
@@ -799,7 +790,7 @@ mod tests {
         // Create and add a transaction
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(tx.clone(), RequestId(0));
+        mempool.on_submit_transaction(tx.clone());
 
         // Commit the transaction first (deferrals apply to committed TXs)
         let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
@@ -817,7 +808,7 @@ mod tests {
         // Create another TX as the "winner"
         let winner_tx = test_transaction(2);
         let winner_hash = winner_tx.hash();
-        mempool.on_submit_transaction(winner_tx.clone(), RequestId(1));
+        mempool.on_submit_transaction(winner_tx.clone());
 
         // Create a deferral for our TX
         let deferral = TransactionDefer {
@@ -850,12 +841,12 @@ mod tests {
         // Create loser TX and submit
         let loser_tx = test_transaction(1);
         let loser_hash = loser_tx.hash();
-        mempool.on_submit_transaction(loser_tx.clone(), RequestId(0));
+        mempool.on_submit_transaction(loser_tx.clone());
 
         // Create winner TX and submit
         let winner_tx = test_transaction(2);
         let winner_hash = winner_tx.hash();
-        mempool.on_submit_transaction(winner_tx.clone(), RequestId(1));
+        mempool.on_submit_transaction(winner_tx.clone());
 
         // Commit both
         let commit_block = make_test_block(
@@ -924,7 +915,7 @@ mod tests {
         // Create and commit a TX
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(tx.clone(), RequestId(0));
+        mempool.on_submit_transaction(tx.clone());
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&commit_block);
@@ -962,7 +953,7 @@ mod tests {
         assert_eq!(retry3.retry_count(), 3);
 
         // Submit the multiply-retried TX
-        mempool.on_submit_transaction(retry3.clone(), RequestId(0));
+        mempool.on_submit_transaction(retry3.clone());
 
         // Should detect too many retries (max_retries = 3 means 3 retries allowed, 4th would be rejected)
         let aborts = mempool.get_timed_out_transactions(BlockHeight(10), 100, 3);
@@ -980,7 +971,7 @@ mod tests {
         // Create and commit a TX
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(tx.clone(), RequestId(0));
+        mempool.on_submit_transaction(tx.clone());
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&commit_block);

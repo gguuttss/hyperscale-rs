@@ -28,13 +28,11 @@
 mod action;
 mod event;
 mod message;
-mod request;
 mod traits;
 
 pub use action::{Action, TransactionStatus};
 pub use event::{Event, EventPriority};
 pub use message::OutboundMessage;
-pub use request::RequestId;
 pub use traits::{StateMachine, SubStateMachine};
 
 /// Type alias for timer identification.

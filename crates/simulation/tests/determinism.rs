@@ -1132,7 +1132,7 @@ fn test_consensus_throughput() {
 /// 3. Verify transactions appear in committed blocks
 #[test]
 fn test_mempool_to_block_integration() {
-    use hyperscale_core::{Event, RequestId};
+    use hyperscale_core::Event;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1154,26 +1154,17 @@ fn test_mempool_to_block_integration() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction {
-            tx: tx1,
-            request_id: RequestId(1),
-        },
+        Event::SubmitTransaction { tx: tx1 },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(51),
-        Event::SubmitTransaction {
-            tx: tx2,
-            request_id: RequestId(2),
-        },
+        Event::SubmitTransaction { tx: tx2 },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(52),
-        Event::SubmitTransaction {
-            tx: tx3,
-            request_id: RequestId(3),
-        },
+        Event::SubmitTransaction { tx: tx3 },
     );
 
     // Run for 100ms - before first proposal timer fires (100ms default)
@@ -1236,7 +1227,7 @@ fn test_mempool_to_block_integration() {
 /// 5. Execution runs and creates certificates
 #[test]
 fn test_execution_flow() {
-    use hyperscale_core::{Event, RequestId};
+    use hyperscale_core::Event;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1251,10 +1242,7 @@ fn test_execution_flow() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction {
-            tx,
-            request_id: RequestId(1),
-        },
+        Event::SubmitTransaction { tx },
     );
 
     // Run for 2 seconds - should commit blocks and execute transactions
@@ -1284,7 +1272,7 @@ fn test_execution_flow() {
 /// it eventually appears in other validators' mempools via gossip.
 #[test]
 fn test_transaction_gossip() {
-    use hyperscale_core::{Event, RequestId};
+    use hyperscale_core::Event;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1299,10 +1287,7 @@ fn test_transaction_gossip() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(10),
-        Event::SubmitTransaction {
-            tx,
-            request_id: RequestId(1),
-        },
+        Event::SubmitTransaction { tx },
     );
 
     // Run briefly - transaction should be in node 0's mempool

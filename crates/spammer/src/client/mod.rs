@@ -90,11 +90,37 @@ impl RpcClient {
     pub async fn is_ready(&self) -> bool {
         let response = self
             .client
-            .get(format!("{}/api/v1/ready", self.base_url))
+            .get(format!("{}/ready", self.base_url))
             .send()
             .await;
 
         matches!(response, Ok(r) if r.status().is_success())
+    }
+
+    /// Get transaction status by hash.
+    ///
+    /// Returns the current status of a transaction, or an error if the
+    /// transaction is not found or the request fails.
+    pub async fn get_transaction_status(
+        &self,
+        tx_hash: &str,
+    ) -> Result<TransactionStatusResponse, RpcError> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/transactions/{}", self.base_url, tx_hash))
+            .send()
+            .await
+            .map_err(RpcError::Http)?;
+
+        let status = response.status();
+        let body: TransactionStatusResponse = response.json().await.map_err(RpcError::Http)?;
+
+        // If the response indicates an error at the HTTP level, convert to RpcError
+        if status.as_u16() == 404 {
+            return Err(RpcError::TransactionNotFound(tx_hash.to_string()));
+        }
+
+        Ok(body)
     }
 
     /// Get the base URL of this client.
@@ -117,4 +143,7 @@ pub enum RpcError {
 
     #[error("Node unavailable")]
     Unavailable,
+
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(String),
 }

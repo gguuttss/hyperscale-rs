@@ -10,7 +10,7 @@
 //! - Deterministic - same seed always produces same results
 //! - Inline execution - Radix Engine runs synchronously (not in thread pool)
 
-use hyperscale_core::{Event, RequestId, TransactionStatus};
+use hyperscale_core::{Event, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     shard_for_node, sign_and_notarize, KeyPair, KeyType, NodeId, PublicKey, RoutableTransaction,
@@ -149,7 +149,6 @@ fn test_e2e_single_shard_transaction() {
         Duration::ZERO,
         Event::SubmitTransaction {
             tx: transaction.clone(),
-            request_id: RequestId(1),
         },
     );
 
@@ -361,7 +360,6 @@ fn test_e2e_single_shard_determinism() {
         Duration::from_millis(100),
         Event::SubmitTransaction {
             tx: transaction.clone(),
-            request_id: RequestId(1),
         },
     );
     runner1.run_until(Duration::from_secs(5));
@@ -379,7 +377,6 @@ fn test_e2e_single_shard_determinism() {
         Duration::from_millis(100),
         Event::SubmitTransaction {
             tx: transaction.clone(),
-            request_id: RequestId(1),
         },
     );
     runner2.run_until(Duration::from_secs(5));
@@ -580,10 +577,7 @@ fn test_e2e_cross_shard_transaction() {
     runner.schedule_initial_event(
         0,
         submit_time,
-        Event::SubmitTransaction {
-            tx: cross_shard_tx,
-            request_id: RequestId(200),
-        },
+        Event::SubmitTransaction { tx: cross_shard_tx },
     );
 
     // Poll for transaction status progression
@@ -777,7 +771,6 @@ fn test_e2e_cross_shard_determinism() {
         Duration::from_millis(100),
         Event::SubmitTransaction {
             tx: transaction.clone(),
-            request_id: RequestId(1),
         },
     );
     runner1.run_until(Duration::from_secs(5));
@@ -795,7 +788,6 @@ fn test_e2e_cross_shard_determinism() {
         Duration::from_millis(100),
         Event::SubmitTransaction {
             tx: transaction.clone(),
-            request_id: RequestId(1),
         },
     );
     runner2.run_until(Duration::from_secs(5));
@@ -860,10 +852,7 @@ fn test_e2e_transaction_throughput() {
         runner.schedule_initial_event(
             (i % 4) as u32, // Distribute across validators
             Duration::from_millis(i as u64 * 50),
-            Event::SubmitTransaction {
-                tx,
-                request_id: RequestId(i as u64 + 1),
-            },
+            Event::SubmitTransaction { tx },
         );
     }
 

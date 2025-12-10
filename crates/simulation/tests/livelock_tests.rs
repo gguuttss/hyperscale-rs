@@ -10,7 +10,7 @@
 //! 4. Timeout aborts for N-way cycles (when deadlock cannot be broken by deferral)
 //! 5. Stress testing with many cross-shard transactions
 
-use hyperscale_core::{Event, RequestId, TransactionStatus};
+use hyperscale_core::{Event, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     shard_for_node, sign_and_notarize, KeyPair, KeyType, NodeId, PublicKey, RoutableTransaction,
@@ -181,21 +181,11 @@ fn test_two_shard_cycle_detection() {
 
     // Submit both transactions nearly simultaneously to create cycle potential
     let submit_time = runner.now();
-    runner.schedule_initial_event(
-        0,
-        submit_time,
-        Event::SubmitTransaction {
-            tx: tx_a,
-            request_id: RequestId(200),
-        },
-    );
+    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx: tx_a });
     runner.schedule_initial_event(
         3,
         submit_time + Duration::from_millis(5),
-        Event::SubmitTransaction {
-            tx: tx_b,
-            request_id: RequestId(201),
-        },
+        Event::SubmitTransaction { tx: tx_b },
     );
 
     println!("\n✓ Conflicting transactions submitted\n");
@@ -370,14 +360,7 @@ fn test_retry_completion_after_winner() {
     println!("Cross-shard transaction: {:?}", tx_hash);
 
     let submit_time = runner.now();
-    runner.schedule_initial_event(
-        0,
-        submit_time,
-        Event::SubmitTransaction {
-            tx,
-            request_id: RequestId(200),
-        },
-    );
+    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx });
 
     // Run and monitor
     let start_time = runner.now();
@@ -495,10 +478,7 @@ fn test_many_cross_shard_transactions() {
         runner.schedule_initial_event(
             0,
             runner.now() + Duration::from_millis(i as u64 * 100),
-            Event::SubmitTransaction {
-                tx,
-                request_id: RequestId(200 + i as u64),
-            },
+            Event::SubmitTransaction { tx },
         );
     }
 
@@ -656,21 +636,11 @@ fn test_resolves_livelocks_in_under_x_seconds() {
 
     // Submit both transactions simultaneously to maximize cycle potential
     let submit_time = runner.now();
-    runner.schedule_initial_event(
-        0,
-        submit_time,
-        Event::SubmitTransaction {
-            tx: tx_a,
-            request_id: RequestId(200),
-        },
-    );
+    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx: tx_a });
     runner.schedule_initial_event(
         3,
         submit_time + Duration::from_millis(1), // Near-simultaneous
-        Event::SubmitTransaction {
-            tx: tx_b,
-            request_id: RequestId(201),
-        },
+        Event::SubmitTransaction { tx: tx_b },
     );
 
     println!("✓ Conflicting transactions submitted simultaneously");
@@ -925,14 +895,7 @@ fn test_timeout_abort_mechanism() {
     println!("Submitting cross-shard transaction: {:?}", tx_hash);
 
     let submit_time = runner.now();
-    runner.schedule_initial_event(
-        0,
-        submit_time,
-        Event::SubmitTransaction {
-            tx,
-            request_id: RequestId(200),
-        },
-    );
+    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx });
 
     // Run for extended period to allow timeout detection
     // Timeout is typically 30 blocks, and blocks are ~1s apart

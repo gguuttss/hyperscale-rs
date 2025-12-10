@@ -3,13 +3,18 @@
 //! A command-line tool for generating and submitting transactions to a Hyperscale network.
 
 use clap::{Parser, Subcommand};
-use hyperscale_spammer::accounts::SelectionMode;
+use hyperscale_spammer::accounts::{AccountPool, SelectionMode};
+use hyperscale_spammer::client::RpcClient;
 use hyperscale_spammer::config::SpammerConfig;
 use hyperscale_spammer::genesis::generate_genesis_toml;
 use hyperscale_spammer::runner::Spammer;
+use hyperscale_spammer::workloads::{TransferWorkload, WorkloadGenerator};
+use hyperscale_types::shard_for_node;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
-use std::time::Duration;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "hyperscale-spammer")]
@@ -74,6 +79,37 @@ enum Commands {
         /// Batch size for transaction generation
         #[arg(long, default_value = "100")]
         batch_size: usize,
+    },
+
+    /// Submit a single transaction and wait for it to complete (smoke test)
+    ///
+    /// This command submits one transaction, polls for its status until it
+    /// reaches a terminal state, and reports the end-to-end latency.
+    /// Useful for verifying the cluster is healthy after startup.
+    SmokeTest {
+        /// RPC endpoints (comma-separated, one per shard minimum)
+        #[arg(short, long, value_delimiter = ',', required = true)]
+        endpoints: Vec<String>,
+
+        /// Number of shards
+        #[arg(long, default_value = "2")]
+        num_shards: u64,
+
+        /// Accounts per shard (must match genesis configuration)
+        #[arg(long, default_value = "100")]
+        accounts_per_shard: usize,
+
+        /// Maximum time to wait for transaction completion
+        #[arg(long, default_value = "60s")]
+        timeout: humantime::Duration,
+
+        /// Poll interval for checking transaction status
+        #[arg(long, default_value = "100ms")]
+        poll_interval: humantime::Duration,
+
+        /// Wait for nodes to be ready before starting
+        #[arg(long)]
+        wait_ready: bool,
     },
 }
 
@@ -144,6 +180,160 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Starting spammer for {:?}...", *duration);
             let report = spammer.run_for(*duration).await;
             report.print();
+        }
+
+        Commands::SmokeTest {
+            endpoints,
+            num_shards,
+            accounts_per_shard,
+            timeout,
+            poll_interval,
+            wait_ready,
+        } => {
+            // Initialize tracing for smoke test
+            tracing_subscriber::fmt::init();
+
+            println!("=== Smoke Test ===");
+            println!("Endpoints: {:?}", endpoints);
+            println!("Shards: {}", num_shards);
+
+            // Create RPC clients
+            let clients: Vec<RpcClient> = endpoints
+                .iter()
+                .map(|e| RpcClient::new(e.clone()))
+                .collect();
+
+            // Wait for nodes to be ready if requested
+            if wait_ready {
+                println!("Waiting for nodes to be ready...");
+                let start = Instant::now();
+                let ready_timeout = Duration::from_secs(60);
+
+                loop {
+                    if start.elapsed() > ready_timeout {
+                        eprintln!("ERROR: Nodes not ready within timeout");
+                        std::process::exit(1);
+                    }
+
+                    let mut all_ready = true;
+                    for client in &clients {
+                        if !client.is_ready().await {
+                            all_ready = false;
+                            break;
+                        }
+                    }
+
+                    if all_ready {
+                        println!("All nodes ready.");
+                        break;
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+
+            // Generate accounts (same as what's in genesis)
+            let accounts = AccountPool::generate(num_shards, accounts_per_shard)
+                .expect("Failed to generate account pool");
+
+            // Create a simple same-shard transfer
+            let workload =
+                TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.0); // Same-shard for simplicity
+
+            let mut rng = ChaCha8Rng::seed_from_u64(99999); // Different seed to avoid conflicts
+            let tx = workload
+                .generate_one(&accounts, &mut rng)
+                .expect("Failed to generate transaction");
+
+            // Determine which shard to submit to
+            let target_shard = if let Some(first_write) = tx.declared_writes.first() {
+                shard_for_node(first_write, num_shards).0 as usize
+            } else {
+                0
+            };
+
+            let client_idx = target_shard % clients.len();
+            let client = &clients[client_idx];
+
+            // Submit the transaction
+            println!("Submitting transaction to shard {}...", target_shard);
+            let submit_start = Instant::now();
+
+            let result = client
+                .submit_transaction(&tx)
+                .await
+                .expect("Failed to submit transaction");
+
+            if !result.accepted {
+                eprintln!(
+                    "ERROR: Transaction rejected: {}",
+                    result.error.unwrap_or_default()
+                );
+                std::process::exit(1);
+            }
+
+            let tx_hash = &result.hash;
+            println!("Transaction submitted: {}", tx_hash);
+            println!("Polling for status...");
+
+            // Poll for transaction status
+            let timeout_duration: Duration = *timeout;
+            let poll_duration: Duration = *poll_interval;
+            let mut last_status = String::new();
+
+            loop {
+                if submit_start.elapsed() > timeout_duration {
+                    eprintln!("ERROR: Transaction did not complete within timeout");
+                    std::process::exit(1);
+                }
+
+                match client.get_transaction_status(tx_hash).await {
+                    Ok(status) => {
+                        if status.status != last_status {
+                            println!(
+                                "  [{:>6}ms] Status: {}",
+                                submit_start.elapsed().as_millis(),
+                                status.status
+                            );
+                            last_status = status.status.clone();
+                        }
+
+                        if status.is_terminal() {
+                            let total_latency = submit_start.elapsed();
+                            println!();
+                            println!("=== Smoke Test Results ===");
+                            println!("Final status: {}", status.status);
+
+                            if let Some(decision) = &status.decision {
+                                println!("Decision: {}", decision);
+                            }
+
+                            println!("Total latency: {:?}", total_latency);
+                            println!("Latency (ms): {:.2}", total_latency.as_secs_f64() * 1000.0);
+
+                            if status.is_success() {
+                                println!("Result: SUCCESS");
+                            } else {
+                                println!("Result: FAILED");
+                                if let Some(error) = &status.error {
+                                    eprintln!("Error: {}", error);
+                                }
+                                std::process::exit(1);
+                            }
+
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Transaction might not be in cache yet, continue polling
+                        if submit_start.elapsed() > Duration::from_secs(5) {
+                            eprintln!("Warning: Error polling status: {}", e);
+                        }
+                    }
+                }
+
+                tokio::time::sleep(poll_duration).await;
+            }
         }
     }
 

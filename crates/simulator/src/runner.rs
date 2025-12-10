@@ -5,7 +5,7 @@
 
 use crate::config::SimulatorConfig;
 use crate::metrics::{MetricsCollector, SimulationReport};
-use hyperscale_core::{Event, RequestId};
+use hyperscale_core::Event;
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_simulation::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
@@ -45,9 +45,6 @@ pub struct Simulator {
 
     /// Tracks in-flight transactions: hash -> (submit_time, target_shard).
     in_flight: HashMap<Hash, (Duration, ShardGroupId)>,
-
-    /// Request ID counter.
-    next_request_id: u64,
 }
 
 impl Simulator {
@@ -88,7 +85,6 @@ impl Simulator {
             config,
             rng,
             in_flight: HashMap::new(),
-            next_request_id: 1,
         })
     }
 
@@ -179,16 +175,10 @@ impl Simulator {
                 // propagated to the proposer yet when their proposal timer fires.
                 let shard_nodes = self.nodes_for_shard(target_shard);
                 for node_idx in shard_nodes {
-                    let request_id = RequestId(self.next_request_id);
-                    self.next_request_id += 1;
-
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        Event::SubmitTransaction {
-                            tx: tx.clone(),
-                            request_id,
-                        },
+                        Event::SubmitTransaction { tx: tx.clone() },
                     );
                 }
 

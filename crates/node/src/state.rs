@@ -493,8 +493,8 @@ impl StateMachine for NodeStateMachine {
             }
 
             // SubmitTransaction needs special handling to add gossip broadcast
-            Event::SubmitTransaction { tx, request_id } => {
-                let mut actions = self.mempool.on_submit_transaction(tx.clone(), *request_id);
+            Event::SubmitTransaction { tx } => {
+                let mut actions = self.mempool.on_submit_transaction(tx.clone());
 
                 // Broadcast transaction to all validators in our shard
                 let gossip = hyperscale_messages::TransactionGossip::new(tx.clone());
@@ -546,13 +546,6 @@ impl StateMachine for NodeStateMachine {
             Event::TransactionAccepted { tx_hash } => {
                 tracing::debug!(?tx_hash, "Transaction accepted into mempool");
                 return vec![];
-            }
-
-            // Query transaction status from mempool
-            Event::QueryTransactionStatus { .. } => {
-                if let Some(actions) = self.mempool.try_handle(&event) {
-                    return actions;
-                }
             }
 
             // Storage callback events - route to appropriate handler
