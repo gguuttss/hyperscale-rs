@@ -282,18 +282,10 @@ impl ParallelOrchestrator {
 
             // Log progress when completions cross thresholds
             if completed / progress_interval > last_logged_completed / progress_interval {
-                let elapsed = start_time.elapsed();
                 let sim_time = self.simulator.simulated_time();
 
-                // Wall-clock TPS: how fast our simulator is processing
-                let wall_tps = if elapsed.as_secs_f64() > 0.0 {
-                    completed as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-
                 // Simulated-time TPS: how fast the protocol processes transactions
-                let sim_tps = if sim_time.as_secs_f64() > 0.0 {
+                let avg_tps = if sim_time.as_secs_f64() > 0.0 {
                     completed as f64 / sim_time.as_secs_f64()
                 } else {
                     0.0
@@ -305,8 +297,7 @@ impl ParallelOrchestrator {
                     rejected,
                     in_flight = current_in_flight,
                     simulated_time_ms = sim_time.as_millis(),
-                    sim_tps = format!("{:.0}", sim_tps),
-                    wall_tps = format!("{:.0}", wall_tps),
+                    avg_tps = format!("{:.0}", avg_tps),
                     "Simulation progress"
                 );
                 last_logged_completed = completed;
@@ -314,22 +305,13 @@ impl ParallelOrchestrator {
         }
 
         let wall_clock_duration = start_time.elapsed();
-        let sim_time = self.simulator.simulated_time();
         let report = self.simulator.finalize(wall_clock_duration);
-
-        // Calculate simulated-time TPS (protocol throughput)
-        let sim_tps = if sim_time.as_secs_f64() > 0.0 {
-            report.completed as f64 / sim_time.as_secs_f64()
-        } else {
-            0.0
-        };
 
         info!(
             completed = report.completed,
             rejected = report.rejected,
-            sim_tps = format!("{:.0}", sim_tps),
-            wall_tps = format!("{:.0}", report.tps),
-            simulated_time_ms = sim_time.as_millis(),
+            avg_tps = format!("{:.0}", report.avg_tps),
+            simulated_time_ms = report.simulated_duration.as_millis(),
             wall_clock_ms = wall_clock_duration.as_millis(),
             "Simulation complete"
         );

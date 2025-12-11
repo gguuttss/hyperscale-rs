@@ -723,10 +723,10 @@ impl ParallelSimulator {
 
     /// Finalize and produce report.
     ///
-    /// TPS is calculated from wall clock duration for meaningful performance metrics.
     /// Latency is in simulated time (milliseconds converted to microseconds).
     pub fn finalize(mut self, wall_clock_duration: Duration) -> SimulationReport {
         let (submitted, completed, rejected, in_flight) = self.metrics();
+        let simulated_time = self.simulated_time;
 
         // Compute latency percentiles (in simulated microseconds)
         self.latencies.sort_unstable();
@@ -740,15 +740,16 @@ impl ParallelSimulator {
             self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
         };
 
-        // TPS based on wall clock time (meaningful performance metric)
-        let tps = if wall_clock_duration.as_secs_f64() > 0.0 {
-            completed as f64 / wall_clock_duration.as_secs_f64()
+        // Average TPS: protocol throughput in simulated time
+        let avg_tps = if simulated_time.as_secs_f64() > 0.0 {
+            completed as f64 / simulated_time.as_secs_f64()
         } else {
             0.0
         };
 
         SimulationReport {
-            duration: wall_clock_duration,
+            wall_duration: wall_clock_duration,
+            simulated_duration: simulated_time,
             submitted,
             completed,
             rejected,
@@ -756,7 +757,7 @@ impl ParallelSimulator {
             in_flight: in_flight as u64,
             messages_dropped_loss: 0,
             messages_dropped_partition: 0,
-            tps,
+            avg_tps,
             latency_p50_us: p50,
             latency_p90_us: p90,
             latency_p99_us: p99,

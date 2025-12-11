@@ -153,8 +153,12 @@ impl MetricsCollector {
     }
 
     /// Finalize and produce report.
-    pub fn finalize(self, router_stats: crate::router::RouterStats) -> SimulationReport {
-        let duration = self.start_time.elapsed();
+    pub fn finalize(
+        self,
+        router_stats: crate::router::RouterStats,
+        simulated_time: Duration,
+    ) -> SimulationReport {
+        let wall_duration = self.start_time.elapsed();
         let snapshot = self.shared.snapshot();
 
         // Compute latency percentiles
@@ -171,14 +175,16 @@ impl MetricsCollector {
             latencies.iter().sum::<u64>() / latencies.len() as u64
         };
 
-        let tps = if duration.as_secs_f64() > 0.0 {
-            snapshot.completed as f64 / duration.as_secs_f64()
+        // Average TPS: protocol throughput in simulated time
+        let avg_tps = if simulated_time.as_secs_f64() > 0.0 {
+            snapshot.completed as f64 / simulated_time.as_secs_f64()
         } else {
             0.0
         };
 
         SimulationReport {
-            duration,
+            wall_duration,
+            simulated_duration: simulated_time,
             submitted: snapshot.submitted,
             completed: snapshot.completed,
             rejected: snapshot.rejected,
@@ -186,7 +192,7 @@ impl MetricsCollector {
             in_flight: self.in_flight.len() as u64,
             messages_dropped_loss: router_stats.dropped_loss,
             messages_dropped_partition: router_stats.dropped_partition,
-            tps,
+            avg_tps,
             latency_p50_us: p50,
             latency_p90_us: p90,
             latency_p99_us: p99,
@@ -207,7 +213,8 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 /// Final simulation report.
 #[derive(Debug, Clone)]
 pub struct SimulationReport {
-    pub duration: Duration,
+    pub wall_duration: Duration,
+    pub simulated_duration: Duration,
     pub submitted: u64,
     pub completed: u64,
     pub rejected: u64,
@@ -215,7 +222,8 @@ pub struct SimulationReport {
     pub in_flight: u64,
     pub messages_dropped_loss: u64,
     pub messages_dropped_partition: u64,
-    pub tps: f64,
+    /// Average TPS: protocol throughput in simulated time
+    pub avg_tps: f64,
     pub latency_p50_us: u64,
     pub latency_p90_us: u64,
     pub latency_p99_us: u64,
@@ -237,7 +245,7 @@ impl SimulationReport {
         println!("  In-flight:  {} (at cutoff)", self.in_flight);
         println!();
         println!("Throughput:");
-        println!("  Average TPS: {:.2}", self.tps);
+        println!("  Average TPS: {:.2}", self.avg_tps);
         println!();
         println!("Latency (completed txs):");
         println!("  P50:  {:.3}ms", self.latency_p50_us as f64 / 1000.0);
@@ -250,7 +258,11 @@ impl SimulationReport {
         println!("  Packet loss: {}", self.messages_dropped_loss);
         println!("  Partitions:  {}", self.messages_dropped_partition);
         println!();
-        println!("Duration: {:.2}s", self.duration.as_secs_f64());
+        println!(
+            "Duration: {:.2}s (simulated: {:.3}s)",
+            self.wall_duration.as_secs_f64(),
+            self.simulated_duration.as_secs_f64()
+        );
         println!("═══════════════════════════════════════════\n");
     }
 }
