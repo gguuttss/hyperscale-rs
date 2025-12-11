@@ -63,8 +63,8 @@ pub struct ParallelSimulator {
     node_task_handles: Vec<JoinHandle<()>>,
     /// Thread pool manager (shared across all nodes).
     thread_pools: Arc<ThreadPoolManager>,
-    /// Sender for routing messages (cloned to each node).
-    router_tx: Option<mpsc::Sender<RoutedMessage>>,
+    /// Sender for routing messages (cloned to each node, unbounded).
+    router_tx: Option<mpsc::UnboundedSender<RoutedMessage>>,
     /// Whether simulation has been started.
     started: bool,
 }
@@ -143,18 +143,17 @@ impl ParallelSimulator {
             shard_committees.insert(shard, committee);
         }
 
-        // Create router
+        // Create router (unbounded channels for simulation)
         let (router, node_receivers) = MessageRouter::new(
             num_shards,
             validators_per_shard,
-            self.config.channel_capacity,
             self.config.network.clone(),
             seed,
         );
         self.router_stats = Some(router.stats_handle());
 
-        // Create router channel
-        let (router_tx, router_rx) = mpsc::channel(self.config.channel_capacity);
+        // Create router channel (unbounded)
+        let (router_tx, router_rx) = mpsc::unbounded_channel();
         self.router_tx = Some(router_tx.clone());
 
         // Create metrics channel

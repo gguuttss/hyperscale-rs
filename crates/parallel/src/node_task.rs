@@ -213,8 +213,8 @@ impl NodeTask {
     pub async fn execute_action(&mut self, action: Action) {
         match action {
             Action::BroadcastToShard { shard, message } => {
-                // Use try_send to avoid blocking the node task if channel is full
-                let _ = self.router_tx.try_send(RoutedMessage {
+                // Unbounded send - never blocks
+                let _ = self.router_tx.send(RoutedMessage {
                     from: self.node_index,
                     destination: Destination::Shard(shard),
                     message: Arc::new(message),
@@ -222,8 +222,8 @@ impl NodeTask {
             }
 
             Action::BroadcastGlobal { message } => {
-                // Use try_send to avoid blocking the node task if channel is full
-                let _ = self.router_tx.try_send(RoutedMessage {
+                // Unbounded send - never blocks
+                let _ = self.router_tx.send(RoutedMessage {
                     from: self.node_index,
                     destination: Destination::Global,
                     message: Arc::new(message),

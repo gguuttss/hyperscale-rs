@@ -184,7 +184,6 @@ impl MetricsCollector {
             rejected: snapshot.rejected,
             retries: snapshot.retries,
             in_flight: self.in_flight.len() as u64,
-            messages_dropped_buffer: router_stats.dropped_buffer,
             messages_dropped_loss: router_stats.dropped_loss,
             messages_dropped_partition: router_stats.dropped_partition,
             tps,
@@ -214,7 +213,6 @@ pub struct SimulationReport {
     pub rejected: u64,
     pub retries: u64,
     pub in_flight: u64,
-    pub messages_dropped_buffer: u64,
     pub messages_dropped_loss: u64,
     pub messages_dropped_partition: u64,
     pub tps: f64,
@@ -249,7 +247,6 @@ impl SimulationReport {
         println!("  Avg:  {:.3}ms", self.latency_avg_us as f64 / 1000.0);
         println!();
         println!("Message Drops:");
-        println!("  Buffer full: {}", self.messages_dropped_buffer);
         println!("  Packet loss: {}", self.messages_dropped_loss);
         println!("  Partitions:  {}", self.messages_dropped_partition);
         println!();

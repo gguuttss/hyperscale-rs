@@ -23,8 +23,6 @@ pub struct ParallelConfig {
     /// Drain duration after submission ends (default 5s).
     /// Allows in-flight transactions to complete before collecting final metrics.
     pub drain_duration: Duration,
-    /// Channel capacity for inter-node messages (default 10,000).
-    pub channel_capacity: usize,
 }
 
 impl ParallelConfig {
@@ -41,7 +39,6 @@ impl ParallelConfig {
                 ..NetworkConfig::default()
             },
             drain_duration: Duration::from_secs(5),
-            channel_capacity: 10_000,
         }
     }
 
@@ -73,12 +70,6 @@ impl ParallelConfig {
         self.thread_pools = thread_pools;
         self
     }
-
-    /// Set channel capacity.
-    pub fn with_channel_capacity(mut self, capacity: usize) -> Self {
-        self.channel_capacity = capacity;
-        self
-    }
 }
 
 #[cfg(test)]
@@ -98,11 +89,9 @@ mod tests {
     fn test_builder_pattern() {
         let config = ParallelConfig::new(1, 4)
             .with_seed(123)
-            .with_drain_duration(Duration::from_secs(10))
-            .with_channel_capacity(5000);
+            .with_drain_duration(Duration::from_secs(10));
 
         assert_eq!(config.seed, 123);
         assert_eq!(config.drain_duration, Duration::from_secs(10));
-        assert_eq!(config.channel_capacity, 5000);
     }
 }

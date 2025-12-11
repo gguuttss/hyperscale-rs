@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Handle for sending messages to the router.
-pub type RouterTx = mpsc::Sender<RoutedMessage>;
+/// Handle for sending messages to the router (unbounded for simulation).
+pub type RouterTx = mpsc::UnboundedSender<RoutedMessage>;
 
-/// Handle for receiving messages at a node.
-pub type NodeRx = mpsc::Receiver<InboundMessage>;
+/// Handle for receiving messages at a node (unbounded for simulation).
+pub type NodeRx = mpsc::UnboundedReceiver<InboundMessage>;
 
 /// Message with routing information, sent to the router.
 pub struct RoutedMessage {
@@ -54,7 +54,6 @@ pub struct InboundMessage {
 /// Statistics from the router (accessed via Arc after router task completes).
 #[derive(Debug, Clone, Default)]
 pub struct RouterStats {
-    pub dropped_buffer: u64,
     pub dropped_loss: u64,
     pub dropped_partition: u64,
 }
@@ -66,18 +65,17 @@ pub struct RouterStats {
 ///
 /// # Design Notes
 ///
+/// - Uses unbounded channels to avoid backpressure in simulation
 /// - Messages are wrapped in `Arc` to avoid expensive clones during broadcast
 /// - Partitions are managed through the underlying `SimulatedNetwork`
 /// - Drop statistics are tracked via atomic counters exposed through `RouterStatsHandle`
 pub struct MessageRouter {
     /// Sender handles for each node (node_index -> sender).
-    node_senders: HashMap<u32, mpsc::Sender<InboundMessage>>,
+    node_senders: HashMap<u32, mpsc::UnboundedSender<InboundMessage>>,
     /// Simulated network for latency/loss/partition decisions.
     network: SimulatedNetwork,
     /// RNG for latency/loss sampling.
     rng: ChaCha8Rng,
-    /// Count of dropped messages due to full buffers.
-    messages_dropped_buffer: Arc<AtomicU64>,
     /// Count of dropped messages due to packet loss.
     messages_dropped_loss: Arc<AtomicU64>,
     /// Count of dropped messages due to partition.
@@ -91,7 +89,6 @@ impl MessageRouter {
     pub fn new(
         num_shards: usize,
         validators_per_shard: usize,
-        channel_capacity: usize,
         network_config: NetworkConfig,
         seed: u64,
     ) -> (Self, HashMap<u32, NodeRx>) {
@@ -100,7 +97,7 @@ impl MessageRouter {
         let mut node_receivers = HashMap::new();
 
         for node_idx in 0..total_nodes as u32 {
-            let (tx, rx) = mpsc::channel(channel_capacity);
+            let (tx, rx) = mpsc::unbounded_channel();
             node_senders.insert(node_idx, tx);
             node_receivers.insert(node_idx, rx);
         }
@@ -111,7 +108,6 @@ impl MessageRouter {
             node_senders,
             network,
             rng: ChaCha8Rng::seed_from_u64(seed),
-            messages_dropped_buffer: Arc::new(AtomicU64::new(0)),
             messages_dropped_loss: Arc::new(AtomicU64::new(0)),
             messages_dropped_partition: Arc::new(AtomicU64::new(0)),
         };
@@ -122,7 +118,6 @@ impl MessageRouter {
     /// Get a handle for accessing router stats after the router task completes.
     pub fn stats_handle(&self) -> RouterStatsHandle {
         RouterStatsHandle {
-            dropped_buffer: Arc::clone(&self.messages_dropped_buffer),
             dropped_loss: Arc::clone(&self.messages_dropped_loss),
             dropped_partition: Arc::clone(&self.messages_dropped_partition),
         }
@@ -173,12 +168,11 @@ impl MessageRouter {
         }
     }
 
-    /// Deliver a message to a target node.
+    /// Deliver a message to a target node (unbounded, never fails).
     fn deliver(&self, target: u32, message: InboundMessage) {
         if let Some(tx) = self.node_senders.get(&target) {
-            if tx.try_send(message).is_err() {
-                self.messages_dropped_buffer.fetch_add(1, Ordering::Relaxed);
-            }
+            // Unbounded send - ignoring error means receiver was dropped (shutdown)
+            let _ = tx.send(message);
         }
     }
 
@@ -186,7 +180,7 @@ impl MessageRouter {
     ///
     /// Processes incoming messages and delivers them immediately.
     /// Exits when the incoming channel is closed (all senders dropped).
-    pub async fn run(mut self, mut incoming: mpsc::Receiver<RoutedMessage>) {
+    pub async fn run(mut self, mut incoming: mpsc::UnboundedReceiver<RoutedMessage>) {
         // Process messages as fast as possible - no wall-clock delays
         while let Some(msg) = incoming.recv().await {
             self.queue_message(msg);
@@ -208,17 +202,11 @@ impl MessageRouter {
 /// statistics via atomic counters that can be read from anywhere.
 #[derive(Clone)]
 pub struct RouterStatsHandle {
-    dropped_buffer: Arc<AtomicU64>,
     dropped_loss: Arc<AtomicU64>,
     dropped_partition: Arc<AtomicU64>,
 }
 
 impl RouterStatsHandle {
-    /// Get current count of messages dropped due to full buffers.
-    pub fn dropped_buffer(&self) -> u64 {
-        self.dropped_buffer.load(Ordering::Relaxed)
-    }
-
     /// Get current count of messages dropped due to packet loss.
     pub fn dropped_loss(&self) -> u64 {
         self.dropped_loss.load(Ordering::Relaxed)
@@ -232,7 +220,6 @@ impl RouterStatsHandle {
     /// Get a snapshot of all router statistics.
     pub fn snapshot(&self) -> RouterStats {
         RouterStats {
-            dropped_buffer: self.dropped_buffer(),
             dropped_loss: self.dropped_loss(),
             dropped_partition: self.dropped_partition(),
         }
@@ -252,14 +239,13 @@ mod tests {
             ..Default::default()
         };
 
-        let (router, receivers) = MessageRouter::new(2, 4, 100, config, 42);
+        let (router, receivers) = MessageRouter::new(2, 4, config, 42);
 
         assert_eq!(receivers.len(), 8);
         assert!(receivers.contains_key(&0));
         assert!(receivers.contains_key(&7));
 
         let stats = router.stats_handle();
-        assert_eq!(stats.dropped_buffer(), 0);
         assert_eq!(stats.dropped_loss(), 0);
         assert_eq!(stats.dropped_partition(), 0);
     }
@@ -272,8 +258,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (router, _receivers) = MessageRouter::new(1, 2, 100, config, 42);
-        let (tx, rx) = mpsc::channel(10);
+        let (router, _receivers) = MessageRouter::new(1, 2, config, 42);
+        let (tx, rx) = mpsc::unbounded_channel();
 
         // Spawn router
         let handle = tokio::spawn(async move {
