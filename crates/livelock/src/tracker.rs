@@ -3,25 +3,35 @@
 //! These trackers maintain the state needed for detecting bidirectional
 //! dependencies between shards that could cause livelock.
 
-use hyperscale_types::{Hash, ShardGroupId};
+use hyperscale_types::{Hash, NodeId, ShardGroupId};
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// Information about a committed cross-shard transaction's remote state needs.
+#[derive(Debug, Clone)]
+pub struct RemoteStateNeeds {
+    /// Which shards this TX needs provisions from.
+    pub shards: BTreeSet<ShardGroupId>,
+    /// Which specific NodeIds this TX needs from each shard.
+    /// Maps shard -> set of NodeIds needed from that shard.
+    pub nodes_by_shard: HashMap<ShardGroupId, HashSet<NodeId>>,
+}
 
 /// Tracks committed cross-shard transactions for cycle detection.
 ///
 /// When a cross-shard transaction is committed, we need to know which shards
-/// it requires provisions from. This tracker maintains a bidirectional index
-/// for efficient lookups in both directions:
+/// it requires provisions from AND which specific nodes (accounts) it needs.
+/// This tracker maintains indexes for efficient lookups:
 ///
-/// 1. Given a TX, which shards does it need provisions from?
+/// 1. Given a TX, which shards/nodes does it need provisions from?
 /// 2. Given a shard, which TXs need provisions from it?
 ///
 /// The second lookup is critical for cycle detection: when we receive a
 /// provision from shard S, we can quickly find all local TXs that need S's
-/// state, and check if S has any TXs that need our state (bidirectional cycle).
+/// state, and check if they have overlapping node dependencies (true cycle).
 #[derive(Debug, Default)]
 pub struct CommittedCrossShardTracker {
-    /// tx_hash -> shards we need provisions from
-    txs_needing_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+    /// tx_hash -> remote state needs (shards and specific nodes)
+    tx_needs: HashMap<Hash, RemoteStateNeeds>,
     /// Reverse index: shard -> tx_hashes that need provisions from it
     shards_needed_by: HashMap<ShardGroupId, HashSet<Hash>>,
 }
@@ -32,15 +42,15 @@ impl CommittedCrossShardTracker {
         Self::default()
     }
 
-    /// Add a transaction that needs provisions from the given shards.
+    /// Add a transaction that needs provisions from the given shards with specific nodes.
     ///
     /// # Arguments
     ///
     /// * `tx_hash` - The transaction hash
-    /// * `shards` - Set of shards this TX needs provisions from
-    pub fn add(&mut self, tx_hash: Hash, shards: BTreeSet<ShardGroupId>) {
+    /// * `needs` - The remote state needs (shards and specific nodes)
+    pub fn add(&mut self, tx_hash: Hash, needs: RemoteStateNeeds) {
         // Build reverse index
-        for &shard in &shards {
+        for &shard in &needs.shards {
             self.shards_needed_by
                 .entry(shard)
                 .or_default()
@@ -48,16 +58,16 @@ impl CommittedCrossShardTracker {
         }
 
         // Store forward mapping
-        self.txs_needing_shards.insert(tx_hash, shards);
+        self.tx_needs.insert(tx_hash, needs);
     }
 
     /// Remove a transaction (completed, deferred, or aborted).
     ///
     /// Cleans up both the forward and reverse indexes.
     pub fn remove(&mut self, tx_hash: &Hash) {
-        if let Some(shards) = self.txs_needing_shards.remove(tx_hash) {
+        if let Some(needs) = self.tx_needs.remove(tx_hash) {
             // Clean up reverse index
-            for shard in shards {
+            for shard in needs.shards {
                 if let Some(txs) = self.shards_needed_by.get_mut(&shard) {
                     txs.remove(tx_hash);
                     if txs.is_empty() {
@@ -76,24 +86,37 @@ impl CommittedCrossShardTracker {
         self.shards_needed_by.get(&shard)
     }
 
+    /// Get the nodes a transaction needs from a specific shard.
+    ///
+    /// Returns None if the TX isn't tracked or doesn't need anything from that shard.
+    pub fn nodes_needed_from_shard(
+        &self,
+        tx_hash: &Hash,
+        shard: ShardGroupId,
+    ) -> Option<&HashSet<NodeId>> {
+        self.tx_needs
+            .get(tx_hash)
+            .and_then(|needs| needs.nodes_by_shard.get(&shard))
+    }
+
     /// Check if a transaction is being tracked.
     pub fn contains(&self, tx_hash: &Hash) -> bool {
-        self.txs_needing_shards.contains_key(tx_hash)
+        self.tx_needs.contains_key(tx_hash)
     }
 
     /// Get the shards a transaction needs provisions from.
     pub fn shards_for_tx(&self, tx_hash: &Hash) -> Option<&BTreeSet<ShardGroupId>> {
-        self.txs_needing_shards.get(tx_hash)
+        self.tx_needs.get(tx_hash).map(|n| &n.shards)
     }
 
     /// Get the number of transactions being tracked.
     pub fn len(&self) -> usize {
-        self.txs_needing_shards.len()
+        self.tx_needs.len()
     }
 
     /// Check if the tracker is empty.
     pub fn is_empty(&self) -> bool {
-        self.txs_needing_shards.is_empty()
+        self.tx_needs.is_empty()
     }
 }
 
@@ -168,6 +191,12 @@ impl ProvisionTracker {
 mod tests {
     use super::*;
 
+    fn make_node_id(id: u8) -> NodeId {
+        let mut bytes = [0u8; 30];
+        bytes[0] = id;
+        NodeId::from_bytes(&bytes)
+    }
+
     #[test]
     fn test_committed_tracker_basic() {
         let mut tracker = CommittedCrossShardTracker::new();
@@ -178,11 +207,33 @@ mod tests {
         let shard1 = ShardGroupId(1);
         let shard2 = ShardGroupId(2);
 
-        // tx1 needs provisions from shard0 and shard1
-        tracker.add(tx1, [shard0, shard1].into_iter().collect());
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
 
-        // tx2 needs provisions from shard1 and shard2
-        tracker.add(tx2, [shard1, shard2].into_iter().collect());
+        // tx1 needs provisions from shard0 (node_a) and shard1 (node_b)
+        let needs1 = RemoteStateNeeds {
+            shards: [shard0, shard1].into_iter().collect(),
+            nodes_by_shard: [
+                (shard0, [node_a.clone()].into_iter().collect()),
+                (shard1, [node_b.clone()].into_iter().collect()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        tracker.add(tx1, needs1);
+
+        // tx2 needs provisions from shard1 (node_b) and shard2 (node_c)
+        let needs2 = RemoteStateNeeds {
+            shards: [shard1, shard2].into_iter().collect(),
+            nodes_by_shard: [
+                (shard1, [node_b.clone()].into_iter().collect()),
+                (shard2, [node_c.clone()].into_iter().collect()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        tracker.add(tx2, needs2);
 
         // Check forward lookups
         assert!(tracker.contains(&tx1));
@@ -204,6 +255,20 @@ mod tests {
         assert_eq!(
             tracker.txs_needing_shard(shard2),
             Some(&[tx2].into_iter().collect())
+        );
+
+        // Check node lookups
+        assert_eq!(
+            tracker.nodes_needed_from_shard(&tx1, shard0),
+            Some(&[node_a].into_iter().collect())
+        );
+        assert_eq!(
+            tracker.nodes_needed_from_shard(&tx1, shard1),
+            Some(&[node_b.clone()].into_iter().collect())
+        );
+        assert_eq!(
+            tracker.nodes_needed_from_shard(&tx2, shard1),
+            Some(&[node_b].into_iter().collect())
         );
 
         // Remove tx1

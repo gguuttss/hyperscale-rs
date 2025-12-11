@@ -515,9 +515,8 @@ impl SimulationRunner {
                 let peers = self.network.peers_in_shard(shard);
                 for to in peers {
                     if to != from {
-                        if let Some(event) = self.message_to_event(message.clone()) {
-                            self.try_deliver_message(from, to, event);
-                        }
+                        let event = self.message_to_event(message.clone());
+                        self.try_deliver_message(from, to, event);
                     }
                 }
             }
@@ -525,9 +524,8 @@ impl SimulationRunner {
             Action::BroadcastGlobal { message } => {
                 for to in self.network.all_nodes() {
                     if to != from {
-                        if let Some(event) = self.message_to_event(message.clone()) {
-                            self.try_deliver_message(from, to, event);
-                        }
+                        let event = self.message_to_event(message.clone());
+                        self.try_deliver_message(from, to, event);
                     }
                 }
             }
@@ -1104,37 +1102,8 @@ impl SimulationRunner {
     /// Note: Sender identity is not included in Events anymore.
     /// In production, sender identity comes from message signatures (ValidatorId).
     /// In simulation, sender identity isn't needed for consensus correctness.
-    fn message_to_event(&self, message: OutboundMessage) -> Option<Event> {
-        Some(match message {
-            OutboundMessage::BlockHeader(gossip) => Event::BlockHeaderReceived {
-                header: gossip.header,
-                tx_hashes: gossip.transaction_hashes,
-                cert_hashes: gossip.certificate_hashes,
-                deferred: gossip.deferred,
-                aborted: gossip.aborted,
-            },
-            OutboundMessage::BlockVote(gossip) => Event::BlockVoteReceived { vote: gossip.vote },
-            OutboundMessage::ViewChangeVote(gossip) => {
-                Event::ViewChangeVoteReceived { vote: gossip.vote }
-            }
-            OutboundMessage::ViewChangeCertificate(gossip) => {
-                Event::ViewChangeCertificateReceived {
-                    cert: gossip.certificate,
-                }
-            }
-            OutboundMessage::StateProvision(gossip) => Event::StateProvisionReceived {
-                provision: gossip.provision,
-            },
-            OutboundMessage::StateVoteBlock(gossip) => {
-                Event::StateVoteReceived { vote: gossip.vote }
-            }
-            OutboundMessage::StateCertificate(gossip) => Event::StateCertificateReceived {
-                cert: gossip.certificate,
-            },
-            OutboundMessage::TransactionGossip(gossip) => Event::TransactionGossipReceived {
-                tx: gossip.transaction,
-            },
-        })
+    fn message_to_event(&self, message: OutboundMessage) -> Event {
+        message.to_received_event()
     }
 
     /// Convert a timer ID to an event.

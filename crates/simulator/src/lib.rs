@@ -34,6 +34,7 @@
 pub mod config;
 pub mod livelock;
 pub mod metrics;
+pub mod parallel;
 pub mod runner;
 
 // Re-export types from hyperscale-spammer for convenience
@@ -45,4 +46,5 @@ pub use hyperscale_spammer::{
 pub use config::{SimulatorConfig, WorkloadConfig};
 pub use livelock::{LivelockAnalyzer, LivelockReport, StuckTransaction};
 pub use metrics::{MetricsCollector, SimulationReport};
+pub use parallel::{ParallelOrchestrator, ParallelOrchestratorConfig, ParallelOrchestratorError};
 pub use runner::Simulator;

@@ -3,13 +3,13 @@
 //! This module implements the provision-based cycle detection system that
 //! prevents bidirectional livelock in cross-shard transactions.
 
-use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker};
+use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
-    BlockHeight, DeferReason, Hash, RoutableTransaction, ShardGroupId, StateProvision, Topology,
-    TransactionDefer,
+    BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId, StateProvision,
+    Topology, TransactionDefer,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace};
@@ -115,14 +115,14 @@ impl LivelockState {
     /// Called when a cross-shard transaction is committed.
     ///
     /// Registers the transaction for cycle detection by tracking which
-    /// shards it needs provisions from.
+    /// shards and specific nodes it needs provisions from.
     pub fn on_cross_shard_committed(&mut self, tx: &RoutableTransaction, height: BlockHeight) {
         let tx_hash = tx.hash();
 
-        // Determine which shards we need provisions from
-        let provisioning_shards = self.provisioning_shards_for_tx(tx);
+        // Determine which shards and nodes we need provisions from
+        let needs = self.compute_remote_state_needs(tx);
 
-        if provisioning_shards.is_empty() {
+        if needs.shards.is_empty() {
             // Not actually cross-shard, nothing to track
             return;
         }
@@ -130,17 +130,54 @@ impl LivelockState {
         debug!(
             tx_hash = %tx_hash,
             height = height.0,
-            shards = ?provisioning_shards,
+            shards = ?needs.shards,
             "Tracking committed cross-shard TX for cycle detection"
         );
 
-        self.committed_tracker.add(tx_hash, provisioning_shards);
+        self.committed_tracker.add(tx_hash, needs);
+    }
+
+    /// Compute which remote shards and nodes a transaction needs provisions from.
+    fn compute_remote_state_needs(&self, tx: &RoutableTransaction) -> RemoteStateNeeds {
+        let local_shard = self.local_shard;
+
+        // Collect all reads and writes, grouped by shard
+        let mut nodes_by_shard: HashMap<ShardGroupId, HashSet<NodeId>> = HashMap::new();
+
+        // Add read nodes (provisions come from read shards)
+        for node_id in &tx.declared_reads {
+            let shard = self.topology.shard_for_node_id(node_id);
+            if shard != local_shard {
+                nodes_by_shard
+                    .entry(shard)
+                    .or_default()
+                    .insert(node_id.clone());
+            }
+        }
+
+        // Add write nodes from remote shards (for read-your-writes scenarios)
+        for node_id in &tx.declared_writes {
+            let shard = self.topology.shard_for_node_id(node_id);
+            if shard != local_shard {
+                nodes_by_shard
+                    .entry(shard)
+                    .or_default()
+                    .insert(node_id.clone());
+            }
+        }
+
+        let shards = nodes_by_shard.keys().copied().collect();
+
+        RemoteStateNeeds {
+            shards,
+            nodes_by_shard,
+        }
     }
 
     /// Called when we receive a provision from another shard.
     ///
     /// Performs cycle detection and queues a deferral if a bidirectional
-    /// cycle is detected.
+    /// cycle is detected. Only triggers if there's actual state-level conflict.
     ///
     /// Returns empty vec - no actions emitted. Just updates internal state.
     pub fn on_provision_received(&mut self, provision: &StateProvision) {
@@ -169,21 +206,34 @@ impl LivelockState {
             return;
         }
 
-        // Cycle detection: Do we have any committed TXs that need provisions
-        // from the source_shard? If so, and the remote TX needs provisions
-        // from us, we have a bidirectional cycle.
-        self.check_for_cycle(remote_tx_hash, source_shard);
+        // Extract the nodes that the remote TX is providing (these are the nodes it writes/reads)
+        let remote_tx_nodes: HashSet<NodeId> = provision
+            .entries
+            .iter()
+            .map(|e| e.node_id.clone())
+            .collect();
+
+        // Cycle detection: Check if any of our local TXs have overlapping state with the remote TX
+        self.check_for_cycle(remote_tx_hash, source_shard, &remote_tx_nodes);
     }
 
     /// Check for a bidirectional cycle with a remote transaction.
     ///
-    /// A cycle exists when:
-    /// 1. We have a local TX that needs provisions from source_shard
-    /// 2. The remote TX (from source_shard) needs provisions from us
+    /// A TRUE cycle exists when:
+    /// 1. We have a local TX that needs provisions from source_shard for SPECIFIC NODES
+    /// 2. The remote TX needs provisions from us for OVERLAPPING NODES
     ///
-    /// When a cycle is detected, the transaction with the higher hash loses
+    /// If the nodes don't overlap, there's no actual deadlock risk - the transactions
+    /// can proceed independently even though they cross the same shards.
+    ///
+    /// When a true cycle is detected, the transaction with the higher hash loses
     /// and is deferred. Both shards independently reach the same conclusion.
-    fn check_for_cycle(&mut self, remote_tx_hash: Hash, source_shard: ShardGroupId) {
+    fn check_for_cycle(
+        &mut self,
+        remote_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        remote_tx_nodes: &HashSet<NodeId>,
+    ) {
         // Get all our committed TXs that need provisions from the remote shard
         // Clone to avoid borrow issues when we need to call queue_deferral
         let local_txs_needing_source: Vec<Hash> = self
@@ -198,13 +248,32 @@ impl LivelockState {
 
         // For each local TX that needs the source shard...
         for local_tx_hash in local_txs_needing_source {
-            // Check if the local TX needs provisions from the source shard AND
-            // the source shard has a TX that needs provisions from us.
-            // The provision we just received proves the latter!
+            // Get the specific nodes our local TX needs from the remote shard
+            let local_nodes_needed = match self
+                .committed_tracker
+                .nodes_needed_from_shard(&local_tx_hash, source_shard)
+            {
+                Some(nodes) => nodes,
+                None => continue, // Shouldn't happen, but be safe
+            };
 
-            // This is a bidirectional cycle: local_tx -> source_shard -> us
-            // and remote_tx -> us (proven by receiving provision)
+            // Check if there's actual node-level overlap
+            // A true cycle only exists if the remote TX's nodes overlap with our local TX's needs
+            let has_overlap = local_nodes_needed
+                .iter()
+                .any(|node| remote_tx_nodes.contains(node));
 
+            if !has_overlap {
+                // No actual state conflict - these TXs can proceed independently
+                trace!(
+                    local_tx = %local_tx_hash,
+                    remote_tx = %remote_tx_hash,
+                    "No node overlap - skipping cycle detection"
+                );
+                continue;
+            }
+
+            // There IS a true bidirectional cycle with overlapping state!
             // Determine winner by hash comparison (lower hash wins)
             let (winner, loser) = if local_tx_hash < remote_tx_hash {
                 (local_tx_hash, remote_tx_hash)
@@ -221,7 +290,7 @@ impl LivelockState {
                     local_tx = %local_tx_hash,
                     remote_tx = %remote_tx_hash,
                     winner = %winner,
-                    "Cycle detected - our TX loses, queuing deferral"
+                    "TRUE cycle detected with overlapping nodes - our TX loses, queuing deferral"
                 );
 
                 self.queue_deferral(local_tx_hash, winner);
@@ -353,26 +422,9 @@ impl LivelockState {
         }
     }
 
-    /// Determine which shards we need to provision from for a transaction.
-    ///
-    /// Returns the set of shards that own state this transaction reads/writes,
-    /// excluding our own shard.
-    fn provisioning_shards_for_tx(&self, tx: &RoutableTransaction) -> BTreeSet<ShardGroupId> {
-        let mut shards = BTreeSet::new();
-
-        for node_id in tx.all_declared_nodes() {
-            let shard = self.topology.shard_for_node_id(node_id);
-            if shard != self.local_shard {
-                shards.insert(shard);
-            }
-        }
-
-        shards
-    }
-
     /// Check if a transaction is cross-shard (needs provisions from other shards).
     pub fn is_cross_shard(&self, tx: &RoutableTransaction) -> bool {
-        !self.provisioning_shards_for_tx(tx).is_empty()
+        !self.compute_remote_state_needs(tx).shards.is_empty()
     }
 
     /// Get statistics for metrics.
@@ -445,7 +497,15 @@ mod tests {
         ))
     }
 
+    fn make_test_node_id(id: u8) -> NodeId {
+        // Create a simple NodeId from bytes
+        let mut bytes = [0u8; 30];
+        bytes[0] = id;
+        NodeId::from_bytes(&bytes)
+    }
+
     fn make_provision(tx_hash: Hash, source_shard: ShardGroupId) -> StateProvision {
+        // Create a provision with no entries (no node overlap possible)
         StateProvision {
             transaction_hash: tx_hash,
             target_shard: ShardGroupId(0),
@@ -454,6 +514,41 @@ mod tests {
             entries: vec![],
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
+        }
+    }
+
+    fn make_provision_with_nodes(
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        node_ids: Vec<NodeId>,
+    ) -> StateProvision {
+        use hyperscale_types::{PartitionNumber, StateEntry};
+        // Create a provision with specific nodes
+        let entries = node_ids
+            .into_iter()
+            .map(|node_id| StateEntry::new(node_id, PartitionNumber(0), vec![], None))
+            .collect();
+        StateProvision {
+            transaction_hash: tx_hash,
+            target_shard: ShardGroupId(0),
+            source_shard,
+            block_height: BlockHeight(1),
+            entries,
+            validator_id: ValidatorId(0),
+            signature: Signature::zero(),
+        }
+    }
+
+    fn make_remote_state_needs(
+        shards: &[ShardGroupId],
+        nodes_by_shard: Vec<(ShardGroupId, Vec<NodeId>)>,
+    ) -> RemoteStateNeeds {
+        RemoteStateNeeds {
+            shards: shards.iter().copied().collect(),
+            nodes_by_shard: nodes_by_shard
+                .into_iter()
+                .map(|(s, nodes)| (s, nodes.into_iter().collect()))
+                .collect(),
         }
     }
 
@@ -477,14 +572,20 @@ mod tests {
         let local_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
         let remote_tx = hash_with_prefix(0x00); // Lower hash (will win)
 
-        // Register local TX as committed needing shard 1
-        state
-            .committed_tracker
-            .add(local_tx, [ShardGroupId(1)].into_iter().collect());
+        // Create a node that both transactions will conflict on
+        let conflicting_node = make_test_node_id(42);
 
-        // Receive provision from shard 1 for remote_tx
-        // This simulates shard 1 having committed a TX that needs our state
-        let provision = make_provision(remote_tx, ShardGroupId(1));
+        // Register local TX as committed needing shard 1's state for the conflicting node
+        let needs = make_remote_state_needs(
+            &[ShardGroupId(1)],
+            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+        );
+        state.committed_tracker.add(local_tx, needs);
+
+        // Receive provision from shard 1 for remote_tx with the SAME conflicting node
+        // This simulates shard 1 having committed a TX that also uses the conflicting node
+        let provision =
+            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
         state.on_provision_received(&provision);
 
         // Should have queued a deferral (local_tx loses to remote_tx)
@@ -507,16 +608,50 @@ mod tests {
         let local_tx = hash_with_prefix(0x00); // Lower hash (will win)
         let remote_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
 
-        // Register local TX as committed needing shard 1
-        state
-            .committed_tracker
-            .add(local_tx, [ShardGroupId(1)].into_iter().collect());
+        // Create a conflicting node
+        let conflicting_node = make_test_node_id(42);
 
-        // Receive provision from shard 1 for remote_tx
-        let provision = make_provision(remote_tx, ShardGroupId(1));
+        // Register local TX as committed needing shard 1 for the conflicting node
+        let needs = make_remote_state_needs(
+            &[ShardGroupId(1)],
+            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+        );
+        state.committed_tracker.add(local_tx, needs);
+
+        // Receive provision from shard 1 for remote_tx with overlapping node
+        let provision =
+            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
         state.on_provision_received(&provision);
 
         // Should NOT have queued a deferral (we win, remote should defer)
+        assert!(state.get_pending_deferrals().is_empty());
+    }
+
+    #[test]
+    fn test_no_cycle_when_no_node_overlap() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut state = LivelockState::new(ShardGroupId(0), topology);
+
+        // local_tx would lose by hash comparison
+        let local_tx = hash_with_prefix(0xFF);
+        let remote_tx = hash_with_prefix(0x00);
+
+        // Different nodes - no conflict!
+        let local_node = make_test_node_id(1);
+        let remote_node = make_test_node_id(2);
+
+        // Register local TX as committed needing shard 1 for local_node
+        let needs = make_remote_state_needs(
+            &[ShardGroupId(1)],
+            vec![(ShardGroupId(1), vec![local_node])],
+        );
+        state.committed_tracker.add(local_tx, needs);
+
+        // Receive provision from shard 1 for remote_tx with DIFFERENT node
+        let provision = make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![remote_node]);
+        state.on_provision_received(&provision);
+
+        // Should NOT have queued a deferral - no node overlap means no real conflict
         assert!(state.get_pending_deferrals().is_empty());
     }
 
@@ -574,13 +709,18 @@ mod tests {
         let local_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
         let remote_tx = hash_with_prefix(0x00); // Lower hash (will win)
 
+        let conflicting_node = make_test_node_id(42);
+
         // Register local TX as committed needing shard 1
-        state
-            .committed_tracker
-            .add(local_tx, [ShardGroupId(1)].into_iter().collect());
+        let needs = make_remote_state_needs(
+            &[ShardGroupId(1)],
+            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+        );
+        state.committed_tracker.add(local_tx, needs);
 
         // Receive provision - should queue deferral
-        let provision = make_provision(remote_tx, ShardGroupId(1));
+        let provision =
+            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node.clone()]);
         state.on_provision_received(&provision);
 
         assert_eq!(state.get_pending_deferrals().len(), 1);
@@ -595,7 +735,8 @@ mod tests {
         );
 
         // Receive provision from different shard for same cycle - still no duplicate
-        let provision2 = make_provision(remote_tx, ShardGroupId(2));
+        let provision2 =
+            make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![conflicting_node]);
         state.on_provision_received(&provision2);
 
         assert_eq!(
@@ -611,11 +752,12 @@ mod tests {
         let mut state = LivelockState::new(ShardGroupId(0), topology);
 
         let tx = hash_with_prefix(0xFF);
+        let node = make_test_node_id(1);
 
         // Register TX as committed
-        state
-            .committed_tracker
-            .add(tx, [ShardGroupId(1)].into_iter().collect());
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(tx, needs);
 
         assert!(state.committed_tracker.contains(&tx));
 
@@ -665,11 +807,12 @@ mod tests {
         let mut state = LivelockState::new(ShardGroupId(0), topology);
 
         let tx = hash_with_prefix(0xAA);
+        let node = make_test_node_id(1);
 
         // Register TX as committed
-        state
-            .committed_tracker
-            .add(tx, [ShardGroupId(1)].into_iter().collect());
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(tx, needs);
 
         assert!(state.committed_tracker.contains(&tx));
 
@@ -714,15 +857,18 @@ mod tests {
         let local_tx = hash_with_prefix(0xFF);
         let remote_tx = hash_with_prefix(0x00);
 
+        let node1 = make_test_node_id(1);
+        let node2 = make_test_node_id(2);
+
         // Local TX needs shard 1, but shard 1's TX does NOT need us
-        state
-            .committed_tracker
-            .add(local_tx, [ShardGroupId(1)].into_iter().collect());
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node1])]);
+        state.committed_tracker.add(local_tx, needs);
 
         // Receive provision from shard 2 (not shard 1) for remote_tx
         // This means remote_tx needs our state, but we don't need shard 2's state
         // so there's no cycle with our local_tx
-        let provision = make_provision(remote_tx, ShardGroupId(2));
+        let provision = make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![node2]);
         state.on_provision_received(&provision);
 
         // Should NOT queue a deferral - no cycle exists

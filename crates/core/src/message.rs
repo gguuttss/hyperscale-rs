@@ -1,5 +1,6 @@
 //! Outbound message types for network communication.
 
+use crate::Event;
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
     StateVoteBlockGossip, TraceContext, TransactionGossip, ViewChangeCertificateGossip,
@@ -116,6 +117,45 @@ impl OutboundMessage {
             | OutboundMessage::ViewChangeVote(_)
             | OutboundMessage::ViewChangeCertificate(_)
             | OutboundMessage::StateVoteBlock(_) => {}
+        }
+    }
+
+    /// Convert an outbound message to the corresponding inbound event.
+    ///
+    /// This is used by both the deterministic and parallel simulators
+    /// to handle received messages uniformly.
+    pub fn to_received_event(&self) -> Event {
+        match self {
+            OutboundMessage::BlockHeader(gossip) => Event::BlockHeaderReceived {
+                header: gossip.header.clone(),
+                tx_hashes: gossip.transaction_hashes.clone(),
+                cert_hashes: gossip.certificate_hashes.clone(),
+                deferred: gossip.deferred.clone(),
+                aborted: gossip.aborted.clone(),
+            },
+            OutboundMessage::BlockVote(gossip) => Event::BlockVoteReceived {
+                vote: gossip.vote.clone(),
+            },
+            OutboundMessage::ViewChangeVote(gossip) => Event::ViewChangeVoteReceived {
+                vote: gossip.vote.clone(),
+            },
+            OutboundMessage::ViewChangeCertificate(gossip) => {
+                Event::ViewChangeCertificateReceived {
+                    cert: gossip.certificate.clone(),
+                }
+            }
+            OutboundMessage::StateProvision(gossip) => Event::StateProvisionReceived {
+                provision: gossip.provision.clone(),
+            },
+            OutboundMessage::StateVoteBlock(gossip) => Event::StateVoteReceived {
+                vote: gossip.vote.clone(),
+            },
+            OutboundMessage::StateCertificate(gossip) => Event::StateCertificateReceived {
+                cert: gossip.certificate.clone(),
+            },
+            OutboundMessage::TransactionGossip(gossip) => Event::TransactionGossipReceived {
+                tx: gossip.transaction.clone(),
+            },
         }
     }
 }

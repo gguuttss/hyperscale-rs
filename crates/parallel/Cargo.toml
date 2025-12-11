@@ -1,0 +1,39 @@
+[package]
+name = "hyperscale-parallel"
+version.workspace = true
+edition.workspace = true
+description = "Parallel (non-deterministic) simulation for multi-core performance testing"
+
+[dependencies]
+# Core dependencies
+hyperscale-core.workspace = true
+hyperscale-node.workspace = true
+hyperscale-types.workspace = true
+hyperscale-bft.workspace = true
+hyperscale-engine.workspace = true
+hyperscale-mempool.workspace = true
+
+# Reuse production infrastructure (thread pools)
+hyperscale-production.workspace = true
+
+# Simulation storage and network config
+hyperscale-simulation.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["full", "sync", "time", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["time"] }  # for DelayQueue
+futures = "0.3"
+
+# Parallelism (for crypto thread pool)
+rayon.workspace = true
+
+# Random
+rand.workspace = true
+rand_chacha.workspace = true
+
+# Utilities
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tracing-test = "0.2.5"

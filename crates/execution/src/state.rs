@@ -904,8 +904,19 @@ impl ExecutionState {
             if self.state_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
-            // Buffer for later
-            self.early_votes.entry(tx_hash).or_default().push(vote);
+            // Buffer for later (deduplicate to avoid double-verification in parallel execution)
+            let buffer = self.early_votes.entry(tx_hash).or_default();
+            if !buffer.contains(&vote) {
+                buffer.push(vote);
+            }
+            return vec![];
+        }
+
+        // Check if already pending verification (duplicate vote in parallel execution)
+        if self
+            .pending_vote_verifications
+            .contains_key(&(tx_hash, validator_id))
+        {
             return vec![];
         }
 
@@ -950,10 +961,12 @@ impl ExecutionState {
             .pending_vote_verifications
             .remove(&(tx_hash, validator_id))
         else {
-            tracing::warn!(
+            // Vote verification arrived after transaction was cleaned up (deferred/aborted)
+            // or after quorum was already reached. This is a benign race condition.
+            tracing::debug!(
                 tx_hash = ?tx_hash,
                 validator = validator_id.0,
-                "State vote verification result for unknown pending vote"
+                "State vote verification for cleaned-up transaction"
             );
             return vec![];
         };

@@ -1,27 +1,34 @@
-//! Hyperscale Deterministic Simulator CLI
+//! Hyperscale Simulator CLI
 //!
 //! Run long-running workload simulations with configurable parameters.
+//! Supports both deterministic (single-threaded) and parallel (multi-core) modes.
 //!
 //! # Example
 //!
 //! ```bash
-//! # Run a 60-second simulation with 2 shards
+//! # Run a 60-second deterministic simulation with 2 shards
 //! hyperscale-sim --shards 2 --duration 60
+//!
+//! # Run a parallel simulation (multi-core)
+//! hyperscale-sim --parallel -s 2 -v 4 -d 60 --tps 1000
 //!
 //! # Run with more validators and cross-shard transactions
 //! hyperscale-sim -s 4 -v 5 -d 120 --cross-shard-ratio 0.3
 //! ```
 
 use clap::Parser;
-use hyperscale_simulator::{Simulator, SimulatorConfig, WorkloadConfig};
+use hyperscale_simulator::{
+    ParallelOrchestrator, ParallelOrchestratorConfig, Simulator, SimulatorConfig, WorkloadConfig,
+};
 use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-/// Hyperscale Deterministic Simulator
+/// Hyperscale Simulator
 ///
-/// Runs long-running workload simulations in a fully deterministic environment.
-/// Given the same seed, produces identical results every run.
+/// Runs long-running workload simulations. Supports two modes:
+/// - Deterministic (default): Single-threaded, reproducible results
+/// - Parallel (--parallel): Multi-core, realistic async behavior
 #[derive(Parser, Debug)]
 #[command(name = "hyperscale-sim")]
 #[command(version, about, long_about = None)]
@@ -54,13 +61,21 @@ struct Args {
     #[arg(long)]
     cross_shard_ratio: Option<f64>,
 
-    /// Show livelock analysis at end
+    /// Show livelock analysis at end (deterministic mode only)
     #[arg(long)]
     analyze_livelocks: bool,
 
-    /// Use no-contention account distribution (disjoint pairs)
+    /// Use no-contention account distribution (disjoint pairs for zero conflicts)
     #[arg(long)]
     no_contention: bool,
+
+    /// Run in parallel mode (multi-core, non-deterministic)
+    #[arg(short = 'p', long)]
+    parallel: bool,
+
+    /// Drain duration in seconds (parallel mode only)
+    #[arg(long, default_value = "5")]
+    drain: u64,
 }
 
 fn main() {
@@ -85,6 +100,67 @@ fn main() {
         }
     });
 
+    // Warn if --seed is explicitly set with --parallel (results won't be reproducible)
+    if args.parallel && args.seed != 42 {
+        eprintln!(
+            "Warning: --seed has no effect in parallel mode. \
+             Parallel simulation is non-deterministic due to async scheduling."
+        );
+    }
+
+    if args.parallel {
+        run_parallel(&args, cross_shard_ratio);
+    } else {
+        run_deterministic(&args, cross_shard_ratio);
+    }
+}
+
+fn run_parallel(args: &Args, cross_shard_ratio: f64) {
+    info!(
+        shards = args.shards,
+        validators = args.validators,
+        duration_secs = args.duration,
+        drain_secs = args.drain,
+        seed = args.seed,
+        accounts = args.accounts,
+        tps = args.tps,
+        cross_shard_ratio,
+        "Starting PARALLEL simulation"
+    );
+
+    let mut config =
+        ParallelOrchestratorConfig::new(args.shards as usize, args.validators as usize)
+            .with_target_tps(args.tps as u64)
+            .with_submission_duration(Duration::from_secs(args.duration))
+            .with_drain_duration(Duration::from_secs(args.drain))
+            .with_accounts_per_shard(args.accounts)
+            .with_cross_shard_ratio(cross_shard_ratio)
+            .with_seed(args.seed);
+
+    if args.no_contention {
+        config = config.with_no_contention();
+    }
+
+    // Create tokio runtime and run
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    let report = rt.block_on(async {
+        let orchestrator =
+            ParallelOrchestrator::new(config).expect("Failed to create parallel orchestrator");
+        orchestrator
+            .run()
+            .await
+            .expect("Parallel simulation failed")
+    });
+
+    // Print summary
+    report.print_summary();
+}
+
+fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
     info!(
         shards = args.shards,
         validators = args.validators,
@@ -93,7 +169,7 @@ fn main() {
         accounts = args.accounts,
         tps = args.tps,
         cross_shard_ratio,
-        "Starting simulation"
+        "Starting DETERMINISTIC simulation"
     );
 
     // Calculate batch parameters to achieve target TPS
@@ -132,15 +208,7 @@ fn main() {
     simulator.initialize();
 
     // Run simulation for the specified duration (hard stop, no ramp-down)
-    let report = simulator.run_for(Duration::from_secs(args.duration));
-
-    // Print summary
-    println!("\n=== Simulation Complete ===");
-    println!("Submitted:  {}", report.total_submitted);
-    println!("Completed:  {}", report.total_completed);
-    println!("Rejected:   {}", report.total_rejected);
-    println!("In-flight:  {}", report.in_flight_at_end);
-    println!("TPS:        {:.2}", report.average_tps);
+    let _report = simulator.run_for(Duration::from_secs(args.duration));
 
     // Livelock analysis
     if args.analyze_livelocks {
@@ -150,6 +218,8 @@ fn main() {
 
     // Account usage stats
     let usage = simulator.account_usage_stats();
-    println!("\n=== Account Usage ===");
-    println!("Skew ratio: {:.2}", usage.skew_ratio());
+    if usage.skew_ratio() > 0.0 {
+        println!("\n=== Account Usage ===");
+        println!("Skew ratio: {:.2}", usage.skew_ratio());
+    }
 }
