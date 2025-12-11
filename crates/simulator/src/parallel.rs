@@ -133,7 +133,7 @@ impl From<&SimulatorConfig> for ParallelOrchestratorConfig {
             drain_duration: Duration::from_secs(5),
             cross_shard_ratio: config.workload.cross_shard_ratio,
             seed: config.seed,
-            selection_mode: config.workload.selection_mode.clone(),
+            selection_mode: config.workload.selection_mode,
         }
     }
 }
@@ -172,7 +172,7 @@ impl ParallelOrchestrator {
         // Create workload generator
         let workload = TransferWorkload::new(NetworkDefinition::simulator())
             .with_cross_shard_ratio(config.cross_shard_ratio)
-            .with_selection_mode(config.selection_mode.clone());
+            .with_selection_mode(config.selection_mode);
 
         let rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(1));
 

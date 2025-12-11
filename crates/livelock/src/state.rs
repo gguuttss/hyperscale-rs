@@ -148,10 +148,7 @@ impl LivelockState {
         for node_id in &tx.declared_reads {
             let shard = self.topology.shard_for_node_id(node_id);
             if shard != local_shard {
-                nodes_by_shard
-                    .entry(shard)
-                    .or_default()
-                    .insert(node_id.clone());
+                nodes_by_shard.entry(shard).or_default().insert(*node_id);
             }
         }
 
@@ -159,10 +156,7 @@ impl LivelockState {
         for node_id in &tx.declared_writes {
             let shard = self.topology.shard_for_node_id(node_id);
             if shard != local_shard {
-                nodes_by_shard
-                    .entry(shard)
-                    .or_default()
-                    .insert(node_id.clone());
+                nodes_by_shard.entry(shard).or_default().insert(*node_id);
             }
         }
 
@@ -207,11 +201,8 @@ impl LivelockState {
         }
 
         // Extract the nodes that the remote TX is providing (these are the nodes it writes/reads)
-        let remote_tx_nodes: HashSet<NodeId> = provision
-            .entries
-            .iter()
-            .map(|e| e.node_id.clone())
-            .collect();
+        let remote_tx_nodes: HashSet<NodeId> =
+            provision.entries.iter().map(|e| e.node_id).collect();
 
         // Cycle detection: Check if any of our local TXs have overlapping state with the remote TX
         self.check_for_cycle(remote_tx_hash, source_shard, &remote_tx_nodes);
@@ -578,7 +569,7 @@ mod tests {
         // Register local TX as committed needing shard 1's state for the conflicting node
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
-            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+            vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
@@ -614,7 +605,7 @@ mod tests {
         // Register local TX as committed needing shard 1 for the conflicting node
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
-            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+            vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
@@ -714,13 +705,13 @@ mod tests {
         // Register local TX as committed needing shard 1
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
-            vec![(ShardGroupId(1), vec![conflicting_node.clone()])],
+            vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
         // Receive provision - should queue deferral
         let provision =
-            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node.clone()]);
+            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
         state.on_provision_received(&provision);
 
         assert_eq!(state.get_pending_deferrals().len(), 1);

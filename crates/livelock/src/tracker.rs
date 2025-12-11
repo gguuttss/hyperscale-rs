@@ -215,8 +215,8 @@ mod tests {
         let needs1 = RemoteStateNeeds {
             shards: [shard0, shard1].into_iter().collect(),
             nodes_by_shard: [
-                (shard0, [node_a.clone()].into_iter().collect()),
-                (shard1, [node_b.clone()].into_iter().collect()),
+                (shard0, [node_a].into_iter().collect()),
+                (shard1, [node_b].into_iter().collect()),
             ]
             .into_iter()
             .collect(),
@@ -227,8 +227,8 @@ mod tests {
         let needs2 = RemoteStateNeeds {
             shards: [shard1, shard2].into_iter().collect(),
             nodes_by_shard: [
-                (shard1, [node_b.clone()].into_iter().collect()),
-                (shard2, [node_c.clone()].into_iter().collect()),
+                (shard1, [node_b].into_iter().collect()),
+                (shard2, [node_c].into_iter().collect()),
             ]
             .into_iter()
             .collect(),
@@ -264,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             tracker.nodes_needed_from_shard(&tx1, shard1),
-            Some(&[node_b.clone()].into_iter().collect())
+            Some(&[node_b].into_iter().collect())
         );
         assert_eq!(
             tracker.nodes_needed_from_shard(&tx2, shard1),
