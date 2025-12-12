@@ -221,7 +221,7 @@ impl SimNode {
             .pending_timers
             .iter()
             .filter(|(_, fire_time)| **fire_time <= new_time)
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id.clone())
             .collect();
 
         for timer_id in due_timers {
@@ -231,6 +231,9 @@ impl SimNode {
                 TimerId::ViewChange => Event::ViewChangeTimer,
                 TimerId::Cleanup => Event::CleanupTimer,
                 TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
+                TimerId::TransactionFetch { block_hash } => {
+                    Event::TransactionFetchTimer { block_hash }
+                }
             };
             self.internal_queue.push_back(event);
         }

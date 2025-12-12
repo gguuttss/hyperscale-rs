@@ -36,7 +36,7 @@ pub use message::OutboundMessage;
 pub use traits::{StateMachine, SubStateMachine};
 
 /// Type alias for timer identification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerId {
     /// Block proposal timer
     Proposal,
@@ -46,4 +46,10 @@ pub enum TimerId {
     Cleanup,
     /// Global consensus timer (epoch management)
     GlobalConsensus,
+    /// Transaction fetch timer for a specific block.
+    /// Fires after a timeout if pending block is still missing transactions.
+    TransactionFetch {
+        /// The block hash that needs transactions fetched.
+        block_hash: hyperscale_types::Hash,
+    },
 }

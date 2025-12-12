@@ -87,6 +87,22 @@ pub struct InboundSyncRequest {
     pub channel_id: u64,
 }
 
+/// An inbound transaction fetch request from a peer.
+///
+/// The runner receives these, looks up transactions from mempool,
+/// and sends the response via `Libp2pAdapter::send_transaction_response()`.
+#[derive(Debug)]
+pub struct InboundTransactionRequest {
+    /// The requesting peer.
+    pub peer: Libp2pPeerId,
+    /// The block hash the transactions are for.
+    pub block_hash: hyperscale_types::Hash,
+    /// The transaction hashes being requested.
+    pub tx_hashes: Vec<hyperscale_types::Hash>,
+    /// Opaque response channel ID (used to send the response).
+    pub channel_id: u64,
+}
+
 /// Commands sent to the swarm task.
 enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
@@ -117,6 +133,17 @@ enum SwarmCommand {
 
     /// Send a response to a block request (by channel ID).
     SendBlockResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Request transactions from a peer (for pending block completion).
+    RequestTransactions {
+        peer: Libp2pPeerId,
+        block_hash: hyperscale_types::Hash,
+        tx_hashes: Vec<hyperscale_types::Hash>,
+        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
+    },
+
+    /// Send a response to a transaction request (by channel ID).
+    SendTransactionResponse { channel_id: u64, response: Vec<u8> },
 }
 
 /// Network errors.
@@ -282,6 +309,10 @@ pub struct Libp2pAdapter {
     /// Channel for inbound sync requests (sent to runner for processing).
     #[allow(dead_code)]
     sync_request_tx: mpsc::Sender<InboundSyncRequest>,
+
+    /// Channel for inbound transaction fetch requests (sent to runner for processing).
+    #[allow(dead_code)]
+    tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
 }
 
 impl Libp2pAdapter {
@@ -299,8 +330,9 @@ impl Libp2pAdapter {
     ///
     /// # Returns
     ///
-    /// A tuple of (adapter, sync_request_rx) where sync_request_rx receives
-    /// inbound sync block requests that need to be handled by the runner.
+    /// A tuple of (adapter, sync_request_rx, tx_request_rx) where:
+    /// - sync_request_rx receives inbound sync block requests
+    /// - tx_request_rx receives inbound transaction fetch requests (higher priority)
     pub async fn new(
         config: Libp2pConfig,
         keypair: identity::Keypair,
@@ -309,7 +341,14 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         transaction_tx: mpsc::Sender<Event>,
         tx_validator: Arc<TransactionValidation>,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<InboundSyncRequest>), NetworkError> {
+    ) -> Result<
+        (
+            Arc<Self>,
+            mpsc::Receiver<InboundSyncRequest>,
+            mpsc::Receiver<InboundTransactionRequest>,
+        ),
+        NetworkError,
+    > {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
         info!(
@@ -393,6 +432,7 @@ impl Libp2pAdapter {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(100); // Buffer for inbound sync requests
+        let (tx_request_tx, tx_request_rx) = mpsc::channel(100); // Buffer for inbound transaction requests
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -406,6 +446,7 @@ impl Libp2pAdapter {
             request_timeout: config.request_timeout,
             shutdown_tx: Some(shutdown_tx),
             sync_request_tx: sync_request_tx.clone(),
+            tx_request_tx: tx_request_tx.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -419,11 +460,12 @@ impl Libp2pAdapter {
             peer_validators,
             shutdown_rx,
             sync_request_tx,
+            tx_request_tx,
             rate_limit_config,
             tx_validator,
         ));
 
-        Ok((adapter, sync_request_rx))
+        Ok((adapter, sync_request_rx, tx_request_rx))
     }
 
     /// Register a validator's peer ID mapping.
@@ -601,6 +643,50 @@ impl Libp2pAdapter {
             .map_err(|_| NetworkError::NetworkShutdown)
     }
 
+    /// Request transactions from a peer for pending block completion.
+    ///
+    /// Returns the raw response bytes. The caller is responsible for decoding.
+    pub async fn request_transactions(
+        &self,
+        peer: Libp2pPeerId,
+        block_hash: hyperscale_types::Hash,
+        tx_hashes: Vec<hyperscale_types::Hash>,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.command_tx
+            .send(SwarmCommand::RequestTransactions {
+                peer,
+                block_hash,
+                tx_hashes,
+                response_tx: tx,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)?;
+
+        // Wait for response with timeout
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_) => Err(NetworkError::Timeout),
+        }
+    }
+
+    /// Send a transaction response for an inbound request.
+    ///
+    /// The `channel_id` comes from the inbound request.
+    pub fn send_transaction_response(
+        &self,
+        channel_id: u64,
+        response: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(SwarmCommand::SendTransactionResponse {
+                channel_id,
+                response,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)
+    }
+
     /// Background event loop that processes swarm events and routes messages.
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
@@ -611,6 +697,7 @@ impl Libp2pAdapter {
         peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
+        tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
         rate_limit_config: RateLimitConfig,
         tx_validator: Arc<TransactionValidation>,
     ) {
@@ -651,6 +738,7 @@ impl Libp2pAdapter {
                         &mut pending_response_channels,
                         &mut next_channel_id,
                         &sync_request_tx,
+                        &tx_request_tx,
                         &mut rate_limiter,
                         &tx_validator,
                     ).await;
@@ -730,6 +818,42 @@ impl Libp2pAdapter {
                     warn!(channel_id, "Unknown channel ID for block response");
                 }
             }
+            SwarmCommand::RequestTransactions {
+                peer,
+                block_hash,
+                tx_hashes,
+                response_tx,
+            } => {
+                // Encode transaction request using SBOR
+                use hyperscale_messages::request::GetTransactionsRequest;
+                let request = GetTransactionsRequest::new(block_hash, tx_hashes);
+                let data = sbor::basic_encode(&request).unwrap_or_default();
+                let req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, data);
+                pending_requests.insert(req_id, response_tx);
+                debug!(
+                    "Sent transaction request to {:?} for block {:?}",
+                    peer, block_hash
+                );
+            }
+            SwarmCommand::SendTransactionResponse {
+                channel_id,
+                response,
+            } => {
+                if let Some(channel) = pending_response_channels.remove(&channel_id) {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, response)
+                    {
+                        warn!("Failed to send transaction response: {:?}", e);
+                    }
+                } else {
+                    warn!(channel_id, "Unknown channel ID for transaction response");
+                }
+            }
         }
     }
 
@@ -747,6 +871,7 @@ impl Libp2pAdapter {
         pending_response_channels: &mut HashMap<u64, ResponseChannel<Vec<u8>>>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::Sender<InboundSyncRequest>,
+        tx_request_tx: &mpsc::Sender<InboundTransactionRequest>,
         rate_limiter: &mut SyncRateLimiter,
         tx_validator: &Arc<TransactionValidation>,
     ) {
@@ -915,7 +1040,7 @@ impl Libp2pAdapter {
                 }
             }
 
-            // Handle inbound sync requests
+            // Handle inbound requests (sync blocks or transaction fetch)
             SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
                 request_response::Event::Message {
                     peer,
@@ -936,15 +1061,18 @@ impl Libp2pAdapter {
                     warn!(
                         peer = %peer,
                         is_validator = is_validator,
-                        "Rate limited sync request from peer"
+                        "Rate limited request from peer"
                     );
                     // Drop the request by not processing it
                     // The channel will be dropped, which signals failure to the requester
                     return;
                 }
 
-                // Parse the request (height as little-endian u64)
-                if request.len() >= 8 {
+                // Determine request type:
+                // - Block sync request: exactly 8 bytes (height as little-endian u64)
+                // - Transaction request: > 8 bytes, SBOR encoded GetTransactionsRequest
+                if request.len() == 8 {
+                    // Block sync request
                     let height = u64::from_le_bytes(request[..8].try_into().unwrap());
 
                     // Allocate a channel ID and store the response channel
@@ -975,8 +1103,49 @@ impl Libp2pAdapter {
                         // Remove the channel since we can't process this request
                         pending_response_channels.remove(&channel_id);
                     }
+                } else if request.len() > 8 {
+                    // Transaction fetch request - decode and send to runner
+                    use hyperscale_messages::request::GetTransactionsRequest;
+
+                    match sbor::basic_decode::<GetTransactionsRequest>(&request) {
+                        Ok(tx_request) => {
+                            // Allocate a channel ID and store the response channel
+                            let channel_id = *next_channel_id;
+                            *next_channel_id = next_channel_id.wrapping_add(1);
+                            pending_response_channels.insert(channel_id, channel);
+
+                            debug!(
+                                peer = %peer,
+                                block_hash = ?tx_request.block_hash,
+                                tx_count = tx_request.tx_hashes.len(),
+                                channel_id = channel_id,
+                                is_validator = is_validator,
+                                "Received transaction fetch request"
+                            );
+
+                            // Send to runner for processing
+                            let inbound_request = InboundTransactionRequest {
+                                peer,
+                                block_hash: tx_request.block_hash,
+                                tx_hashes: tx_request.tx_hashes,
+                                channel_id,
+                            };
+
+                            if tx_request_tx.send(inbound_request).await.is_err() {
+                                warn!(
+                                    channel_id,
+                                    "Failed to send transaction request to runner (channel full or closed)"
+                                );
+                                // Remove the channel since we can't process this request
+                                pending_response_channels.remove(&channel_id);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %peer, error = ?e, "Failed to decode transaction request");
+                        }
+                    }
                 } else {
-                    warn!(peer = %peer, len = request.len(), "Invalid sync request (too short)");
+                    warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
                 }
             }
 

@@ -1,7 +1,8 @@
 //! Production runner implementation.
 
 use crate::network::{
-    compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
+    compute_peer_id_for_validator, InboundSyncRequest, InboundTransactionRequest, Libp2pAdapter,
+    Libp2pConfig, NetworkError,
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::storage::RocksDbStorage;
@@ -343,7 +344,7 @@ impl ProductionRunnerBuilder {
 
         // Create network adapter with transaction validation
         // Pass both channels - consensus for BFT messages, transaction for mempool
-        let (network, sync_request_rx) = Libp2pAdapter::new(
+        let (network, sync_request_rx, tx_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
@@ -394,6 +395,7 @@ impl ProductionRunnerBuilder {
             mempool_snapshot: self.mempool_snapshot,
             genesis_config: self.genesis_config,
             sync_request_rx,
+            tx_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
         })
@@ -455,6 +457,8 @@ pub struct ProductionRunner {
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
     /// Inbound sync request channel (from network adapter).
     sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
+    /// Inbound transaction fetch request channel (from network adapter).
+    tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
@@ -700,6 +704,18 @@ impl ProductionRunner {
                                 None
                             };
 
+                            // Check for TransactionFetchNeeded - handle specially
+                            let tx_fetch_info = if let Event::TransactionFetchNeeded {
+                                block_hash,
+                                proposer,
+                                missing_tx_hashes,
+                            } = &event
+                            {
+                                Some((*block_hash, *proposer, missing_tx_hashes.clone()))
+                            } else {
+                                None
+                            };
+
                             // Process event synchronously (fast)
                             let actions = {
                                 let sm_span = span!(Level::DEBUG, "state_machine.handle");
@@ -783,6 +799,11 @@ impl ProductionRunner {
                             if let Some((target_height, target_hash)) = sync_target {
                                 self.sync_manager.start_sync(target_height, target_hash);
                             }
+
+                            // If this was a transaction fetch request, fetch from proposer
+                            if let Some((block_hash, proposer, missing_tx_hashes)) = tx_fetch_info {
+                                self.handle_transaction_fetch_needed(block_hash, proposer, missing_tx_hashes).await;
+                            }
                         }
                         None => {
                             // Channel closed, exit loop
@@ -827,6 +848,24 @@ impl ProductionRunner {
                     }
 
                     // Reset batch counter after processing transactions
+                    consensus_batch_count = 0;
+                }
+
+                // HIGH PRIORITY: Handle inbound transaction fetch requests from peers
+                // These are needed for active consensus, so process before sync
+                Some(request) = self.tx_request_rx.recv() => {
+                    let tx_span = span!(
+                        Level::DEBUG,
+                        "handle_tx_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        tx_count = request.tx_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _tx_guard = tx_span.enter();
+
+                    self.handle_inbound_transaction_request(request);
+                    // Reset batch counter - we yielded, now back to prioritizing consensus
                     consensus_batch_count = 0;
                 }
 
@@ -1804,6 +1843,141 @@ impl ProductionRunner {
                 channel_id = channel_id,
                 error = ?e,
                 "Failed to send block response"
+            );
+        }
+    }
+
+    /// Handle a TransactionFetchNeeded event - fetch missing transactions from the proposer.
+    ///
+    /// Makes an outbound request to the proposer to get the missing transactions,
+    /// then delivers them to the state machine via TransactionFetchReceived.
+    async fn handle_transaction_fetch_needed(
+        &self,
+        block_hash: Hash,
+        proposer: ValidatorId,
+        missing_tx_hashes: Vec<Hash>,
+    ) {
+        use hyperscale_messages::response::GetTransactionsResponse;
+
+        tracing::info!(
+            block_hash = ?block_hash,
+            proposer = ?proposer,
+            missing_count = missing_tx_hashes.len(),
+            "Fetching missing transactions from proposer"
+        );
+
+        // Get the peer ID for the proposer
+        let Some(peer_id) = self.network.peer_for_validator(proposer).await else {
+            tracing::warn!(
+                proposer = ?proposer,
+                "Cannot fetch transactions: proposer peer ID not known"
+            );
+            return;
+        };
+
+        // Make the request to the proposer
+        match self
+            .network
+            .request_transactions(peer_id, block_hash, missing_tx_hashes.clone())
+            .await
+        {
+            Ok(response_bytes) => {
+                // Decode the response
+                match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
+                    Ok(response) => {
+                        let tx_count = response.count();
+                        tracing::info!(
+                            block_hash = ?block_hash,
+                            received = tx_count,
+                            requested = missing_tx_hashes.len(),
+                            "Received transactions from proposer"
+                        );
+
+                        if tx_count > 0 {
+                            // Send to state machine
+                            let event = Event::TransactionFetchReceived {
+                                block_hash,
+                                transactions: response.into_transactions(),
+                            };
+
+                            if let Err(e) = self.consensus_tx.send(event).await {
+                                tracing::error!(error = ?e, "Failed to send TransactionFetchReceived event");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            block_hash = ?block_hash,
+                            error = ?e,
+                            "Failed to decode transaction fetch response"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    block_hash = ?block_hash,
+                    proposer = ?proposer,
+                    error = ?e,
+                    "Failed to fetch transactions from proposer"
+                );
+            }
+        }
+    }
+
+    /// Handle an inbound transaction fetch request from a peer.
+    ///
+    /// Looks up requested transactions from mempool and sends them back.
+    fn handle_inbound_transaction_request(&self, request: InboundTransactionRequest) {
+        use hyperscale_messages::response::GetTransactionsResponse;
+
+        let channel_id = request.channel_id;
+
+        tracing::debug!(
+            peer = %request.peer,
+            block_hash = ?request.block_hash,
+            tx_count = request.tx_hashes.len(),
+            channel_id = channel_id,
+            "Handling inbound transaction request"
+        );
+
+        // Look up transactions from mempool
+        let mempool = self.state.mempool();
+        let mut found_transactions = Vec::new();
+
+        for tx_hash in &request.tx_hashes {
+            if let Some(tx) = mempool.get_transaction(tx_hash) {
+                found_transactions.push(tx);
+            }
+        }
+
+        tracing::debug!(
+            block_hash = ?request.block_hash,
+            requested = request.tx_hashes.len(),
+            found = found_transactions.len(),
+            "Responding to transaction fetch request"
+        );
+
+        // Encode the response
+        let response = GetTransactionsResponse::new(found_transactions);
+        let response_bytes = match sbor::basic_encode(&response) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to encode transaction response");
+                sbor::basic_encode(&GetTransactionsResponse::empty()).unwrap_or_default()
+            }
+        };
+
+        // Send response via network adapter
+        if let Err(e) = self
+            .network
+            .send_transaction_response(channel_id, response_bytes)
+        {
+            tracing::warn!(
+                block_hash = ?request.block_hash,
+                channel_id = channel_id,
+                error = ?e,
+                "Failed to send transaction response"
             );
         }
     }

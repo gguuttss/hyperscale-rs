@@ -605,13 +605,8 @@ impl MempoolState {
         self.pool.contains_key(hash)
     }
 
-    /// Get a transaction by hash.
-    pub fn get_transaction(&self, hash: &Hash) -> Option<&RoutableTransaction> {
-        self.pool.get(hash).map(|e| e.tx.as_ref())
-    }
-
     /// Get a transaction Arc by hash.
-    pub fn get_transaction_arc(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get_transaction(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
         self.pool.get(hash).map(|e| Arc::clone(&e.tx))
     }
 

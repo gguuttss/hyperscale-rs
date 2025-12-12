@@ -705,6 +705,46 @@ impl StateMachine for NodeStateMachine {
             Event::ShardMergeComplete { merged_shard } => {
                 tracing::info!(?merged_shard, "ShardMergeComplete - not yet implemented");
             }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Transaction Fetch Protocol
+            // ═══════════════════════════════════════════════════════════════════════
+            Event::TransactionFetchTimer { block_hash } => {
+                return self.bft.on_transaction_fetch_timer(*block_hash);
+            }
+
+            Event::TransactionFetchNeeded {
+                block_hash,
+                proposer,
+                missing_tx_hashes,
+            } => {
+                // The runner will handle this by making a request to the proposer or peers.
+                // Return an action that signals the runner to fetch transactions.
+                tracing::info!(
+                    block_hash = ?block_hash,
+                    proposer = ?proposer,
+                    missing_count = missing_tx_hashes.len(),
+                    "Transaction fetch needed - runner should request from peer"
+                );
+                // Return the event as-is in an action for the runner to handle.
+                // The runner will make the network request and deliver TransactionFetchReceived.
+                return vec![Action::EnqueueInternal {
+                    event: Event::TransactionFetchNeeded {
+                        block_hash: *block_hash,
+                        proposer: *proposer,
+                        missing_tx_hashes: missing_tx_hashes.clone(),
+                    },
+                }];
+            }
+
+            Event::TransactionFetchReceived {
+                block_hash,
+                transactions,
+            } => {
+                return self
+                    .bft
+                    .on_transaction_fetch_received(*block_hash, transactions.clone());
+            }
         }
 
         // Event not handled by any sub-machine

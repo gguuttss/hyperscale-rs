@@ -478,6 +478,42 @@ pub enum Event {
         /// The height we synced to.
         height: u64,
     },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Transaction Fetch Protocol (priority: Internal/Network)
+    // Used when block header arrives but transactions are missing from mempool
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Timer fired for fetching missing transactions (priority: Timer).
+    ///
+    /// If a pending block is still incomplete after the timeout, we request
+    /// the missing transactions from the proposer or a peer.
+    TransactionFetchTimer {
+        /// Hash of the block that needs transactions.
+        block_hash: Hash,
+    },
+
+    /// Request to fetch missing transactions for a pending block (priority: Internal).
+    ///
+    /// Triggered when TransactionFetchTimer fires and block is still incomplete.
+    /// The runner handles peer selection and makes the request.
+    TransactionFetchNeeded {
+        /// Hash of the block that needs these transactions.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing transactions.
+        missing_tx_hashes: Vec<Hash>,
+    },
+
+    /// Received transactions from a fetch request (priority: Network).
+    ///
+    /// Delivered by the runner after fetching from a peer.
+    TransactionFetchReceived {
+        /// Hash of the block these transactions are for.
+        block_hash: Hash,
+        /// The fetched transactions.
+        transactions: Vec<Arc<RoutableTransaction>>,
+    },
 }
 
 impl Event {
@@ -548,6 +584,11 @@ impl Event {
             | Event::SyncComplete { .. } => EventPriority::Internal,
 
             Event::SyncBlockReceived { .. } => EventPriority::Network,
+
+            // Transaction fetch events
+            Event::TransactionFetchTimer { .. } => EventPriority::Timer,
+            Event::TransactionFetchNeeded { .. } => EventPriority::Internal,
+            Event::TransactionFetchReceived { .. } => EventPriority::Network,
         }
     }
 
@@ -641,6 +682,11 @@ impl Event {
             Event::SyncBlockReceived { .. } => "SyncBlockReceived",
             Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             Event::SyncComplete { .. } => "SyncComplete",
+
+            // Transaction Fetch Protocol
+            Event::TransactionFetchTimer { .. } => "TransactionFetchTimer",
+            Event::TransactionFetchNeeded { .. } => "TransactionFetchNeeded",
+            Event::TransactionFetchReceived { .. } => "TransactionFetchReceived",
         }
     }
 }

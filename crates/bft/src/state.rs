@@ -918,7 +918,23 @@ impl BftState {
             return actions;
         }
 
-        // Block not complete yet - wait for missing transactions
+        // Block not complete yet - start a timer to fetch missing transactions if needed
+        // Check if we're only missing transactions (not certificates)
+        if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            if pending.missing_transaction_count() > 0 {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_tx_count = pending.missing_transaction_count(),
+                    "Starting transaction fetch timer for incomplete block"
+                );
+                actions.push(Action::SetTimer {
+                    id: TimerId::TransactionFetch { block_hash },
+                    duration: self.config.transaction_fetch_timeout,
+                });
+            }
+        }
+
         actions
     }
 
@@ -2064,6 +2080,120 @@ impl BftState {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
         }]
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Transaction Fetch Protocol
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Handle transaction fetch timer expiry.
+    ///
+    /// If the pending block is still incomplete, emit TransactionFetchNeeded
+    /// so the runner can request the missing transactions from a peer.
+    pub fn on_transaction_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
+        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+            // Block no longer pending (completed or removed)
+            return vec![];
+        };
+
+        if pending.is_complete() {
+            // Block is now complete, no fetch needed
+            return vec![];
+        }
+
+        let missing = pending.missing_transactions();
+        if missing.is_empty() {
+            // Only missing certificates, not transactions
+            return vec![];
+        }
+
+        let proposer = pending.header().proposer;
+
+        info!(
+            validator = ?self.validator_id(),
+            block_hash = ?block_hash,
+            proposer = ?proposer,
+            missing_count = missing.len(),
+            "Transaction fetch timer fired - requesting missing transactions"
+        );
+
+        vec![Action::EnqueueInternal {
+            event: Event::TransactionFetchNeeded {
+                block_hash,
+                proposer,
+                missing_tx_hashes: missing,
+            },
+        }]
+    }
+
+    /// Handle transactions received from a fetch request.
+    ///
+    /// Adds the fetched transactions to the pending block and triggers
+    /// voting if the block is now complete.
+    pub fn on_transaction_fetch_received(
+        &mut self,
+        block_hash: Hash,
+        transactions: Vec<Arc<RoutableTransaction>>,
+    ) -> Vec<Action> {
+        let validator_id = self.validator_id();
+
+        // First phase: add transactions and check state
+        let (added, still_missing, is_complete, needs_construct) = {
+            let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
+                debug!(
+                    block_hash = ?block_hash,
+                    "Received fetched transactions for unknown/completed block"
+                );
+                return vec![];
+            };
+
+            let mut added = 0;
+            for tx in transactions {
+                if pending.add_transaction_arc(tx) {
+                    added += 1;
+                }
+            }
+
+            let still_missing = pending.missing_transaction_count();
+            let is_complete = pending.is_complete();
+            let needs_construct = is_complete && pending.block().is_none();
+
+            (added, still_missing, is_complete, needs_construct)
+        };
+
+        debug!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            added = added,
+            still_missing = still_missing,
+            "Added fetched transactions to pending block"
+        );
+
+        // Check if block is now complete
+        if !is_complete {
+            // Still missing transactions or certificates
+            // Could restart timer here for retry, but for now we'll let it timeout
+            return vec![];
+        }
+
+        // Second phase: construct block if needed
+        if needs_construct {
+            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                if let Err(e) = pending.construct_block() {
+                    warn!("Failed to construct block after tx fetch: {}", e);
+                    return vec![];
+                }
+            }
+        }
+
+        info!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            "Pending block completed after transaction fetch"
+        );
+
+        // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+        self.trigger_qc_verification_or_vote(block_hash)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

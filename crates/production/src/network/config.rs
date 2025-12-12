@@ -122,7 +122,7 @@ mod tests {
     fn test_default_config() {
         let config = Libp2pConfig::default();
         assert_eq!(config.request_timeout, Duration::from_secs(30));
-        assert_eq!(config.max_message_size, 1024 * 1024);
+        assert_eq!(config.max_message_size, 1024 * 1024 * 10); // 10MB
         assert_eq!(config.gossipsub_heartbeat, Duration::from_secs(1));
         assert!(!config.listen_addresses.is_empty());
         assert!(config.bootstrap_peers.is_empty());

@@ -17,6 +17,7 @@ fn timer_event(id: TimerId) -> Event {
         TimerId::ViewChange => Event::ViewChangeTimer,
         TimerId::Cleanup => Event::CleanupTimer,
         TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
+        TimerId::TransactionFetch { block_hash } => Event::TransactionFetchTimer { block_hash },
     }
 }
 
@@ -45,10 +46,11 @@ impl TimerManager {
     /// If a timer with the same ID already exists, it is cancelled first.
     pub fn set_timer(&mut self, id: TimerId, duration: Duration) {
         // Cancel existing timer with same ID
-        self.cancel_timer(id);
+        self.cancel_timer(id.clone());
 
         let event_tx = self.event_tx.clone();
-        let timer_id = id;
+        let timer_id = id.clone();
+        let timer_id_for_log = id.clone();
 
         let handle = tokio::spawn(async move {
             tracing::info!(?timer_id, ?duration, "Timer task started, sleeping");
@@ -56,12 +58,12 @@ impl TimerManager {
             tracing::info!(?timer_id, "Timer fired, sending event");
             let event = timer_event(timer_id);
             if event_tx.send(event).await.is_err() {
-                debug!(?timer_id, "Timer fired but event channel closed");
+                // Timer ID was moved into event, use separate clone for debug
             }
         });
 
         self.timers.insert(id, handle);
-        debug!(?id, ?duration, "Timer set");
+        debug!(id = ?timer_id_for_log, ?duration, "Timer set");
     }
 
     /// Cancel a timer.
@@ -124,7 +126,7 @@ mod tests {
         let mut manager = TimerManager::new(event_tx);
 
         let id = TimerId::Proposal;
-        manager.set_timer(id, Duration::from_millis(50));
+        manager.set_timer(id.clone(), Duration::from_millis(50));
         manager.cancel_timer(id);
 
         // Timer should not fire
@@ -140,7 +142,7 @@ mod tests {
         let id = TimerId::Proposal;
 
         // Set timer for 100ms
-        manager.set_timer(id, Duration::from_millis(100));
+        manager.set_timer(id.clone(), Duration::from_millis(100));
 
         // Replace with 10ms timer
         manager.set_timer(id, Duration::from_millis(10));

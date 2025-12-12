@@ -575,9 +575,9 @@ impl SimulationRunner {
 
             Action::SetTimer { id, duration } => {
                 let fire_time = self.now + duration;
-                let event = self.timer_to_event(id);
+                let event = self.timer_to_event(id.clone());
                 let key = self.schedule_event(from, fire_time, event);
-                self.timers.insert((from, id), key);
+                self.timers.insert((from, id.clone()), key);
                 self.stats.timers_set += 1;
             }
 
@@ -589,19 +589,46 @@ impl SimulationRunner {
             }
 
             Action::EnqueueInternal { event } => {
-                // Special handling for SyncNeeded: the runner fetches blocks directly
+                // Special handling for events that require runner I/O
+
+                // SyncNeeded: the runner fetches blocks directly
                 let sync_target = if let Event::SyncNeeded { target_height, .. } = &event {
                     Some(*target_height)
                 } else {
                     None
                 };
 
+                // TransactionFetchNeeded: the runner fetches transactions from peers
+                let tx_fetch_info = if let Event::TransactionFetchNeeded {
+                    block_hash,
+                    proposer,
+                    missing_tx_hashes,
+                } = &event
+                {
+                    Some((*block_hash, *proposer, missing_tx_hashes.clone()))
+                } else {
+                    None
+                };
+
                 // Schedule the event so the state machine knows about it
-                self.schedule_event(from, self.now, event);
+                // (Skip TransactionFetchNeeded as we handle it directly)
+                if tx_fetch_info.is_none() {
+                    self.schedule_event(from, self.now, event);
+                }
 
                 // If it was a sync request, fetch the blocks (runner owns sync I/O)
                 if let Some(target_height) = sync_target {
                     self.handle_sync_needed(from, target_height);
+                }
+
+                // If it was a transaction fetch request, fetch from proposer's mempool
+                if let Some((block_hash, proposer, missing_tx_hashes)) = tx_fetch_info {
+                    self.handle_transaction_fetch_needed(
+                        from,
+                        block_hash,
+                        proposer,
+                        missing_tx_hashes,
+                    );
                 }
             }
 
@@ -1181,6 +1208,68 @@ impl SimulationRunner {
         None
     }
 
+    /// Handle transaction fetch needed: fetch missing transactions from proposer's mempool.
+    ///
+    /// In production, this would make a network request to the proposer or peers.
+    /// In simulation, we look up transactions from the proposer's mempool directly.
+    pub fn handle_transaction_fetch_needed(
+        &mut self,
+        node: NodeIndex,
+        block_hash: hyperscale_types::Hash,
+        proposer: ValidatorId,
+        missing_tx_hashes: Vec<hyperscale_types::Hash>,
+    ) {
+        // Find the proposer's node index
+        let proposer_node = proposer.0 as NodeIndex;
+
+        if proposer_node as usize >= self.nodes.len() {
+            warn!(
+                node = node,
+                proposer = ?proposer,
+                "Transaction fetch: proposer node not found"
+            );
+            return;
+        }
+
+        // Look up transactions from proposer's mempool
+        let mut found_transactions = Vec::new();
+        {
+            let proposer_state = &self.nodes[proposer_node as usize];
+            let mempool = proposer_state.mempool();
+
+            for tx_hash in &missing_tx_hashes {
+                if let Some(tx) = mempool.get_transaction(tx_hash) {
+                    found_transactions.push(tx);
+                }
+            }
+        }
+
+        if found_transactions.is_empty() {
+            debug!(
+                node = node,
+                block_hash = ?block_hash,
+                missing_count = missing_tx_hashes.len(),
+                "Transaction fetch: no transactions found in proposer's mempool"
+            );
+            return;
+        }
+
+        debug!(
+            node = node,
+            block_hash = ?block_hash,
+            found_count = found_transactions.len(),
+            missing_count = missing_tx_hashes.len(),
+            "Transaction fetch: delivering fetched transactions"
+        );
+
+        // Deliver the transactions to the requesting node
+        let event = Event::TransactionFetchReceived {
+            block_hash,
+            transactions: found_transactions,
+        };
+        self.schedule_event(node, self.now, event);
+    }
+
     /// Schedule an event.
     fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: Event) -> EventKey {
         self.sequence += 1;
@@ -1252,6 +1341,7 @@ impl SimulationRunner {
             TimerId::ViewChange => Event::ViewChangeTimer,
             TimerId::Cleanup => Event::CleanupTimer,
             TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
+            TimerId::TransactionFetch { block_hash } => Event::TransactionFetchTimer { block_hash },
         }
     }
 

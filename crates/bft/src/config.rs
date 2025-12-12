@@ -22,6 +22,11 @@ pub struct BftConfig {
 
     /// Maximum acceptable rush for proposer timestamp ahead of our clock (ms).
     pub max_timestamp_rush_ms: u64,
+
+    /// Timeout before fetching missing transactions from peers.
+    /// If a pending block is still incomplete after this duration, request
+    /// the missing transactions directly from the proposer or a peer.
+    pub transaction_fetch_timeout: Duration,
 }
 
 impl Default for BftConfig {
@@ -33,6 +38,7 @@ impl Default for BftConfig {
             max_certificates_per_block: 4096,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
+            transaction_fetch_timeout: Duration::from_millis(50),
         }
     }
 }

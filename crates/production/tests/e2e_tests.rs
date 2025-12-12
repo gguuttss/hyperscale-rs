@@ -137,7 +137,7 @@ async fn test_network_adapter_starts() {
     .await;
 
     assert!(result.is_ok(), "Adapter creation should not timeout");
-    let (adapter, _sync_rx) = result.unwrap().unwrap();
+    let (adapter, _sync_rx, _tx_rx) = result.unwrap().unwrap();
 
     // Verify adapter state
     assert_eq!(adapter.local_validator_id(), validator_id);
@@ -168,7 +168,7 @@ async fn test_two_node_connection() {
     let (consensus_tx1, _consensus_rx1) = mpsc::channel(100);
     let (transaction_tx1, _transaction_rx1) = mpsc::channel(100);
 
-    let (adapter1, _sync_rx1) = Libp2pAdapter::new(
+    let (adapter1, _sync_rx1, _tx_rx1) = Libp2pAdapter::new(
         config1,
         keypair1,
         ValidatorId(0),
@@ -197,7 +197,7 @@ async fn test_two_node_connection() {
     let (consensus_tx2, _consensus_rx2) = mpsc::channel(100);
     let (transaction_tx2, _transaction_rx2) = mpsc::channel(100);
 
-    let (adapter2, _sync_rx2) = Libp2pAdapter::new(
+    let (adapter2, _sync_rx2, _tx_rx2) = Libp2pAdapter::new(
         config2,
         keypair2,
         ValidatorId(1),
@@ -254,7 +254,7 @@ async fn test_topic_subscription() {
     let (consensus_tx, _consensus_rx) = mpsc::channel(100);
     let (transaction_tx, _transaction_rx) = mpsc::channel(100);
 
-    let (adapter, _sync_rx) = Libp2pAdapter::new(
+    let (adapter, _sync_rx, _tx_rx) = Libp2pAdapter::new(
         config,
         keypair,
         ValidatorId(0),

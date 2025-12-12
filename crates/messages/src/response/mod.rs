@@ -4,5 +4,7 @@
 
 mod block;
 mod sync;
+mod transaction;
 
 pub use block::GetBlockResponse;
+pub use transaction::GetTransactionsResponse;

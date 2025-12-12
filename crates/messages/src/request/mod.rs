@@ -4,6 +4,8 @@
 
 mod block;
 mod sync;
+mod transaction;
 
 pub use block::GetBlockRequest;
 pub use sync::SyncCompleteAnnouncement;
+pub use transaction::GetTransactionsRequest;
