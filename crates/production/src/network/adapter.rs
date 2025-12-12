@@ -318,10 +318,13 @@ impl Libp2pAdapter {
             .heartbeat_interval(config.gossipsub_heartbeat)
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|msg| {
-                // Use message hash as ID for deduplication
+                // Use message data + topic as ID for deduplication.
+                // Including the topic allows the same message (e.g., cross-shard transaction)
+                // to be published to multiple shard topics without being rejected as duplicate.
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 msg.data.hash(&mut hasher);
+                msg.topic.hash(&mut hasher);
                 gossipsub::MessageId::from(hasher.finish().to_string())
             })
             .max_transmit_size(config.max_message_size)
