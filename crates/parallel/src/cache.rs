@@ -72,6 +72,24 @@ impl SimulationCache {
     /// Must be called before any execution for this shard.
     /// Runs Radix Engine genesis on the storage.
     pub fn init_shard(&self, shard_id: u64) {
+        self.init_shard_with_balances(shard_id, vec![])
+    }
+
+    /// Initialize a shard's executor and storage with funded accounts.
+    ///
+    /// Must be called before any execution for this shard.
+    /// Runs Radix Engine genesis on the storage with the specified XRD balances.
+    /// Only accounts relevant to this shard should be passed.
+    pub fn init_shard_with_balances(
+        &self,
+        shard_id: u64,
+        balances: Vec<(
+            radix_common::types::ComponentAddress,
+            radix_common::math::Decimal,
+        )>,
+    ) {
+        use hyperscale_engine::GenesisConfig;
+
         if self.shard_executors.contains_key(&shard_id) {
             return; // Already initialized
         }
@@ -79,8 +97,13 @@ impl SimulationCache {
         let executor = RadixExecutor::new(NetworkDefinition::simulator());
         let mut storage = SimStorage::new();
 
-        // Run genesis
-        if let Err(e) = executor.run_genesis(&mut storage) {
+        // Run genesis with balances
+        let config = GenesisConfig {
+            xrd_balances: balances,
+            ..GenesisConfig::test_default()
+        };
+
+        if let Err(e) = executor.run_genesis_with_config(&mut storage, config) {
             warn!(shard_id, "Radix Engine genesis failed: {:?}", e);
             // Continue anyway - tests may not need full Radix state
         }
@@ -101,6 +124,51 @@ impl SimulationCache {
                 storage.commit(&updates);
             }
         }
+    }
+
+    /// Fetch state entries from a shard's reference storage.
+    ///
+    /// This is used for cross-shard provisioning - fetching state that needs
+    /// to be sent to other shards.
+    pub fn fetch_state_entries(
+        &self,
+        shard_id: u64,
+        nodes: &[NodeId],
+    ) -> Vec<hyperscale_types::StateEntry> {
+        use hyperscale_engine::SubstateStore;
+
+        let storage_ref = match self.shard_storage.get(&shard_id) {
+            Some(s) => s,
+            None => {
+                warn!(shard_id, "No storage for shard in fetch_state_entries");
+                return Vec::new();
+            }
+        };
+
+        let storage = match storage_ref.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                warn!(shard_id, "Failed to lock storage in fetch_state_entries");
+                return Vec::new();
+            }
+        };
+
+        nodes
+            .iter()
+            .flat_map(|node_id| {
+                storage
+                    .list_substates_for_node(node_id)
+                    .map(
+                        |(partition, sort_key, value)| hyperscale_types::StateEntry {
+                            node_id: *node_id,
+                            partition: hyperscale_types::PartitionNumber(partition),
+                            sort_key: sort_key.0,
+                            value: Some(value),
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Compute a cache key from verification inputs.

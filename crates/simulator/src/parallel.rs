@@ -9,6 +9,7 @@ use hyperscale_spammer::{
     AccountPool, AccountPoolError, SelectionMode, TransferWorkload, WorkloadGenerator,
 };
 use hyperscale_types::{shard_for_node, RoutableTransaction, ShardGroupId};
+use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -33,6 +34,8 @@ pub struct ParallelOrchestratorConfig {
     pub validators_per_shard: usize,
     /// Accounts per shard for workload generation.
     pub accounts_per_shard: usize,
+    /// Initial XRD balance for each account at genesis.
+    pub initial_balance: Decimal,
     /// Target transactions per second.
     pub target_tps: u64,
     /// Duration of transaction submission.
@@ -53,6 +56,7 @@ impl Default for ParallelOrchestratorConfig {
             num_shards: 2,
             validators_per_shard: 4,
             accounts_per_shard: 100,
+            initial_balance: Decimal::from(10_000u32),
             target_tps: 100,
             submission_duration: Duration::from_secs(10),
             drain_duration: Duration::from_secs(5),
@@ -127,6 +131,7 @@ impl From<&SimulatorConfig> for ParallelOrchestratorConfig {
             num_shards: config.num_shards as usize,
             validators_per_shard: config.validators_per_shard as usize,
             accounts_per_shard: config.accounts_per_shard,
+            initial_balance: config.initial_balance,
             target_tps: 100, // Default
             submission_duration: Duration::from_secs(10),
             drain_duration: Duration::from_secs(5),
@@ -211,8 +216,19 @@ impl ParallelOrchestrator {
         ),
         ParallelOrchestratorError,
     > {
-        // Initialize the simulator
-        self.simulator.initialize();
+        // Initialize the simulator with funded accounts
+        // Each shard gets only the accounts that belong to it
+        let initial_balance = self.config.initial_balance;
+        self.simulator.initialize_with_balances(|shard_id| {
+            self.accounts
+                .genesis_balances_for_shard(ShardGroupId(shard_id), initial_balance)
+        });
+
+        info!(
+            num_accounts = self.accounts.total_accounts(),
+            %initial_balance,
+            "Accounts funded at genesis"
+        );
 
         // Calculate total transactions and submission rate
         let total_transactions = (self.config.target_tps as f64

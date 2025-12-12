@@ -23,9 +23,9 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, KeyPair, NodeId, PartitionNumber, PublicKey,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StaticTopology, Topology,
-    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, BlockHeader, BlockHeight, Hash, KeyPair, NodeId, PublicKey, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StaticTopology, Topology, TransactionDecision,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -483,23 +483,10 @@ impl SimNode {
             }
 
             Action::FetchStateEntries { tx_hash, nodes } => {
-                use hyperscale_engine::SubstateStore;
-                let entries: Vec<_> = nodes
-                    .iter()
-                    .flat_map(|node_id| {
-                        self.storage
-                            .list_substates_for_node(node_id)
-                            .map(
-                                |(partition, sort_key, value)| hyperscale_types::StateEntry {
-                                    node_id: *node_id,
-                                    partition: PartitionNumber(partition),
-                                    sort_key: sort_key.0,
-                                    value: Some(value),
-                                },
-                            )
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
+                // Fetch state entries from the shared cache storage (not node's local storage)
+                // This is necessary because genesis state is only in the cache storage
+                let shard_id = self.state.shard().0;
+                let entries = cache.fetch_state_entries(shard_id, &nodes);
                 self.internal_queue
                     .push_back(Event::StateEntriesFetched { tx_hash, entries });
             }
@@ -735,6 +722,145 @@ impl ParallelSimulator {
         }
 
         info!("Genesis initialized for all shards");
+    }
+
+    /// Initialize with funded accounts at genesis.
+    ///
+    /// Like `initialize()`, but also funds the specified accounts at genesis time.
+    /// Each shard only receives balances for accounts belonging to that shard.
+    ///
+    /// `shard_balances` is a function that returns the balances for a given shard.
+    pub fn initialize_with_balances<F>(&mut self, shard_balances: F)
+    where
+        F: Fn(
+            u64,
+        ) -> Vec<(
+            radix_common::types::ComponentAddress,
+            radix_common::math::Decimal,
+        )>,
+    {
+        let num_shards = self.config.num_shards;
+        let validators_per_shard = self.config.validators_per_shard as u32;
+        let total_nodes = num_shards * self.config.validators_per_shard;
+
+        info!(
+            num_shards,
+            validators_per_shard,
+            total_nodes,
+            "Initializing parallel simulator with funded accounts"
+        );
+
+        // Generate keys deterministically
+        let seed = self.config.seed;
+        let keys: Vec<KeyPair> = (0..total_nodes)
+            .map(|i| {
+                let mut seed_bytes = [0u8; 32];
+                let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
+                seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
+                seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+                KeyPair::from_seed(hyperscale_types::KeyType::Bls12381, &seed_bytes)
+            })
+            .collect();
+        let public_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key()).collect();
+
+        // Build global validator set
+        let global_validators: Vec<ValidatorInfo> = (0..total_nodes)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: public_keys[i].clone(),
+                voting_power: 1,
+            })
+            .collect();
+        let global_validator_set = ValidatorSet::new(global_validators);
+
+        // Build shard committees
+        let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+        for shard_id in 0..num_shards {
+            let shard = ShardGroupId(shard_id as u64);
+            let shard_start = shard_id * self.config.validators_per_shard;
+            let shard_end = shard_start + self.config.validators_per_shard;
+            let committee: Vec<ValidatorId> = (shard_start..shard_end)
+                .map(|i| ValidatorId(i as u64))
+                .collect();
+            shard_committees.insert(shard, committee);
+            self.shard_members
+                .insert(shard, (shard_start..shard_end).map(|i| i as u32).collect());
+        }
+
+        // Create nodes
+        for shard_id in 0..num_shards {
+            let shard = ShardGroupId(shard_id as u64);
+            let shard_start = shard_id * self.config.validators_per_shard;
+
+            for v in 0..self.config.validators_per_shard {
+                let node_index = shard_start + v;
+                let validator_id = ValidatorId(node_index as u64);
+
+                let topology: Arc<dyn Topology> = Arc::new(StaticTopology::with_shard_committees(
+                    validator_id,
+                    shard,
+                    num_shards as u64,
+                    &global_validator_set,
+                    shard_committees.clone(),
+                ));
+
+                let state = NodeStateMachine::new(
+                    node_index as u32,
+                    topology,
+                    keys[node_index].clone(),
+                    BftConfig::default(),
+                    RecoveredState::default(),
+                );
+
+                let storage = SimStorage::new();
+                let node = SimNode::new(node_index as u32, state, storage);
+                self.nodes.push(node);
+            }
+        }
+
+        // Initialize Radix Engine executors for each shard WITH balances
+        for shard_id in 0..num_shards {
+            let balances = shard_balances(shard_id as u64);
+            self.simulation_cache
+                .init_shard_with_balances(shard_id as u64, balances);
+        }
+        info!(
+            num_shards,
+            "Radix Engine executors initialized with funded accounts"
+        );
+
+        // Initialize genesis for each shard
+        for shard_id in 0..num_shards {
+            let genesis_header = BlockHeader {
+                height: BlockHeight(0),
+                parent_hash: Hash::from_bytes(&[0u8; 32]),
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId((shard_id * self.config.validators_per_shard) as u64),
+                timestamp: 0,
+                round: 0,
+                is_fallback: false,
+            };
+            let genesis_block = Block {
+                header: genesis_header,
+                transactions: vec![],
+                committed_certificates: vec![],
+                deferred: vec![],
+                aborted: vec![],
+            };
+
+            let shard_start = shard_id * self.config.validators_per_shard;
+            let shard_end = shard_start + self.config.validators_per_shard;
+
+            for node_index in shard_start..shard_end {
+                let node = &mut self.nodes[node_index];
+                let actions = node.state.initialize_genesis(genesis_block.clone());
+                for action in actions {
+                    node.execute_action(action, &self.simulation_cache);
+                }
+            }
+        }
+
+        info!("Genesis initialized for all shards with funded accounts");
     }
 
     /// Submit a transaction to the appropriate node.
