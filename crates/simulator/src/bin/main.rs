@@ -6,11 +6,11 @@
 //! # Example
 //!
 //! ```bash
-//! # Run a 60-second deterministic simulation with 2 shards
+//! # Run a parallel simulation (default, multi-core, non-deterministic)
 //! hyperscale-sim --shards 2 --duration 60
 //!
-//! # Run a parallel simulation (multi-core)
-//! hyperscale-sim --parallel -s 2 -v 4 -d 60 --tps 1000
+//! # Run a deterministic simulation with a fixed seed
+//! hyperscale-sim --seed 42 -s 2 -v 4 -d 60 --tps 1000
 //!
 //! # Run with more validators and cross-shard transactions
 //! hyperscale-sim -s 4 -v 5 -d 120 --cross-shard-ratio 0.3
@@ -27,8 +27,8 @@ use tracing_subscriber::EnvFilter;
 /// Hyperscale Simulator
 ///
 /// Runs long-running workload simulations. Supports two modes:
-/// - Deterministic (default): Single-threaded, reproducible results
-/// - Parallel (--parallel): Multi-core, realistic async behavior
+/// - Parallel (default): Multi-core, realistic async behavior
+/// - Deterministic (--seed): Single-threaded, reproducible results when seed is provided
 #[derive(Parser, Debug)]
 #[command(name = "hyperscale-sim")]
 #[command(version, about, long_about = None)]
@@ -45,9 +45,10 @@ struct Args {
     #[arg(short = 'd', long, default_value = "30")]
     duration: u64,
 
-    /// Random seed for deterministic simulation
-    #[arg(long, default_value = "42")]
-    seed: u64,
+    /// Random seed for reproducible results. When set, runs in deterministic
+    /// single-threaded mode. When omitted, runs in parallel multi-core mode.
+    #[arg(long)]
+    seed: Option<u64>,
 
     /// Number of accounts per shard
     #[arg(short = 'a', long, default_value = "500")]
@@ -72,10 +73,6 @@ struct Args {
     /// Use no-contention account distribution (disjoint pairs for zero conflicts)
     #[arg(long)]
     no_contention: bool,
-
-    /// Run in parallel mode (multi-core, non-deterministic)
-    #[arg(short = 'p', long)]
-    parallel: bool,
 
     /// Drain duration in seconds (parallel mode only)
     #[arg(long, default_value = "5")]
@@ -104,28 +101,23 @@ fn main() {
         }
     });
 
-    // Warn if --seed is explicitly set with --parallel (results won't be reproducible)
-    if args.parallel && args.seed != 42 {
-        eprintln!(
-            "Warning: --seed has no effect in parallel mode. \
-             Parallel simulation is non-deterministic due to async scheduling."
-        );
-    }
-
-    if args.parallel {
-        run_parallel(&args, cross_shard_ratio);
-    } else {
+    if args.seed.is_some() {
         run_deterministic(&args, cross_shard_ratio);
+    } else {
+        run_parallel(&args, cross_shard_ratio);
     }
 }
 
 fn run_parallel(args: &Args, cross_shard_ratio: f64) {
+    // Generate a random seed for parallel mode
+    let seed: u64 = rand::random();
+
     info!(
         shards = args.shards,
         validators = args.validators,
         duration_secs = args.duration,
         drain_secs = args.drain,
-        seed = args.seed,
+        seed,
         accounts = args.accounts,
         tps = args.tps,
         cross_shard_ratio,
@@ -139,7 +131,7 @@ fn run_parallel(args: &Args, cross_shard_ratio: f64) {
             .with_drain_duration(Duration::from_secs(args.drain))
             .with_accounts_per_shard(args.accounts)
             .with_cross_shard_ratio(cross_shard_ratio)
-            .with_seed(args.seed);
+            .with_seed(seed);
 
     if args.no_contention {
         config = config.with_no_contention();
@@ -178,11 +170,13 @@ fn run_parallel(args: &Args, cross_shard_ratio: f64) {
 }
 
 fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
+    let seed = args.seed.expect("deterministic mode requires seed");
+
     info!(
         shards = args.shards,
         validators = args.validators,
         duration_secs = args.duration,
-        seed = args.seed,
+        seed,
         accounts = args.accounts,
         tps = args.tps,
         cross_shard_ratio,
@@ -217,7 +211,7 @@ fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
     // Create simulator config
     let config = SimulatorConfig::new(args.shards, args.validators)
         .with_accounts_per_shard(args.accounts)
-        .with_seed(args.seed)
+        .with_seed(seed)
         .with_workload(workload);
 
     // Create and initialize simulator
