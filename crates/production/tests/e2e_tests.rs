@@ -11,11 +11,13 @@ mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
+use hyperscale_engine::TransactionValidation;
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
 use parking_lot::RwLock;
+use radix_common::network::NetworkDefinition;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,11 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::info;
+
+/// Create a test transaction validator.
+fn test_tx_validator() -> Arc<TransactionValidation> {
+    Arc::new(TransactionValidation::new(NetworkDefinition::simulator()))
+}
 
 /// Test timeout values (from design spec).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -116,7 +123,14 @@ async fn test_network_adapter_starts() {
 
     let result = timeout(
         CONNECTION_TIMEOUT,
-        Libp2pAdapter::new(config, keypair, validator_id, shard, event_tx),
+        Libp2pAdapter::new(
+            config,
+            keypair,
+            validator_id,
+            shard,
+            event_tx,
+            test_tx_validator(),
+        ),
     )
     .await;
 
@@ -157,6 +171,7 @@ async fn test_two_node_connection() {
         ValidatorId(0),
         ShardGroupId(0),
         event_tx1,
+        test_tx_validator(),
     )
     .await
     .unwrap();
@@ -183,6 +198,7 @@ async fn test_two_node_connection() {
         ValidatorId(1),
         ShardGroupId(0),
         event_tx2,
+        test_tx_validator(),
     )
     .await
     .unwrap();
@@ -231,10 +247,16 @@ async fn test_topic_subscription() {
     };
     let (event_tx, _event_rx) = mpsc::channel(100);
 
-    let (adapter, _sync_rx) =
-        Libp2pAdapter::new(config, keypair, ValidatorId(0), ShardGroupId(0), event_tx)
-            .await
-            .unwrap();
+    let (adapter, _sync_rx) = Libp2pAdapter::new(
+        config,
+        keypair,
+        ValidatorId(0),
+        ShardGroupId(0),
+        event_tx,
+        test_tx_validator(),
+    )
+    .await
+    .unwrap();
 
     // Subscribe to shard topics
     let result = adapter.subscribe_shard(ShardGroupId(0)).await;

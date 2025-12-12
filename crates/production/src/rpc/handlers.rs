@@ -114,6 +114,9 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Handler for `POST /api/v1/transactions` - submit transaction.
+///
+/// Performs signature validation before accepting the transaction into the
+/// mempool. Invalid transactions are rejected with a 400 Bad Request response.
 pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
@@ -149,6 +152,52 @@ pub async fn submit_transaction_handler(
     };
 
     let hash = hex::encode(transaction.hash().as_bytes());
+
+    // Validate transaction signatures before accepting into mempool
+    {
+        let validator = state.tx_validator.clone();
+        let tx_for_validation = transaction.clone();
+
+        // Run validation on blocking thread pool to avoid blocking async runtime
+        // Signature verification is CPU-intensive
+        let validation_result =
+            tokio::task::spawn_blocking(move || validator.validate_transaction(&tx_for_validation))
+                .await;
+
+        match validation_result {
+            Ok(Ok(())) => {
+                // Validation passed, continue to send
+            }
+            Ok(Err(e)) => {
+                // Validation failed - reject transaction
+                tracing::debug!(
+                    tx_hash = %hash,
+                    error = %e,
+                    "Transaction validation failed"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SubmitTransactionResponse {
+                        accepted: false,
+                        hash,
+                        error: Some(format!("Transaction validation failed: {}", e)),
+                    }),
+                );
+            }
+            Err(e) => {
+                // spawn_blocking task panicked - shouldn't happen
+                tracing::error!(error = ?e, "Validation task panicked");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(SubmitTransactionResponse {
+                        accepted: false,
+                        hash,
+                        error: Some("Internal validation error".to_string()),
+                    }),
+                );
+            }
+        }
+    }
 
     // Send to node
     match state.tx_sender.try_send(transaction) {
@@ -324,7 +373,9 @@ mod tests {
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use crate::sync::SyncStatus;
     use axum::{body::Body, http::Request, Router};
+    use hyperscale_engine::TransactionValidation;
     use hyperscale_types::{BlockHeight, TransactionDecision};
+    use radix_common::network::NetworkDefinition;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
@@ -341,6 +392,7 @@ mod tests {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_validator: Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
         }
     }
 

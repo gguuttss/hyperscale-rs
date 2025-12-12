@@ -13,6 +13,7 @@ use super::topic::Topic;
 use crate::metrics;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{PublicKey, ShardGroupId, ValidatorId};
 use libp2p::{
     gossipsub, identity, kad,
@@ -289,6 +290,7 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `event_tx` - Channel to send incoming events to the runner
+    /// * `tx_validator` - Transaction validator for signature verification
     ///
     /// # Returns
     ///
@@ -300,6 +302,7 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         event_tx: mpsc::Sender<Event>,
+        tx_validator: Arc<TransactionValidation>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<InboundSyncRequest>), NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
@@ -406,6 +409,7 @@ impl Libp2pAdapter {
             shutdown_rx,
             sync_request_tx,
             rate_limit_config,
+            tx_validator,
         ));
 
         Ok((adapter, sync_request_rx))
@@ -587,6 +591,7 @@ impl Libp2pAdapter {
     }
 
     /// Background event loop that processes swarm events and routes messages.
+    #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
         mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
@@ -595,6 +600,7 @@ impl Libp2pAdapter {
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
         rate_limit_config: RateLimitConfig,
+        tx_validator: Arc<TransactionValidation>,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -633,6 +639,7 @@ impl Libp2pAdapter {
                         &mut next_channel_id,
                         &sync_request_tx,
                         &mut rate_limiter,
+                        &tx_validator,
                     ).await;
                 }
             }
@@ -727,6 +734,7 @@ impl Libp2pAdapter {
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::Sender<InboundSyncRequest>,
         rate_limiter: &mut SyncRateLimiter,
+        tx_validator: &Arc<TransactionValidation>,
     ) {
         match event {
             // Handle gossipsub messages
@@ -762,26 +770,72 @@ impl Libp2pAdapter {
                     Ok(decoded) => {
                         metrics::record_network_message_received();
 
-                        // Extract trace context for distributed tracing (when feature enabled)
-                        // We attach the OpenTelemetry context, create a tracing span to capture it,
-                        // then use Future::instrument to attach the span to the send future.
-                        // This ensures the context is active during the async operation.
-                        let send_future = async {
-                            if event_tx.send(decoded.event).await.is_err() {
-                                warn!("Event channel closed");
-                            }
-                        };
-                        #[cfg(feature = "trace-propagation")]
-                        let send_future = {
-                            let span = tracing::trace_span!("cross_shard_message");
-                            if let Some(ref trace_ctx) = decoded.trace_context {
-                                let _ = span.set_parent(trace_ctx.extract());
-                                tracing::trace!("Extracted trace context from cross-shard message");
-                            }
-                            send_future.instrument(span)
-                        };
+                        // For transaction gossips, validate signatures before accepting
+                        // This prevents invalid transactions from entering the mempool
+                        let event_to_send =
+                            if let Event::TransactionGossipReceived { ref tx } = decoded.event {
+                                let validator = tx_validator.clone();
+                                let tx_clone = tx.clone();
+                                let tx_hash = tx.hash();
 
-                        send_future.await;
+                                // Run validation on blocking thread pool
+                                let validation_result = tokio::task::spawn_blocking(move || {
+                                    validator.validate_transaction(&tx_clone)
+                                })
+                                .await;
+
+                                match validation_result {
+                                    Ok(Ok(())) => {
+                                        // Validation passed
+                                        Some(decoded.event)
+                                    }
+                                    Ok(Err(e)) => {
+                                        // Validation failed - drop the transaction
+                                        debug!(
+                                            tx_hash = %hex::encode(tx_hash.as_bytes()),
+                                            peer = %propagation_source,
+                                            error = %e,
+                                            "Dropping gossiped transaction with invalid signature"
+                                        );
+                                        metrics::record_invalid_message();
+                                        None
+                                    }
+                                    Err(e) => {
+                                        // spawn_blocking task panicked
+                                        warn!(error = ?e, "Transaction validation task panicked");
+                                        None
+                                    }
+                                }
+                            } else {
+                                // Non-transaction messages pass through without validation
+                                Some(decoded.event)
+                            };
+
+                        // Send the event if validation passed
+                        if let Some(event) = event_to_send {
+                            // Extract trace context for distributed tracing (when feature enabled)
+                            // We attach the OpenTelemetry context, create a tracing span to capture it,
+                            // then use Future::instrument to attach the span to the send future.
+                            // This ensures the context is active during the async operation.
+                            let send_future = async {
+                                if event_tx.send(event).await.is_err() {
+                                    warn!("Event channel closed");
+                                }
+                            };
+                            #[cfg(feature = "trace-propagation")]
+                            let send_future = {
+                                let span = tracing::trace_span!("cross_shard_message");
+                                if let Some(ref trace_ctx) = decoded.trace_context {
+                                    let _ = span.set_parent(trace_ctx.extract());
+                                    tracing::trace!(
+                                        "Extracted trace context from cross-shard message"
+                                    );
+                                }
+                                send_future.instrument(span)
+                            };
+
+                            send_future.await;
+                        }
                     }
                     Err(e) => {
                         warn!(

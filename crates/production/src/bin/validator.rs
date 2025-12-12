@@ -842,6 +842,11 @@ async fn main() -> Result<()> {
     // Create transaction submission channel for RPC server
     let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(1000);
 
+    // Create transaction validator for signature verification
+    let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
+        NetworkDefinition::simulator(),
+    ));
+
     // Start RPC server
     let rpc_handle = if config.metrics.enabled {
         let rpc_config = RpcServerConfig {
@@ -854,7 +859,7 @@ async fn main() -> Result<()> {
             metrics_enabled: true,
         };
 
-        let rpc_server = RpcServer::new(rpc_config, tx_sender);
+        let rpc_server = RpcServer::new(rpc_config, tx_sender, tx_validator.clone());
         let handle = rpc_server
             .start()
             .await

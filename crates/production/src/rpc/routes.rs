@@ -38,6 +38,8 @@ mod tests {
     use super::*;
     use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use axum::{body::Body, http::Request};
+    use hyperscale_engine::TransactionValidation;
+    use radix_common::network::NetworkDefinition;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
@@ -61,6 +63,7 @@ mod tests {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_validator: Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
         }
     }
 

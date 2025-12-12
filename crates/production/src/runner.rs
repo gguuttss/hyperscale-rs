@@ -157,6 +157,9 @@ pub struct ProductionRunnerBuilder {
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
+    /// Radix network definition for transaction validation.
+    /// Defaults to simulator network if not set.
+    network_definition: Option<NetworkDefinition>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -181,7 +184,17 @@ impl ProductionRunnerBuilder {
             tx_status_cache: None,
             mempool_snapshot: None,
             genesis_config: None,
+            network_definition: None,
         }
+    }
+
+    /// Set the Radix network definition for transaction validation.
+    ///
+    /// This determines which network's transaction format to validate against.
+    /// Defaults to simulator network if not set.
+    pub fn network_definition(mut self, network: NetworkDefinition) -> Self {
+        self.network_definition = Some(network);
+        self
     }
 
     /// Set the network topology.
@@ -315,13 +328,24 @@ impl ProductionRunnerBuilder {
         );
         let timer_manager = TimerManager::new(event_tx.clone());
 
-        // Create network adapter
+        // Use configured network definition or default to simulator
+        let network_definition = self
+            .network_definition
+            .unwrap_or_else(NetworkDefinition::simulator);
+
+        // Create transaction validator for signature verification
+        let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
+            network_definition.clone(),
+        ));
+
+        // Create network adapter with transaction validation
         let (network, sync_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
             event_tx.clone(),
+            tx_validator.clone(),
         )
         .await?;
 
@@ -342,8 +366,7 @@ impl ProductionRunnerBuilder {
             SyncManager::new(SyncConfig::default(), network.clone(), event_tx.clone());
 
         // Create executor
-        // Note: Using simulator network for now - production should use mainnet
-        let executor = Arc::new(RadixExecutor::new(NetworkDefinition::simulator()));
+        let executor = Arc::new(RadixExecutor::new(network_definition));
 
         Ok(ProductionRunner {
             event_rx,
@@ -358,6 +381,7 @@ impl ProductionRunnerBuilder {
             topology,
             storage,
             executor,
+            tx_validator,
             rpc_status: self.rpc_status,
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
@@ -408,6 +432,8 @@ pub struct ProductionRunner {
     storage: Arc<RwLock<RocksDbStorage>>,
     /// Transaction executor.
     executor: Arc<RadixExecutor>,
+    /// Transaction validator for signature verification.
+    tx_validator: Arc<hyperscale_engine::TransactionValidation>,
     /// Optional RPC status state to update on block commits.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     /// Optional transaction status cache for RPC queries.
@@ -450,6 +476,11 @@ impl ProductionRunner {
     /// Get a sender for submitting events.
     pub fn event_sender(&self) -> mpsc::Sender<Event> {
         self.event_tx.clone()
+    }
+
+    /// Get the transaction validator for signature verification.
+    pub fn tx_validator(&self) -> Arc<hyperscale_engine::TransactionValidation> {
+        self.tx_validator.clone()
     }
 
     /// Take the shutdown handle.

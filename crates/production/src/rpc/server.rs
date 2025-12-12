@@ -104,7 +104,12 @@ impl RpcServer {
     ///
     /// * `config` - Server configuration
     /// * `tx_sender` - Channel to send submitted transactions to the node
-    pub fn new(config: RpcServerConfig, tx_sender: mpsc::Sender<RoutableTransaction>) -> Self {
+    /// * `tx_validator` - Transaction validator for signature verification
+    pub fn new(
+        config: RpcServerConfig,
+        tx_sender: mpsc::Sender<RoutableTransaction>,
+        tx_validator: Arc<hyperscale_engine::TransactionValidation>,
+    ) -> Self {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(RwLock::new(SyncStatus::default())),
@@ -113,6 +118,7 @@ impl RpcServer {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_validator,
         };
 
         Self { config, state }
@@ -121,6 +127,7 @@ impl RpcServer {
     /// Create a new RPC server with pre-configured state.
     ///
     /// This allows sharing state between the server and other components.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_state(
         config: RpcServerConfig,
         ready: Arc<AtomicBool>,
@@ -129,6 +136,7 @@ impl RpcServer {
         tx_sender: mpsc::Sender<RoutableTransaction>,
         tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
         mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+        tx_validator: Arc<hyperscale_engine::TransactionValidation>,
     ) -> Self {
         let state = RpcState {
             ready,
@@ -138,6 +146,7 @@ impl RpcServer {
             start_time: Instant::now(),
             tx_status_cache,
             mempool_snapshot,
+            tx_validator,
         };
 
         Self { config, state }
@@ -184,6 +193,8 @@ impl RpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_engine::TransactionValidation;
+    use radix_common::network::NetworkDefinition;
 
     #[test]
     fn test_default_config() {
@@ -196,7 +207,8 @@ mod tests {
     async fn test_server_creation() {
         let (tx, _rx) = mpsc::channel(100);
         let config = RpcServerConfig::default();
-        let server = RpcServer::new(config, tx);
+        let tx_validator = Arc::new(TransactionValidation::new(NetworkDefinition::simulator()));
+        let server = RpcServer::new(config, tx, tx_validator);
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));

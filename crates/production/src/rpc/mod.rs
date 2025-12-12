@@ -23,6 +23,9 @@
 //!
 //! ```no_run
 //! use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
+//! use hyperscale_engine::TransactionValidation;
+//! use radix_common::network::NetworkDefinition;
+//! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = RpcServerConfig {
@@ -30,9 +33,10 @@
 //!     metrics_enabled: true,
 //! };
 //!
-//! // Create server with transaction submission channel
+//! // Create server with transaction submission channel and validator
 //! let (tx_sender, tx_receiver) = tokio::sync::mpsc::channel(1000);
-//! let server = RpcServer::new(config, tx_sender);
+//! let tx_validator = Arc::new(TransactionValidation::new(NetworkDefinition::simulator()));
+//! let server = RpcServer::new(config, tx_sender, tx_validator);
 //!
 //! // Start serving
 //! server.serve().await?;

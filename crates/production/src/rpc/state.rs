@@ -2,6 +2,7 @@
 
 use crate::sync::SyncStatus;
 use hyperscale_core::TransactionStatus;
+use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{Hash, RoutableTransaction};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -26,6 +27,8 @@ pub struct RpcState {
     pub tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+    /// Transaction validator for signature verification before mempool.
+    pub tx_validator: Arc<TransactionValidation>,
 }
 
 /// Cached transaction status entry.
