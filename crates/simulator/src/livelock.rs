@@ -40,7 +40,7 @@ pub struct StuckTransaction {
     /// Current status
     pub status: TransactionStatus,
     /// The transaction itself
-    pub transaction: RoutableTransaction,
+    pub transaction: std::sync::Arc<RoutableTransaction>,
     /// Shard this transaction was found on
     pub shard: ShardGroupId,
     /// All shards this transaction writes to

@@ -494,10 +494,10 @@ impl StateMachine for NodeStateMachine {
 
             // SubmitTransaction needs special handling to add gossip broadcast
             Event::SubmitTransaction { tx } => {
-                let mut actions = self.mempool.on_submit_transaction(tx.clone());
+                let mut actions = self.mempool.on_submit_transaction_arc(Arc::clone(tx));
 
                 // Broadcast transaction to all validators in our shard
-                let gossip = hyperscale_messages::TransactionGossip::new(tx.clone());
+                let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
                 actions.push(Action::BroadcastToShard {
                     message: OutboundMessage::TransactionGossip(Box::new(gossip)),
                     shard: self.shard(),
@@ -530,7 +530,7 @@ impl StateMachine for NodeStateMachine {
             // The BFT might have pending blocks waiting for this transaction
             Event::TransactionGossipReceived { tx } => {
                 let tx_hash = tx.hash();
-                let mut actions = self.mempool.on_transaction_gossip(tx.clone());
+                let mut actions = self.mempool.on_transaction_gossip_arc(Arc::clone(tx));
 
                 // Check if any pending blocks are now complete
                 let mempool_map = self.mempool.as_hash_map();

@@ -25,9 +25,9 @@ pub struct PendingBlock {
     /// Block header (received first).
     header: BlockHeader,
 
-    /// Map of transaction hash -> full RoutableTransaction object (for received transactions).
+    /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
     /// Uses IndexMap for deterministic iteration order (insertion order) when constructing blocks.
-    received_transactions: IndexMap<Hash, RoutableTransaction>,
+    received_transactions: IndexMap<Hash, Arc<RoutableTransaction>>,
 
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
@@ -48,7 +48,6 @@ pub struct PendingBlock {
     aborted: Vec<TransactionAbort>,
 
     /// The fully constructed block (None until all transactions/certs received).
-    /// Wrapped in Arc to allow cheap cloning when returning from tracker methods.
     constructed_block: Option<Arc<Block>>,
 }
 
@@ -93,7 +92,7 @@ impl PendingBlock {
     /// Add a received transaction.
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction(&mut self, tx: RoutableTransaction) -> bool {
+    pub fn add_transaction_arc(&mut self, tx: Arc<RoutableTransaction>) -> bool {
         let hash = tx.hash();
         // O(1) lookup and removal with HashSet
         if self.missing_transaction_hashes.remove(&hash) {
@@ -102,6 +101,13 @@ impl PendingBlock {
         } else {
             false
         }
+    }
+
+    /// Add a received transaction (wraps in Arc).
+    ///
+    /// Returns true if this transaction was needed, false if duplicate or not in this block.
+    pub fn add_transaction(&mut self, tx: RoutableTransaction) -> bool {
+        self.add_transaction_arc(Arc::new(tx))
     }
 
     /// Add a received certificate.
@@ -175,7 +181,7 @@ impl PendingBlock {
 
         // Build the block from header + full transaction objects + certificates
         // Use drain(..) to take ownership of data instead of cloning
-        let transactions: Vec<RoutableTransaction> = self
+        let transactions: Vec<Arc<RoutableTransaction>> = self
             .received_transactions
             .drain(..)
             .map(|(_, v)| v)

@@ -6,6 +6,7 @@ use hyperscale_types::{
     ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
     ViewChangeCertificate, ViewChangeVote,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Actions the state machine wants to perform.
@@ -175,7 +176,7 @@ pub enum Action {
     /// Returns `Event::TransactionsExecuted` when complete.
     ExecuteTransactions {
         block_hash: Hash,
-        transactions: Vec<RoutableTransaction>,
+        transactions: Vec<Arc<RoutableTransaction>>,
         state_root: Hash,
     },
 
@@ -188,7 +189,7 @@ pub enum Action {
         /// Transaction hash (for correlation).
         tx_hash: Hash,
         /// The transaction to execute.
-        transaction: RoutableTransaction,
+        transaction: Arc<RoutableTransaction>,
         /// State provisions from other shards.
         provisions: Vec<StateProvision>,
     },

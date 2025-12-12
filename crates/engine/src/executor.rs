@@ -43,6 +43,7 @@ use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::VmModules;
 use radix_transactions::validation::TransactionValidator;
+use std::sync::Arc;
 
 /// Synchronous Radix Engine executor for deterministic simulation.
 ///
@@ -114,12 +115,12 @@ impl RadixExecutor {
     pub fn execute_single_shard<S: SubstateStore>(
         &self,
         storage: &S,
-        transactions: &[RoutableTransaction],
+        transactions: &[Arc<RoutableTransaction>],
     ) -> Result<ExecutionOutput, ExecutionError> {
         let mut results = Vec::with_capacity(transactions.len());
 
         for tx in transactions {
-            let result = self.execute_one(storage, tx)?;
+            let result = self.execute_one(storage, tx.as_ref())?;
             results.push(result);
         }
 
@@ -139,7 +140,7 @@ impl RadixExecutor {
     pub fn execute_cross_shard<S: SubstateStore>(
         &self,
         storage: &S,
-        transactions: &[RoutableTransaction],
+        transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
         _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {

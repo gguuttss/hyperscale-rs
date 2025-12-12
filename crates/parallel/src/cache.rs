@@ -160,7 +160,7 @@ impl SimulationCache {
         &self,
         shard_id: u64,
         block_hash: Hash,
-        transactions: &[RoutableTransaction],
+        transactions: &[Arc<RoutableTransaction>],
     ) -> Vec<hyperscale_types::ExecutionResult> {
         let key = (shard_id, block_hash);
 
@@ -181,7 +181,7 @@ impl SimulationCache {
     fn do_execute_block(
         &self,
         shard_id: u64,
-        transactions: &[RoutableTransaction],
+        transactions: &[Arc<RoutableTransaction>],
     ) -> Vec<hyperscale_types::ExecutionResult> {
         let executor_ref = match self.shard_executors.get(&shard_id) {
             Some(e) => e,
@@ -254,7 +254,7 @@ impl SimulationCache {
         &self,
         shard_id: u64,
         tx_hash: Hash,
-        transaction: &RoutableTransaction,
+        transaction: &Arc<RoutableTransaction>,
         provisions: &[hyperscale_types::StateProvision],
         is_local_node: impl Fn(&NodeId) -> bool,
     ) -> hyperscale_types::ExecutionResult {
@@ -279,7 +279,7 @@ impl SimulationCache {
     fn do_execute_cross_shard(
         &self,
         shard_id: u64,
-        transaction: &RoutableTransaction,
+        transaction: &Arc<RoutableTransaction>,
         provisions: &[hyperscale_types::StateProvision],
         is_local_node: &impl Fn(&NodeId) -> bool,
     ) -> hyperscale_types::ExecutionResult {

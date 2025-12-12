@@ -7,6 +7,7 @@ use hyperscale_messages::{
     ViewChangeVoteGossip,
 };
 use sbor::prelude::*;
+use std::sync::Arc;
 
 /// Outbound network messages.
 ///
@@ -196,7 +197,7 @@ impl OutboundMessage {
                 cert: gossip.certificate.clone(),
             },
             OutboundMessage::TransactionGossip(gossip) => Event::TransactionGossipReceived {
-                tx: gossip.transaction.clone(),
+                tx: Arc::clone(&gossip.transaction),
             },
         }
     }

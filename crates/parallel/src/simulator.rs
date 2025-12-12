@@ -746,9 +746,11 @@ impl ParallelSimulator {
             .map(|w| hyperscale_types::shard_for_node(w, self.config.num_shards as u64))
             .unwrap_or(ShardGroupId(0));
 
-        // Submit to first validator in target shard
+        // Submit to first validator in target shard (wrap in Arc)
         let node_index = (target_shard.0 as usize * self.config.validators_per_shard) as u32;
-        let event = Event::SubmitTransaction { tx };
+        let event = Event::SubmitTransaction {
+            tx: std::sync::Arc::new(tx),
+        };
         self.nodes[node_index as usize].submit_transaction(event);
 
         self.submitted.fetch_add(1, Ordering::Relaxed);

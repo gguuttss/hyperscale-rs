@@ -81,7 +81,7 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
-            transactions: vec![tx],
+            transactions: vec![std::sync::Arc::new(tx)],
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],

@@ -155,7 +155,6 @@ impl MessageRouter {
                 }
             };
 
-            // Create inbound message (Arc clone is cheap)
             let inbound = InboundMessage {
                 from: msg.from,
                 message: Arc::clone(&msg.message),

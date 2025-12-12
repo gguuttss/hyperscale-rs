@@ -5,6 +5,7 @@ use hyperscale_types::{
     RoutableTransaction, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
     TransactionAbort, TransactionDefer, ViewChangeCertificate, ViewChangeVote,
 };
+use std::sync::Arc;
 
 /// Priority levels for event ordering within the same timestamp.
 ///
@@ -98,7 +99,7 @@ pub enum Event {
     // Network Messages - Mempool (priority: Network)
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a transaction via gossip.
-    TransactionGossipReceived { tx: RoutableTransaction },
+    TransactionGossipReceived { tx: Arc<RoutableTransaction> },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Internal Events (priority: Internal)
@@ -303,7 +304,7 @@ pub enum Event {
     // Client Requests (priority: Client)
     // ═══════════════════════════════════════════════════════════════════════
     /// Client submitted a transaction.
-    SubmitTransaction { tx: RoutableTransaction },
+    SubmitTransaction { tx: Arc<RoutableTransaction> },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Sync Protocol Events (priority varies by type)

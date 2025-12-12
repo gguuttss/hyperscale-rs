@@ -5,6 +5,7 @@ use crate::{
     TransactionCertificate, TransactionDefer, ValidatorId,
 };
 use sbor::prelude::*;
+use std::sync::Arc;
 
 /// Block header containing consensus metadata.
 ///
@@ -61,13 +62,17 @@ impl BlockHeader {
 /// 2. **committed_certificates**: Finalized transaction certificates (Accept/Reject decisions)
 /// 3. **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
 /// 4. **aborted**: Transactions aborted due to timeout or rejection
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+///
+/// Transactions are stored as `Arc<RoutableTransaction>` for efficient cloning
+/// and sharing across the system. When serialized (for storage or network),
+/// the underlying transaction data is written directly.
+#[derive(Debug, Clone)]
 pub struct Block {
     /// Block header with consensus metadata.
     pub header: BlockHeader,
 
     /// Transactions included in this block.
-    pub transactions: Vec<RoutableTransaction>,
+    pub transactions: Vec<Arc<RoutableTransaction>>,
 
     /// Transaction certificates for finalized transactions.
     pub committed_certificates: Vec<TransactionCertificate>,
@@ -85,6 +90,107 @@ pub struct Block {
     /// used for N-way cycles that cannot be resolved via simple deferral,
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
+}
+
+// Manual PartialEq - compare transaction content, not Arc pointers
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header
+            && self.transactions.len() == other.transactions.len()
+            && self
+                .transactions
+                .iter()
+                .zip(other.transactions.iter())
+                .all(|(a, b)| a.hash() == b.hash())
+            && self.committed_certificates == other.committed_certificates
+            && self.deferred == other.deferred
+            && self.aborted == other.aborted
+    }
+}
+
+impl Eq for Block {}
+
+// ============================================================================
+// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
+// We serialize/deserialize the inner RoutableTransaction directly.
+// ============================================================================
+
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E> for Block {
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(5)?; // 5 fields
+        encoder.encode(&self.header)?;
+        // Encode transactions as Vec<RoutableTransaction> (unwrap Arcs)
+        encoder.write_value_kind(sbor::ValueKind::Array)?;
+        encoder.write_value_kind(sbor::ValueKind::Tuple)?; // element type
+        encoder.write_size(self.transactions.len())?;
+        for tx in &self.transactions {
+            encoder.encode_deeper_body(tx.as_ref())?;
+        }
+        encoder.encode(&self.committed_certificates)?;
+        encoder.encode(&self.deferred)?;
+        encoder.encode(&self.aborted)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D> for Block {
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+
+        if length != 5 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 5,
+                actual: length,
+            });
+        }
+
+        let header: BlockHeader = decoder.decode()?;
+
+        // Decode transactions as Vec<Arc<RoutableTransaction>>
+        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?; // element type
+        let tx_count = decoder.read_size()?;
+        let mut transactions = Vec::with_capacity(tx_count);
+        for _ in 0..tx_count {
+            let tx: RoutableTransaction =
+                decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+            transactions.push(Arc::new(tx));
+        }
+
+        let committed_certificates: Vec<TransactionCertificate> = decoder.decode()?;
+        let deferred: Vec<TransactionDefer> = decoder.decode()?;
+        let aborted: Vec<TransactionAbort> = decoder.decode()?;
+
+        Ok(Self {
+            header,
+            transactions,
+            committed_certificates,
+            deferred,
+            aborted,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for Block {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("Block", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
 }
 
 impl Block {

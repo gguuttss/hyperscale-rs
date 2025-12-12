@@ -426,7 +426,7 @@ impl BftState {
     ))]
     pub fn on_proposal_timer(
         &mut self,
-        mempool: &[RoutableTransaction],
+        mempool: &[Arc<RoutableTransaction>],
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<TransactionCertificate>,
@@ -486,10 +486,10 @@ impl BftState {
         };
 
         // Select transactions from mempool (limit by config)
-        let transactions: Vec<_> = mempool
+        let transactions: Vec<Arc<RoutableTransaction>> = mempool
             .iter()
             .take(self.config.max_transactions_per_block)
-            .cloned()
+            .map(Arc::clone)
             .collect();
 
         let timestamp = self.now.as_millis() as u64;
@@ -604,7 +604,7 @@ impl BftState {
             aborted_with_height.clone(),
         );
         for tx in &transactions {
-            pending.add_transaction(tx.clone());
+            pending.add_transaction_arc(Arc::clone(tx));
         }
         for cert in &committed_certificates {
             pending.add_certificate(cert.clone());
@@ -738,7 +738,7 @@ impl BftState {
         cert_hashes: Vec<Hash>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
-        mempool: &HashMap<Hash, RoutableTransaction>,
+        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
         certificates: &HashMap<Hash, TransactionCertificate>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -828,7 +828,7 @@ impl BftState {
         // Try to fill in transactions from mempool
         for tx_hash in &tx_hashes {
             if let Some(tx) = mempool.get(tx_hash) {
-                pending.add_transaction(tx.clone());
+                pending.add_transaction_arc(Arc::clone(tx));
             }
         }
 
@@ -1594,7 +1594,7 @@ impl BftState {
         &mut self,
         block_hash: Hash,
         qc: QuorumCertificate,
-        mempool: &[RoutableTransaction],
+        mempool: &[Arc<RoutableTransaction>],
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<TransactionCertificate>,
@@ -2050,7 +2050,7 @@ impl BftState {
     pub fn check_pending_blocks_for_transaction(
         &mut self,
         tx_hash: Hash,
-        mempool: &HashMap<Hash, RoutableTransaction>,
+        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -2064,9 +2064,8 @@ impl BftState {
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                // Try to add the transaction
                 if let Some(tx) = mempool.get(&tx_hash) {
-                    pending.add_transaction(tx.clone());
+                    pending.add_transaction_arc(Arc::clone(tx));
                 }
 
                 // Check if block is now complete

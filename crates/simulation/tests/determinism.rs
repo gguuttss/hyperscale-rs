@@ -6,6 +6,7 @@
 
 use hyperscale_core::Event;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
 
@@ -1154,17 +1155,17 @@ fn test_mempool_to_block_integration() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction { tx: tx1 },
+        Event::SubmitTransaction { tx: Arc::new(tx1) },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(51),
-        Event::SubmitTransaction { tx: tx2 },
+        Event::SubmitTransaction { tx: Arc::new(tx2) },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(52),
-        Event::SubmitTransaction { tx: tx3 },
+        Event::SubmitTransaction { tx: Arc::new(tx3) },
     );
 
     // Run for 100ms - before first proposal timer fires (100ms default)
@@ -1242,7 +1243,7 @@ fn test_execution_flow() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction { tx },
+        Event::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run for 2 seconds - should commit blocks and execute transactions
@@ -1290,7 +1291,7 @@ fn test_transaction_gossip() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(10),
-        Event::SubmitTransaction { tx },
+        Event::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run briefly - transaction should be in node 0's mempool

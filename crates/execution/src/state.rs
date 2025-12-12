@@ -67,7 +67,7 @@ pub struct ExecutionState {
     /// Pending single-shard executions waiting for callback.
     /// Maps block_hash -> list of single-shard transactions in that block.
     /// After execution completes, we create votes instead of direct certificates.
-    pending_single_shard_executions: HashMap<Hash, Vec<RoutableTransaction>>,
+    pending_single_shard_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
@@ -86,7 +86,7 @@ pub struct ExecutionState {
 
     /// Transactions waiting for provisioning to complete before execution.
     /// Maps tx_hash -> (transaction, block_height)
-    pending_provisioning: HashMap<Hash, (RoutableTransaction, u64)>,
+    pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
     /// Pending provision broadcasts waiting for state fetch.
     /// Maps tx_hash -> PendingProvisionBroadcast
@@ -274,7 +274,7 @@ impl ExecutionState {
         &mut self,
         block_hash: Hash,
         height: u64,
-        transactions: Vec<RoutableTransaction>,
+        transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -328,7 +328,7 @@ impl ExecutionState {
     /// This requires BLS signature aggregation for all transactions, not just cross-shard ones.
     fn start_single_shard_execution(
         &mut self,
-        tx: RoutableTransaction,
+        tx: Arc<RoutableTransaction>,
         _height: u64,
         block_hash: Hash,
     ) -> Vec<Action> {
@@ -424,7 +424,11 @@ impl ExecutionState {
     }
 
     /// Start cross-shard execution (2PC Phase 1: Provisioning).
-    fn start_cross_shard_execution(&mut self, tx: RoutableTransaction, height: u64) -> Vec<Action> {
+    fn start_cross_shard_execution(
+        &mut self,
+        tx: Arc<RoutableTransaction>,
+        height: u64,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
         let local_shard = self.local_shard();
@@ -801,7 +805,7 @@ impl ExecutionState {
     ///
     /// Emits `Action::ExecuteCrossShardTransaction` to delegate execution to the runner.
     /// When execution completes, `on_cross_shard_execution_complete` handles the result.
-    fn execute_with_provisions(&mut self, tx: RoutableTransaction) -> Vec<Action> {
+    fn execute_with_provisions(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let tx_hash = tx.hash();
         let local_shard = self.local_shard();
 
@@ -1565,7 +1569,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block committed with transaction
-        let actions = state.on_block_committed(block_hash, 1, vec![tx.clone()]);
+        let actions = state.on_block_committed(block_hash, 1, vec![Arc::new(tx.clone())]);
 
         // Should request execution (single-shard path) - now also sets up vote tracking
         assert!(!actions.is_empty());
@@ -1615,12 +1619,12 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // First commit - should produce status change + execute transaction actions
-        let actions1 = state.on_block_committed(block_hash, 1, vec![tx.clone()]);
+        let actions1 = state.on_block_committed(block_hash, 1, vec![Arc::new(tx.clone())]);
         assert!(!actions1.is_empty()); // Status change + execute
 
         // Second commit of same transaction
         let block_hash2 = Hash::from_bytes(b"block2");
-        let actions2 = state.on_block_committed(block_hash2, 2, vec![tx]);
+        let actions2 = state.on_block_committed(block_hash2, 2, vec![Arc::new(tx)]);
 
         // Should be empty (deduplicated)
         assert!(actions2.is_empty());

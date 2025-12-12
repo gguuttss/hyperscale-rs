@@ -912,7 +912,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(tx) = tx_receiver.recv().await {
             // Submit transaction via the proper submit path (emits status updates)
-            if let Err(e) = event_sender.send(Event::SubmitTransaction { tx }).await {
+            if let Err(e) = event_sender
+                .send(Event::SubmitTransaction {
+                    tx: std::sync::Arc::new(tx),
+                })
+                .await
+            {
                 warn!("Failed to forward RPC transaction: {}", e);
             }
         }

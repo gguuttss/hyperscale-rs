@@ -168,6 +168,7 @@ impl Simulator {
             for tx in batch {
                 let hash = tx.hash();
                 let target_shard = self.get_target_shard(&tx);
+                let tx = std::sync::Arc::new(tx);
 
                 // Submit to ALL validators in the shard to ensure the proposer has the tx.
                 // This mirrors real-world behavior where clients submit to multiple validators.
@@ -178,7 +179,9 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        Event::SubmitTransaction { tx: tx.clone() },
+                        Event::SubmitTransaction {
+                            tx: std::sync::Arc::clone(&tx),
+                        },
                     );
                 }
 

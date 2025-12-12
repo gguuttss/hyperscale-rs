@@ -37,7 +37,7 @@ impl LockContentionStats {
 /// Entry in the transaction pool.
 #[derive(Debug)]
 struct PoolEntry {
-    tx: RoutableTransaction,
+    tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
     #[allow(dead_code)]
     added_at: Duration,
@@ -56,7 +56,7 @@ pub struct MempoolState {
     ///
     /// When a deferral commits, the loser is added here with status Blocked.
     /// When the winner's certificate commits, we create a retry.
-    blocked_by: HashMap<Hash, (RoutableTransaction, Hash)>,
+    blocked_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash)>,
 
     /// Current time.
     now: Duration,
@@ -82,7 +82,7 @@ impl MempoolState {
 
     /// Handle transaction submission from client.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_submit_transaction(&mut self, tx: RoutableTransaction) -> Vec<Action> {
+    pub fn on_submit_transaction_arc(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let hash = tx.hash();
 
         // Check for duplicate
@@ -93,11 +93,10 @@ impl MempoolState {
             }];
         }
 
-        // Add to pool
         self.pool.insert(
             hash,
             PoolEntry {
-                tx: tx.clone(),
+                tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
                 added_at: self.now,
             },
@@ -119,9 +118,15 @@ impl MempoolState {
         actions
     }
 
+    /// Handle transaction submission from client.
+    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    pub fn on_submit_transaction(&mut self, tx: RoutableTransaction) -> Vec<Action> {
+        self.on_submit_transaction_arc(Arc::new(tx))
+    }
+
     /// Handle transaction received via gossip.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_transaction_gossip(&mut self, tx: RoutableTransaction) -> Vec<Action> {
+    pub fn on_transaction_gossip_arc(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let hash = tx.hash();
 
         // Ignore if already have it
@@ -129,7 +134,6 @@ impl MempoolState {
             return vec![];
         }
 
-        // Add to pool
         self.pool.insert(
             hash,
             PoolEntry {
@@ -144,13 +148,19 @@ impl MempoolState {
         }]
     }
 
+    /// Handle transaction received via gossip.
+    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    pub fn on_transaction_gossip(&mut self, tx: RoutableTransaction) -> Vec<Action> {
+        self.on_transaction_gossip_arc(Arc::new(tx))
+    }
+
     /// Broadcast a transaction to all shards involved in it.
     ///
     /// Uses topology to determine which shards need to receive the transaction
     /// based on its declared reads and writes.
-    fn broadcast_to_transaction_shards(&self, tx: &RoutableTransaction) -> Vec<Action> {
-        let shards = self.topology.all_shards_for_transaction(tx);
-        let gossip = hyperscale_messages::TransactionGossip::new(tx.clone());
+    fn broadcast_to_transaction_shards(&self, tx: &Arc<RoutableTransaction>) -> Vec<Action> {
+        let shards = self.topology.all_shards_for_transaction(tx.as_ref());
+        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
 
         shards
             .into_iter()
@@ -243,7 +253,7 @@ impl MempoolState {
 
                 // Track for retry when winner completes
                 self.blocked_by
-                    .insert(tx_hash, (entry.tx.clone(), *winner_tx_hash));
+                    .insert(tx_hash, (Arc::clone(&entry.tx), *winner_tx_hash));
 
                 return vec![Action::EmitTransactionStatus {
                     tx_hash,
@@ -276,12 +286,13 @@ impl MempoolState {
         }
 
         // Check if any blocked TXs were waiting for this winner
+        // TODO: Replace O(n) scan with reverse index (winner_hash -> Vec<loser_hash>)
         let blocked_losers: Vec<_> = self
             .blocked_by
             .iter()
             .filter(|(_, (_, winner))| *winner == tx_hash)
             .map(|(loser_hash, (loser_tx, winner_hash))| {
-                (*loser_hash, loser_tx.clone(), *winner_hash)
+                (*loser_hash, Arc::clone(loser_tx), *winner_hash)
             })
             .collect();
 
@@ -312,10 +323,11 @@ impl MempoolState {
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
+                let retry_tx = Arc::new(retry_tx);
                 self.pool.insert(
                     retry_hash,
                     PoolEntry {
-                        tx: retry_tx.clone(),
+                        tx: Arc::clone(&retry_tx),
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                     },
@@ -369,12 +381,13 @@ impl MempoolState {
         // Check if any blocked transactions were waiting for this winner to complete.
         // This triggers retries immediately when the winner executes, rather than
         // waiting for the certificate to be committed in a block.
+        // TODO: Replace O(n) scan with reverse index (winner_hash -> Vec<loser_hash>)
         let blocked_losers: Vec<_> = self
             .blocked_by
             .iter()
             .filter(|(_, (_, winner))| *winner == tx_hash)
             .map(|(loser_hash, (loser_tx, winner_hash))| {
-                (*loser_hash, loser_tx.clone(), *winner_hash)
+                (*loser_hash, Arc::clone(loser_tx), *winner_hash)
             })
             .collect();
 
@@ -406,10 +419,11 @@ impl MempoolState {
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
+                let retry_tx = Arc::new(retry_tx);
                 self.pool.insert(
                     retry_hash,
                     PoolEntry {
-                        tx: retry_tx.clone(),
+                        tx: Arc::clone(&retry_tx),
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                     },
@@ -525,17 +539,19 @@ impl MempoolState {
     ///
     /// The hash-ordering ensures different shards are more likely to pick
     /// the same transactions, reducing cycle formation in cross-shard execution.
-    pub fn ready_transactions(&self, max_count: usize) -> Vec<RoutableTransaction> {
+    pub fn ready_transactions(&self, max_count: usize) -> Vec<Arc<RoutableTransaction>> {
         // Get all nodes currently locked by in-flight transactions
+        // TODO: Cache locked_nodes() to avoid O(n) scan on every call
         let locked = self.locked_nodes();
 
         // Collect pending transactions that don't conflict
+        // TODO: Use partial sort / bounded heap to avoid sorting all txs
         let mut ready: Vec<_> = self
             .pool
             .values()
             .filter(|e| e.status == TransactionStatus::Pending)
             .filter(|e| !self.conflicts_with_locked(&e.tx, &locked))
-            .map(|e| e.tx.clone())
+            .map(|e| Arc::clone(&e.tx))
             .collect();
 
         // Sort by hash (ascending) - lower hashes are selected first
@@ -586,7 +602,12 @@ impl MempoolState {
 
     /// Get a transaction by hash.
     pub fn get_transaction(&self, hash: &Hash) -> Option<&RoutableTransaction> {
-        self.pool.get(hash).map(|e| &e.tx)
+        self.pool.get(hash).map(|e| e.tx.as_ref())
+    }
+
+    /// Get a transaction Arc by hash.
+    pub fn get_transaction_arc(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
+        self.pool.get(hash).map(|e| Arc::clone(&e.tx))
     }
 
     /// Get transaction status.
@@ -597,10 +618,10 @@ impl MempoolState {
     /// Get all transactions as a HashMap (for block header validation).
     ///
     /// This allows BFT to look up transactions by hash when receiving block headers.
-    pub fn transactions_by_hash(&self) -> HashMap<Hash, RoutableTransaction> {
+    pub fn transactions_by_hash(&self) -> HashMap<Hash, Arc<RoutableTransaction>> {
         self.pool
             .iter()
-            .map(|(hash, entry)| (*hash, entry.tx.clone()))
+            .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
             .collect()
     }
 
@@ -610,10 +631,10 @@ impl MempoolState {
     }
 
     /// Get the mempool as a hash map for BFT pending block completion.
-    pub fn as_hash_map(&self) -> std::collections::HashMap<Hash, RoutableTransaction> {
+    pub fn as_hash_map(&self) -> std::collections::HashMap<Hash, Arc<RoutableTransaction>> {
         self.pool
             .iter()
-            .map(|(hash, entry)| (*hash, entry.tx.clone()))
+            .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
             .collect()
     }
 
@@ -624,8 +645,10 @@ impl MempoolState {
 
     /// Get all incomplete transactions (not yet finalized or completed).
     ///
-    /// Returns tuples of (hash, status, transaction) for analysis.
-    pub fn incomplete_transactions(&self) -> Vec<(Hash, TransactionStatus, RoutableTransaction)> {
+    /// Returns tuples of (hash, status, transaction Arc) for analysis.
+    pub fn incomplete_transactions(
+        &self,
+    ) -> Vec<(Hash, TransactionStatus, Arc<RoutableTransaction>)> {
         self.pool
             .iter()
             .filter(|(_, entry)| {
@@ -634,7 +657,7 @@ impl MempoolState {
                     TransactionStatus::Executed(_) | TransactionStatus::Completed(_)
                 )
             })
-            .map(|(hash, entry)| (*hash, entry.status.clone(), entry.tx.clone()))
+            .map(|(hash, entry)| (*hash, entry.status.clone(), Arc::clone(&entry.tx)))
             .collect()
     }
 
@@ -717,8 +740,10 @@ impl MempoolState {
 impl SubStateMachine for MempoolState {
     fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
         match event {
-            Event::SubmitTransaction { tx } => Some(self.on_submit_transaction(tx.clone())),
-            Event::TransactionGossipReceived { tx } => Some(self.on_transaction_gossip(tx.clone())),
+            Event::SubmitTransaction { tx } => Some(self.on_submit_transaction_arc(Arc::clone(tx))),
+            Event::TransactionGossipReceived { tx } => {
+                Some(self.on_transaction_gossip_arc(Arc::clone(tx)))
+            }
             Event::BlockCommitted { block, .. } => {
                 // Process block fully including deferrals, certificates, and aborts
                 Some(self.on_block_committed_full(block))
@@ -778,7 +803,7 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
-            transactions,
+            transactions: transactions.into_iter().map(Arc::new).collect(),
             committed_certificates: certificates,
             deferred,
             aborted,

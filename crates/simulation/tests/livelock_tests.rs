@@ -22,6 +22,7 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
 
@@ -181,11 +182,15 @@ fn test_two_shard_cycle_detection() {
 
     // Submit both transactions nearly simultaneously to create cycle potential
     let submit_time = runner.now();
-    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx: tx_a });
+    runner.schedule_initial_event(
+        0,
+        submit_time,
+        Event::SubmitTransaction { tx: Arc::new(tx_a) },
+    );
     runner.schedule_initial_event(
         3,
         submit_time + Duration::from_millis(5),
-        Event::SubmitTransaction { tx: tx_b },
+        Event::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
     println!("\n✓ Conflicting transactions submitted\n");
@@ -360,7 +365,11 @@ fn test_retry_completion_after_winner() {
     println!("Cross-shard transaction: {:?}", tx_hash);
 
     let submit_time = runner.now();
-    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx });
+    runner.schedule_initial_event(
+        0,
+        submit_time,
+        Event::SubmitTransaction { tx: Arc::new(tx) },
+    );
 
     // Run and monitor
     let start_time = runner.now();
@@ -478,7 +487,7 @@ fn test_many_cross_shard_transactions() {
         runner.schedule_initial_event(
             0,
             runner.now() + Duration::from_millis(i as u64 * 100),
-            Event::SubmitTransaction { tx },
+            Event::SubmitTransaction { tx: Arc::new(tx) },
         );
     }
 
@@ -636,11 +645,15 @@ fn test_resolves_livelocks_in_under_x_seconds() {
 
     // Submit both transactions simultaneously to maximize cycle potential
     let submit_time = runner.now();
-    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx: tx_a });
+    runner.schedule_initial_event(
+        0,
+        submit_time,
+        Event::SubmitTransaction { tx: Arc::new(tx_a) },
+    );
     runner.schedule_initial_event(
         3,
         submit_time + Duration::from_millis(1), // Near-simultaneous
-        Event::SubmitTransaction { tx: tx_b },
+        Event::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
     println!("✓ Conflicting transactions submitted simultaneously");
@@ -895,7 +908,11 @@ fn test_timeout_abort_mechanism() {
     println!("Submitting cross-shard transaction: {:?}", tx_hash);
 
     let submit_time = runner.now();
-    runner.schedule_initial_event(0, submit_time, Event::SubmitTransaction { tx });
+    runner.schedule_initial_event(
+        0,
+        submit_time,
+        Event::SubmitTransaction { tx: Arc::new(tx) },
+    );
 
     // Run for extended period to allow timeout detection
     // Timeout is typically 30 blocks, and blocks are ~1s apart

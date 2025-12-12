@@ -1600,9 +1600,10 @@ impl ProductionRunner {
     ///
     /// The transaction status can be queried via the RPC status cache.
     pub async fn submit_transaction(&mut self, tx: RoutableTransaction) -> Result<(), RunnerError> {
-        // Send event to the state machine
         self.event_tx
-            .send(Event::SubmitTransaction { tx })
+            .send(Event::SubmitTransaction {
+                tx: std::sync::Arc::new(tx),
+            })
             .await
             .map_err(|e| RunnerError::SendError(e.to_string()))
     }

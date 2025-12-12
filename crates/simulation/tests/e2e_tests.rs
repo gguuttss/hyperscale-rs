@@ -22,6 +22,7 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
 
@@ -148,7 +149,7 @@ fn test_e2e_single_shard_transaction() {
         0,
         Duration::ZERO,
         Event::SubmitTransaction {
-            tx: transaction.clone(),
+            tx: Arc::new(transaction.clone()),
         },
     );
 
@@ -359,7 +360,7 @@ fn test_e2e_single_shard_determinism() {
         0,
         Duration::from_millis(100),
         Event::SubmitTransaction {
-            tx: transaction.clone(),
+            tx: Arc::new(transaction.clone()),
         },
     );
     runner1.run_until(Duration::from_secs(5));
@@ -376,7 +377,7 @@ fn test_e2e_single_shard_determinism() {
         0,
         Duration::from_millis(100),
         Event::SubmitTransaction {
-            tx: transaction.clone(),
+            tx: Arc::new(transaction.clone()),
         },
     );
     runner2.run_until(Duration::from_secs(5));
@@ -577,7 +578,9 @@ fn test_e2e_cross_shard_transaction() {
     runner.schedule_initial_event(
         0,
         submit_time,
-        Event::SubmitTransaction { tx: cross_shard_tx },
+        Event::SubmitTransaction {
+            tx: Arc::new(cross_shard_tx),
+        },
     );
 
     // Poll for transaction status progression
@@ -770,7 +773,7 @@ fn test_e2e_cross_shard_determinism() {
         0,
         Duration::from_millis(100),
         Event::SubmitTransaction {
-            tx: transaction.clone(),
+            tx: Arc::new(transaction.clone()),
         },
     );
     runner1.run_until(Duration::from_secs(5));
@@ -787,7 +790,7 @@ fn test_e2e_cross_shard_determinism() {
         0,
         Duration::from_millis(100),
         Event::SubmitTransaction {
-            tx: transaction.clone(),
+            tx: Arc::new(transaction.clone()),
         },
     );
     runner2.run_until(Duration::from_secs(5));
@@ -852,7 +855,7 @@ fn test_e2e_transaction_throughput() {
         runner.schedule_initial_event(
             (i % 4) as u32, // Distribute across validators
             Duration::from_millis(i as u64 * 50),
-            Event::SubmitTransaction { tx },
+            Event::SubmitTransaction { tx: Arc::new(tx) },
         );
     }
 
