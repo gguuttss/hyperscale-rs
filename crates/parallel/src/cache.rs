@@ -1,0 +1,363 @@
+//! Simulation cache for expensive computations shared across nodes.
+//!
+//! When multiple nodes in a shard perform identical operations (signature
+//! verification, transaction execution), the result is computed once and
+//! shared. This dramatically improves simulation performance at scale.
+
+use dashmap::DashMap;
+use hyperscale_engine::{CommittableSubstateDatabase, RadixExecutor};
+use hyperscale_simulation::SimStorage;
+use hyperscale_types::{Hash, NodeId, PublicKey, RoutableTransaction, Signature};
+use radix_common::network::NetworkDefinition;
+use std::sync::{Arc, Mutex};
+use tracing::warn;
+
+/// Cache for expensive computations shared across nodes.
+///
+/// When multiple nodes in a shard perform identical operations (signature
+/// verification, transaction execution), the result is computed once and
+/// shared. This dramatically improves simulation performance at scale.
+///
+/// For transaction execution, each shard has one executor and one reference
+/// storage. The first node to execute a block uses this shared executor,
+/// and results are cached for other nodes in the same shard.
+pub struct SimulationCache {
+    /// Cache of aggregated signature verifications: key -> valid
+    aggregated_sigs: DashMap<Hash, bool>,
+    /// Cache of block execution results: (shard_id, block_hash) -> results
+    /// Each shard executes independently, but validators within a shard share results.
+    block_executions: DashMap<(u64, Hash), Vec<hyperscale_types::ExecutionResult>>,
+    /// Cache of cross-shard transaction executions: (shard_id, tx_hash) -> result
+    cross_shard_executions: DashMap<(u64, Hash), hyperscale_types::ExecutionResult>,
+    /// Per-shard executor (one executor per shard).
+    /// Protected by mutex since execution mutates internal Radix state.
+    shard_executors: DashMap<u64, Arc<Mutex<RadixExecutor>>>,
+    /// Per-shard reference storage for execution.
+    /// This is the "canonical" storage used for execution reads.
+    shard_storage: DashMap<u64, Arc<Mutex<SimStorage>>>,
+}
+
+impl std::fmt::Debug for SimulationCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulationCache")
+            .field("aggregated_sigs", &self.aggregated_sigs.len())
+            .field("block_executions", &self.block_executions.len())
+            .field("cross_shard_executions", &self.cross_shard_executions.len())
+            .field("shard_executors", &self.shard_executors.len())
+            .field("shard_storage", &self.shard_storage.len())
+            .finish()
+    }
+}
+
+impl Default for SimulationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimulationCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self {
+            aggregated_sigs: DashMap::new(),
+            block_executions: DashMap::new(),
+            cross_shard_executions: DashMap::new(),
+            shard_executors: DashMap::new(),
+            shard_storage: DashMap::new(),
+        }
+    }
+
+    /// Initialize a shard's executor and storage.
+    ///
+    /// Must be called before any execution for this shard.
+    /// Runs Radix Engine genesis on the storage.
+    pub fn init_shard(&self, shard_id: u64) {
+        if self.shard_executors.contains_key(&shard_id) {
+            return; // Already initialized
+        }
+
+        let executor = RadixExecutor::new(NetworkDefinition::simulator());
+        let mut storage = SimStorage::new();
+
+        // Run genesis
+        if let Err(e) = executor.run_genesis(&mut storage) {
+            warn!(shard_id, "Radix Engine genesis failed: {:?}", e);
+            // Continue anyway - tests may not need full Radix state
+        }
+
+        self.shard_executors
+            .insert(shard_id, Arc::new(Mutex::new(executor)));
+        self.shard_storage
+            .insert(shard_id, Arc::new(Mutex::new(storage)));
+    }
+
+    /// Commit writes to a shard's reference storage.
+    ///
+    /// Called when a TransactionCertificate is persisted to apply state changes.
+    pub fn commit_writes(&self, shard_id: u64, writes: &[hyperscale_types::SubstateWrite]) {
+        if let Some(storage_ref) = self.shard_storage.get(&shard_id) {
+            if let Ok(mut storage) = storage_ref.lock() {
+                let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
+                storage.commit(&updates);
+            }
+        }
+    }
+
+    /// Compute a cache key from verification inputs.
+    fn sig_cache_key(
+        signing_message: &[u8],
+        signature: &Signature,
+        signer_keys: &[PublicKey],
+    ) -> Hash {
+        use std::hash::{Hash as StdHash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        signing_message.hash(&mut hasher);
+        signature.as_bytes().hash(&mut hasher);
+        for pk in signer_keys {
+            pk.as_bytes().hash(&mut hasher);
+        }
+        let h = hasher.finish();
+        Hash::from_bytes(&{
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&h.to_le_bytes());
+            bytes
+        })
+    }
+
+    /// Verify an aggregated signature, using cache if available.
+    pub fn verify_aggregated(
+        &self,
+        signer_keys: &[PublicKey],
+        message: &[u8],
+        signature: &Signature,
+    ) -> bool {
+        let key = Self::sig_cache_key(message, signature, signer_keys);
+
+        // Fast path: check cache
+        if let Some(valid) = self.aggregated_sigs.get(&key) {
+            return *valid;
+        }
+
+        // Slow path: compute and cache
+        let valid = if signer_keys.is_empty() {
+            *signature == Signature::zero()
+        } else {
+            match PublicKey::aggregate_bls(signer_keys) {
+                Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
+                Err(_) => false,
+            }
+        };
+
+        self.aggregated_sigs.insert(key, valid);
+        valid
+    }
+
+    /// Execute transactions for a block using the shared Radix executor.
+    ///
+    /// Results are cached per (shard_id, block_hash) so each shard executes
+    /// independently but validators within a shard share results.
+    pub fn execute_block(
+        &self,
+        shard_id: u64,
+        block_hash: Hash,
+        transactions: &[RoutableTransaction],
+    ) -> Vec<hyperscale_types::ExecutionResult> {
+        let key = (shard_id, block_hash);
+
+        // Fast path: check cache
+        if let Some(results) = self.block_executions.get(&key) {
+            return results.clone();
+        }
+
+        // Slow path: execute using shard's executor and storage
+        let results = self.do_execute_block(shard_id, transactions);
+        self.block_executions.insert(key, results.clone());
+        results
+    }
+
+    /// Internal: perform block execution using Radix engine.
+    fn do_execute_block(
+        &self,
+        shard_id: u64,
+        transactions: &[RoutableTransaction],
+    ) -> Vec<hyperscale_types::ExecutionResult> {
+        let executor_ref = match self.shard_executors.get(&shard_id) {
+            Some(e) => e,
+            None => {
+                warn!(shard_id, "No executor for shard, using mock results");
+                return transactions
+                    .iter()
+                    .map(|tx| hyperscale_types::ExecutionResult {
+                        transaction_hash: tx.hash(),
+                        success: true,
+                        state_root: Hash::ZERO,
+                        writes: vec![],
+                        error: None,
+                    })
+                    .collect();
+            }
+        };
+
+        let storage_ref = match self.shard_storage.get(&shard_id) {
+            Some(s) => s,
+            None => {
+                warn!(shard_id, "No storage for shard, using mock results");
+                return transactions
+                    .iter()
+                    .map(|tx| hyperscale_types::ExecutionResult {
+                        transaction_hash: tx.hash(),
+                        success: true,
+                        state_root: Hash::ZERO,
+                        writes: vec![],
+                        error: None,
+                    })
+                    .collect();
+            }
+        };
+
+        // Lock executor and storage for execution
+        let executor = executor_ref.lock().unwrap();
+        let storage = storage_ref.lock().unwrap();
+
+        match executor.execute_single_shard(&*storage, transactions) {
+            Ok(output) => output
+                .results()
+                .iter()
+                .map(|r| hyperscale_types::ExecutionResult {
+                    transaction_hash: r.tx_hash,
+                    success: r.success,
+                    state_root: r.outputs_merkle_root,
+                    writes: r.state_writes.clone(),
+                    error: r.error.clone(),
+                })
+                .collect(),
+            Err(e) => {
+                warn!(shard_id, "Execution failed: {:?}", e);
+                transactions
+                    .iter()
+                    .map(|tx| hyperscale_types::ExecutionResult {
+                        transaction_hash: tx.hash(),
+                        success: false,
+                        state_root: Hash::ZERO,
+                        writes: vec![],
+                        error: Some(format!("{:?}", e)),
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Execute a cross-shard transaction using the shared Radix executor.
+    pub fn execute_cross_shard(
+        &self,
+        shard_id: u64,
+        tx_hash: Hash,
+        transaction: &RoutableTransaction,
+        provisions: &[hyperscale_types::StateProvision],
+        is_local_node: impl Fn(&NodeId) -> bool,
+    ) -> hyperscale_types::ExecutionResult {
+        let key = (shard_id, tx_hash);
+
+        // Fast path: check cache
+        if let Some(result) = self.cross_shard_executions.get(&key) {
+            return result.clone();
+        }
+
+        // Slow path: execute using shard's executor and storage
+        let result = self.do_execute_cross_shard(shard_id, transaction, provisions, is_local_node);
+        self.cross_shard_executions.insert(key, result.clone());
+        result
+    }
+
+    /// Internal: perform cross-shard execution using Radix engine.
+    fn do_execute_cross_shard(
+        &self,
+        shard_id: u64,
+        transaction: &RoutableTransaction,
+        provisions: &[hyperscale_types::StateProvision],
+        is_local_node: impl Fn(&NodeId) -> bool,
+    ) -> hyperscale_types::ExecutionResult {
+        let executor_ref = match self.shard_executors.get(&shard_id) {
+            Some(e) => e,
+            None => {
+                warn!(shard_id, "No executor for shard");
+                return hyperscale_types::ExecutionResult {
+                    transaction_hash: transaction.hash(),
+                    success: true,
+                    state_root: Hash::ZERO,
+                    writes: vec![],
+                    error: None,
+                };
+            }
+        };
+
+        let storage_ref = match self.shard_storage.get(&shard_id) {
+            Some(s) => s,
+            None => {
+                warn!(shard_id, "No storage for shard");
+                return hyperscale_types::ExecutionResult {
+                    transaction_hash: transaction.hash(),
+                    success: true,
+                    state_root: Hash::ZERO,
+                    writes: vec![],
+                    error: None,
+                };
+            }
+        };
+
+        let executor = executor_ref.lock().unwrap();
+        let storage = storage_ref.lock().unwrap();
+
+        match executor.execute_cross_shard(
+            &*storage,
+            std::slice::from_ref(transaction),
+            provisions,
+            is_local_node,
+        ) {
+            Ok(output) => {
+                if let Some(r) = output.results().first() {
+                    hyperscale_types::ExecutionResult {
+                        transaction_hash: r.tx_hash,
+                        success: r.success,
+                        state_root: r.outputs_merkle_root,
+                        writes: r.state_writes.clone(),
+                        error: r.error.clone(),
+                    }
+                } else {
+                    hyperscale_types::ExecutionResult {
+                        transaction_hash: transaction.hash(),
+                        success: false,
+                        state_root: Hash::ZERO,
+                        writes: vec![],
+                        error: Some("No execution result".to_string()),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(shard_id, "Cross-shard execution failed: {:?}", e);
+                hyperscale_types::ExecutionResult {
+                    transaction_hash: transaction.hash(),
+                    success: false,
+                    state_root: Hash::ZERO,
+                    writes: vec![],
+                    error: Some(format!("{:?}", e)),
+                }
+            }
+        }
+    }
+
+    /// Get number of cached signature verifications.
+    pub fn sig_cache_len(&self) -> usize {
+        self.aggregated_sigs.len()
+    }
+
+    /// Get number of cached block executions.
+    pub fn block_cache_len(&self) -> usize {
+        self.block_executions.len()
+    }
+
+    /// Get number of cached cross-shard executions.
+    pub fn cross_shard_cache_len(&self) -> usize {
+        self.cross_shard_executions.len()
+    }
+}

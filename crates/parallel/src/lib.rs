@@ -48,11 +48,13 @@
 //! routes messages between nodes. Crypto verification is done inline
 //! (synchronous) and timers fire instantly.
 
+mod cache;
 mod config;
 mod metrics;
 mod router;
 mod simulator;
 
+pub use cache::SimulationCache;
 pub use config::ParallelConfig;
 pub use metrics::{
     MetricsCollector, MetricsEvent, MetricsRx, MetricsTx, SharedMetrics, SimulationReport,

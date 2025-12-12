@@ -14,6 +14,7 @@
 //!
 //! Events enqueued during processing wait until the next step.
 
+use crate::cache::SimulationCache;
 use crate::config::ParallelConfig;
 use crate::metrics::SimulationReport;
 use crate::router::Destination;
@@ -22,9 +23,9 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, KeyPair, PartitionNumber, PublicKey, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, Signature, StaticTopology, Topology, TransactionDecision,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, BlockHeader, BlockHeight, Hash, KeyPair, NodeId, PartitionNumber, PublicKey,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StaticTopology, Topology,
+    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -164,7 +165,7 @@ impl SimNode {
     /// realistic timing where internal event propagation takes some time.
     ///
     /// Returns the number of events processed.
-    pub fn process_events(&mut self) -> usize {
+    pub fn process_events(&mut self, cache: &SimulationCache) -> usize {
         let mut processed = 0;
 
         // Snapshot queue lengths - only process events queued before this call
@@ -175,7 +176,7 @@ impl SimNode {
         // Process internal events first (highest priority)
         for _ in 0..internal_count {
             if let Some(event) = self.internal_queue.pop_front() {
-                self.handle_event(event);
+                self.handle_event(event, cache);
                 processed += 1;
             }
         }
@@ -184,7 +185,7 @@ impl SimNode {
         for _ in 0..inbound_count {
             if let Some(msg) = self.inbound_queue.pop_front() {
                 let event = msg.to_received_event();
-                self.handle_event(event);
+                self.handle_event(event, cache);
                 processed += 1;
             }
         }
@@ -192,7 +193,7 @@ impl SimNode {
         // Process transaction submissions
         for _ in 0..tx_count {
             if let Some(event) = self.tx_queue.pop_front() {
-                self.handle_event(event);
+                self.handle_event(event, cache);
                 processed += 1;
             }
         }
@@ -235,18 +236,18 @@ impl SimNode {
     }
 
     /// Handle a single event.
-    fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event, cache: &SimulationCache) {
         // Process through state machine (time is set by advance_time)
         let actions = self.state.handle(event);
 
         // Execute actions
         for action in actions {
-            self.execute_action(action);
+            self.execute_action(action, cache);
         }
     }
 
     /// Execute an action from the state machine.
-    fn execute_action(&mut self, action: Action) {
+    fn execute_action(&mut self, action: Action, cache: &SimulationCache) {
         match action {
             Action::BroadcastToShard { shard, message } => {
                 self.outbound_messages
@@ -317,11 +318,8 @@ impl SimNode {
                     .filter(|(i, _)| certificate.signers.is_set(*i))
                     .map(|(_, pk)| pk.clone())
                     .collect();
-                let valid = Self::verify_aggregated_signature(
-                    &signer_keys,
-                    &msg,
-                    &certificate.aggregated_signature,
-                );
+                let valid =
+                    cache.verify_aggregated(&signer_keys, &msg, &certificate.aggregated_signature);
                 self.internal_queue
                     .push_back(Event::StateCertificateSignatureVerified { certificate, valid });
             }
@@ -341,7 +339,7 @@ impl SimNode {
                 let valid = if signer_keys.is_empty() {
                     false
                 } else {
-                    Self::verify_aggregated_signature(
+                    cache.verify_aggregated(
                         &signer_keys,
                         &signing_message,
                         &qc.aggregated_signature,
@@ -375,7 +373,7 @@ impl SimNode {
                 let valid = if signer_keys.is_empty() {
                     vote.highest_qc.is_genesis()
                 } else {
-                    Self::verify_aggregated_signature(
+                    cache.verify_aggregated(
                         &signer_keys,
                         &signing_message,
                         &vote.highest_qc.aggregated_signature,
@@ -396,7 +394,7 @@ impl SimNode {
                     .filter(|(i, _)| certificate.signers.is_set(*i))
                     .map(|(_, pk)| pk.clone())
                     .collect();
-                let valid = Self::verify_aggregated_signature(
+                let valid = cache.verify_aggregated(
                     &signer_keys,
                     &signing_message,
                     &certificate.aggregated_signature,
@@ -408,36 +406,39 @@ impl SimNode {
                     });
             }
 
-            // Transaction execution - simplified
+            // Transaction execution - cached per shard using real Radix engine.
+            // All validators in a shard execute the same block, so results are cached.
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,
                 ..
             } => {
-                let results = transactions
-                    .iter()
-                    .map(|tx| hyperscale_types::ExecutionResult {
-                        transaction_hash: tx.hash(),
-                        success: true,
-                        state_root: Hash::ZERO,
-                        writes: vec![],
-                        error: None,
-                    })
-                    .collect();
+                let shard_id = self.state.shard().0;
+                let results = cache.execute_block(shard_id, block_hash, &transactions);
                 self.internal_queue.push_back(Event::TransactionsExecuted {
                     block_hash,
                     results,
                 });
             }
 
-            Action::ExecuteCrossShardTransaction { tx_hash, .. } => {
-                let result = hyperscale_types::ExecutionResult {
-                    transaction_hash: tx_hash,
-                    success: true,
-                    state_root: Hash::ZERO,
-                    writes: vec![],
-                    error: None,
+            Action::ExecuteCrossShardTransaction {
+                tx_hash,
+                transaction,
+                provisions,
+            } => {
+                let shard_id = self.state.shard().0;
+                let local_shard = self.state.shard();
+                let topology = self.state.topology();
+                let is_local_node = |node_id: &NodeId| -> bool {
+                    topology.shard_for_node_id(node_id) == local_shard
                 };
+                let result = cache.execute_cross_shard(
+                    shard_id,
+                    tx_hash,
+                    &transaction,
+                    &provisions,
+                    is_local_node,
+                );
                 self.internal_queue
                     .push_back(Event::CrossShardTransactionExecuted { tx_hash, result });
             }
@@ -462,8 +463,11 @@ impl SimNode {
                     .iter()
                     .find(|(shard, _)| **shard == local_shard)
                 {
+                    // Commit to node's local storage
                     self.storage
                         .commit_certificate_with_writes(&certificate, &proof.state_writes);
+                    // Also commit to the shared cache storage so future executions see the state
+                    cache.commit_writes(local_shard.0, &proof.state_writes);
                 } else {
                     self.storage
                         .put_certificate(certificate.transaction_hash, certificate);
@@ -526,21 +530,6 @@ impl SimNode {
             }
         }
     }
-
-    fn verify_aggregated_signature(
-        signer_keys: &[PublicKey],
-        message: &[u8],
-        signature: &Signature,
-    ) -> bool {
-        if signer_keys.is_empty() {
-            *signature == Signature::zero()
-        } else {
-            match PublicKey::aggregate_bls(signer_keys) {
-                Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
-                Err(_) => false,
-            }
-        }
-    }
 }
 
 /// Parallel simulator using rayon for multi-core CPU parallelism.
@@ -577,6 +566,8 @@ pub struct ParallelSimulator {
     network: SimulatedNetwork,
     /// RNG for network latency jitter (seeded for determinism).
     rng: ChaCha8Rng,
+    /// Shared cache for signature verifications and execution results.
+    simulation_cache: Arc<SimulationCache>,
 }
 
 impl ParallelSimulator {
@@ -599,6 +590,7 @@ impl ParallelSimulator {
             pending_messages: MessageQueue::new(),
             network,
             rng,
+            simulation_cache: Arc::new(SimulationCache::new()),
         }
     }
 
@@ -702,6 +694,15 @@ impl ParallelSimulator {
             }
         }
 
+        // Initialize Radix Engine executors for each shard
+        for shard_id in 0..num_shards {
+            self.simulation_cache.init_shard(shard_id as u64);
+        }
+        info!(
+            num_shards,
+            "Radix Engine executors initialized for all shards"
+        );
+
         // Initialize genesis for each shard
         for shard_id in 0..num_shards {
             let genesis_header = BlockHeader {
@@ -728,7 +729,7 @@ impl ParallelSimulator {
                 let node = &mut self.nodes[node_index];
                 let actions = node.state.initialize_genesis(genesis_block.clone());
                 for action in actions {
-                    node.execute_action(action);
+                    node.execute_action(action, &self.simulation_cache);
                 }
             }
         }
@@ -779,10 +780,11 @@ impl ParallelSimulator {
         }
 
         // Step 3: Process all nodes in parallel (single pass)
+        let cache = &self.simulation_cache;
         let events_processed: usize = self
             .nodes
             .par_iter_mut()
-            .map(|node| node.process_events())
+            .map(|node| node.process_events(cache))
             .sum();
 
         // Step 4: Collect outbound messages from all nodes
