@@ -184,13 +184,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let selection_mode = parse_selection_mode(&selection)?;
 
+            // Clamp batch size to target TPS to avoid sending more txns than intended
+            let effective_batch_size = batch_size.min(tps as usize).max(1);
+
             let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
                 .with_target_tps(tps)
                 .with_cross_shard_ratio(cross_shard_ratio)
                 .with_accounts_per_shard(accounts_per_shard)
                 .with_selection_mode(selection_mode)
-                .with_batch_size(batch_size)
+                .with_batch_size(effective_batch_size)
                 .with_network(NetworkDefinition::simulator());
 
             if measure_latency {
