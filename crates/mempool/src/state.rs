@@ -58,6 +58,10 @@ pub struct MempoolState {
     /// When the winner's certificate commits, we create a retry.
     blocked_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash)>,
 
+    /// Reverse index: winner_tx_hash -> Vec<loser_tx_hash>
+    /// Allows O(1) lookup of all losers blocked by a winner.
+    blocked_losers_by_winner: HashMap<Hash, Vec<Hash>>,
+
     /// Current time.
     now: Duration,
 
@@ -74,6 +78,7 @@ impl MempoolState {
         Self {
             pool: HashMap::new(),
             blocked_by: HashMap::new(),
+            blocked_losers_by_winner: HashMap::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -255,6 +260,12 @@ impl MempoolState {
                 self.blocked_by
                     .insert(tx_hash, (Arc::clone(&entry.tx), *winner_tx_hash));
 
+                // Maintain reverse index for O(1) lookup
+                self.blocked_losers_by_winner
+                    .entry(*winner_tx_hash)
+                    .or_default()
+                    .push(tx_hash);
+
                 return vec![Action::EmitTransactionStatus {
                     tx_hash,
                     status: new_status,
@@ -285,18 +296,17 @@ impl MempoolState {
             });
         }
 
-        // Check if any blocked TXs were waiting for this winner
-        // TODO: Replace O(n) scan with reverse index (winner_hash -> Vec<loser_hash>)
-        let blocked_losers: Vec<_> = self
-            .blocked_by
-            .iter()
-            .filter(|(_, (_, winner))| *winner == tx_hash)
-            .map(|(loser_hash, (loser_tx, winner_hash))| {
-                (*loser_hash, Arc::clone(loser_tx), *winner_hash)
-            })
-            .collect();
+        // Check if any blocked TXs were waiting for this winner using reverse index (O(1) lookup)
+        let loser_hashes = self
+            .blocked_losers_by_winner
+            .remove(&tx_hash)
+            .unwrap_or_default();
 
-        for (loser_hash, loser_tx, winner_hash) in blocked_losers {
+        for loser_hash in loser_hashes {
+            // Get the loser transaction from blocked_by
+            let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) else {
+                continue;
+            };
             // Create retry transaction
             let retry_tx = loser_tx.create_retry(winner_hash, height);
             let retry_hash = retry_tx.hash();
@@ -318,8 +328,7 @@ impl MempoolState {
                 });
             }
 
-            // Remove from blocked tracking
-            self.blocked_by.remove(&loser_hash);
+            // Note: loser_hash already removed from blocked_by above
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
@@ -381,18 +390,18 @@ impl MempoolState {
         // Check if any blocked transactions were waiting for this winner to complete.
         // This triggers retries immediately when the winner executes, rather than
         // waiting for the certificate to be committed in a block.
-        // TODO: Replace O(n) scan with reverse index (winner_hash -> Vec<loser_hash>)
-        let blocked_losers: Vec<_> = self
-            .blocked_by
-            .iter()
-            .filter(|(_, (_, winner))| *winner == tx_hash)
-            .map(|(loser_hash, (loser_tx, winner_hash))| {
-                (*loser_hash, Arc::clone(loser_tx), *winner_hash)
-            })
-            .collect();
+        // Using reverse index for O(1) lookup
+        let loser_hashes = self
+            .blocked_losers_by_winner
+            .remove(&tx_hash)
+            .unwrap_or_default();
 
         let height = self.current_height;
-        for (loser_hash, loser_tx, winner_hash) in blocked_losers {
+        for loser_hash in loser_hashes {
+            // Get the loser transaction from blocked_by
+            let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) else {
+                continue;
+            };
             // Create retry transaction
             let retry_tx = loser_tx.create_retry(winner_hash, height);
             let retry_hash = retry_tx.hash();
@@ -414,8 +423,7 @@ impl MempoolState {
                 });
             }
 
-            // Remove from blocked tracking
-            self.blocked_by.remove(&loser_hash);
+            // Note: loser_hash already removed from blocked_by above
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
