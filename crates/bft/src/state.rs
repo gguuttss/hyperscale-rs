@@ -1020,9 +1020,9 @@ impl BftState {
             return actions;
         }
 
-        // Block not complete yet - start a timer to fetch missing transactions if needed
-        // Check if we're only missing transactions (not certificates)
+        // Block not complete yet - start timers to fetch missing data
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            // Start transaction fetch timer if missing transactions
             if pending.missing_transaction_count() > 0 {
                 debug!(
                     validator = ?self.validator_id(),
@@ -1033,6 +1033,20 @@ impl BftState {
                 actions.push(Action::SetTimer {
                     id: TimerId::TransactionFetch { block_hash },
                     duration: self.config.transaction_fetch_timeout,
+                });
+            }
+
+            // Start certificate fetch timer if missing certificates
+            if pending.missing_certificate_count() > 0 {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_cert_count = pending.missing_certificate_count(),
+                    "Starting certificate fetch timer for incomplete block"
+                );
+                actions.push(Action::SetTimer {
+                    id: TimerId::CertificateFetch { block_hash },
+                    duration: self.config.certificate_fetch_timeout,
                 });
             }
         }
@@ -2480,6 +2494,122 @@ impl BftState {
             validator = ?validator_id,
             block_hash = ?block_hash,
             "Pending block completed after transaction fetch"
+        );
+
+        // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+        self.trigger_qc_verification_or_vote(block_hash)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Certificate Fetch Protocol
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Handle certificate fetch timer expiry.
+    ///
+    /// If the pending block is still missing certificates, emit CertificateNeeded
+    /// so the runner can request them from a peer.
+    pub fn on_certificate_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
+        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+            // Block no longer pending (completed or removed)
+            return vec![];
+        };
+
+        if pending.is_complete() {
+            // Block is now complete, no fetch needed
+            return vec![];
+        }
+
+        let missing = pending.missing_certificates();
+        if missing.is_empty() {
+            // Only missing transactions, not certificates
+            return vec![];
+        }
+
+        let proposer = pending.header().proposer;
+
+        info!(
+            validator = ?self.validator_id(),
+            block_hash = ?block_hash,
+            proposer = ?proposer,
+            missing_count = missing.len(),
+            "Certificate fetch timer fired - requesting missing certificates"
+        );
+
+        vec![Action::EnqueueInternal {
+            event: Event::CertificateNeeded {
+                block_hash,
+                proposer,
+                missing_cert_hashes: missing,
+            },
+        }]
+    }
+
+    /// Handle certificates received from a fetch request.
+    ///
+    /// Adds the fetched certificates to the pending block and triggers
+    /// voting if the block is now complete.
+    ///
+    /// Note: Certificates should be verified by the caller before passing here.
+    /// This method assumes the certificates have been validated.
+    pub fn on_certificate_fetch_received(
+        &mut self,
+        block_hash: Hash,
+        certificates: Vec<Arc<TransactionCertificate>>,
+    ) -> Vec<Action> {
+        let validator_id = self.validator_id();
+
+        // First phase: add certificates and check state
+        let (added, still_missing, is_complete, needs_construct) = {
+            let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
+                debug!(
+                    block_hash = ?block_hash,
+                    "Received fetched certificates for unknown/completed block"
+                );
+                return vec![];
+            };
+
+            let mut added = 0;
+            for cert in certificates {
+                if pending.add_certificate(cert) {
+                    added += 1;
+                }
+            }
+
+            let still_missing = pending.missing_certificate_count();
+            let is_complete = pending.is_complete();
+            let needs_construct = is_complete && pending.block().is_none();
+
+            (added, still_missing, is_complete, needs_construct)
+        };
+
+        debug!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            added = added,
+            still_missing = still_missing,
+            "Added fetched certificates to pending block"
+        );
+
+        // Check if block is now complete
+        if !is_complete {
+            // Still missing transactions or certificates
+            return vec![];
+        }
+
+        // Second phase: construct block if needed
+        if needs_construct {
+            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                if let Err(e) = pending.construct_block() {
+                    warn!("Failed to construct block after cert fetch: {}", e);
+                    return vec![];
+                }
+            }
+        }
+
+        info!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            "Pending block completed after certificate fetch"
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)

@@ -3,8 +3,10 @@
 //! These messages are sent in reply to request messages.
 
 mod block;
+mod certificate;
 mod sync;
 mod transaction;
 
 pub use block::GetBlockResponse;
+pub use certificate::GetCertificatesResponse;
 pub use transaction::GetTransactionsResponse;

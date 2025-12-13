@@ -295,4 +295,82 @@ mod tests {
 
         assert!(pb.is_complete());
     }
+
+    #[test]
+    fn test_pending_block_with_certificates() {
+        let tx1 = Hash::from_bytes(b"tx1");
+        let cert1 = Hash::from_bytes(b"cert1");
+        let cert2 = Hash::from_bytes(b"cert2");
+        let header = make_header(1);
+
+        let pb = PendingBlock::new(header, vec![tx1], vec![cert1, cert2]);
+
+        assert_eq!(pb.missing_transaction_count(), 1);
+        assert_eq!(pb.missing_certificate_count(), 2);
+        assert!(!pb.is_complete());
+    }
+
+    #[test]
+    fn test_add_certificate() {
+        use hyperscale_types::{TransactionCertificate, TransactionDecision};
+        use std::collections::BTreeMap;
+
+        let cert_hash = Hash::from_bytes(b"cert1");
+        let header = make_header(1);
+
+        let mut pb = PendingBlock::new(header, vec![], vec![cert_hash]);
+
+        assert_eq!(pb.missing_certificate_count(), 1);
+        assert!(!pb.is_complete());
+
+        // Create a test certificate
+        let cert = TransactionCertificate {
+            transaction_hash: cert_hash,
+            decision: TransactionDecision::Accept,
+            shard_proofs: BTreeMap::new(),
+        };
+
+        // Add the certificate
+        let added = pb.add_certificate(Arc::new(cert));
+        assert!(added);
+
+        assert_eq!(pb.missing_certificate_count(), 0);
+        assert!(pb.is_complete());
+    }
+
+    #[test]
+    fn test_block_needs_both_transactions_and_certificates() {
+        use hyperscale_types::{
+            test_utils::test_transaction, TransactionCertificate, TransactionDecision,
+        };
+        use std::collections::BTreeMap;
+
+        // Create a test transaction
+        let tx = Arc::new(test_transaction(1));
+        let tx_hash = tx.hash();
+
+        let cert_hash = Hash::from_bytes(b"cert1");
+        let header = make_header(1);
+
+        let mut pb = PendingBlock::new(header, vec![tx_hash], vec![cert_hash]);
+
+        assert!(!pb.has_all_transactions());
+        assert!(!pb.is_complete());
+
+        // Add transaction
+        pb.add_transaction_arc(tx);
+
+        assert!(pb.has_all_transactions());
+        assert!(!pb.is_complete()); // Still missing certificate
+
+        // Add certificate
+        let cert = TransactionCertificate {
+            transaction_hash: cert_hash,
+            decision: TransactionDecision::Accept,
+            shard_proofs: BTreeMap::new(),
+        };
+        pb.add_certificate(Arc::new(cert));
+
+        assert!(pb.is_complete());
+    }
 }

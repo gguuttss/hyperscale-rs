@@ -3,8 +3,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash,
     QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate, StateEntry,
-    StateProvision, StateVoteBlock, TransactionAbort, TransactionDefer, ValidatorId,
-    ViewChangeCertificate, ViewChangeVote,
+    StateProvision, StateVoteBlock, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, ViewChangeCertificate, ViewChangeVote,
 };
 use std::sync::Arc;
 
@@ -527,6 +527,54 @@ pub enum Event {
         /// The fetched transactions.
         transactions: Vec<Arc<RoutableTransaction>>,
     },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Certificate Fetch Protocol (priority: Internal/Network)
+    // Used when block header arrives but certificates are missing locally
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Timer fired for fetching missing certificates (priority: Timer).
+    ///
+    /// If a pending block is still missing certificates after the timeout,
+    /// we request them from the proposer or a peer.
+    CertificateTimer {
+        /// Hash of the block that needs certificates.
+        block_hash: Hash,
+    },
+
+    /// Request to fetch missing certificates for a pending block (priority: Internal).
+    ///
+    /// Triggered when CertificateTimer fires and block is still incomplete.
+    /// The runner handles peer selection and makes the request.
+    CertificateNeeded {
+        /// Hash of the block that needs these certificates.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing certificates (transaction hashes).
+        missing_cert_hashes: Vec<Hash>,
+    },
+
+    /// Received certificates from a fetch request (priority: Network).
+    ///
+    /// Delivered by the runner after fetching from a peer.
+    /// Each certificate must be verified before use.
+    CertificateReceived {
+        /// Hash of the block these certificates are for.
+        block_hash: Hash,
+        /// The fetched certificates.
+        certificates: Vec<TransactionCertificate>,
+    },
+
+    /// A fetched certificate has been verified (priority: Internal).
+    ///
+    /// Emitted after all embedded StateCertificate signatures in a
+    /// TransactionCertificate have been verified against topology.
+    FetchedCertificateVerified {
+        /// Hash of the block this certificate is for.
+        block_hash: Hash,
+        /// The verified certificate.
+        certificate: TransactionCertificate,
+    },
 }
 
 impl Event {
@@ -602,6 +650,12 @@ impl Event {
             Event::TransactionTimer { .. } => EventPriority::Timer,
             Event::TransactionNeeded { .. } => EventPriority::Internal,
             Event::TransactionReceived { .. } => EventPriority::Network,
+
+            // Certificate fetch events
+            Event::CertificateTimer { .. } => EventPriority::Timer,
+            Event::CertificateNeeded { .. } => EventPriority::Internal,
+            Event::CertificateReceived { .. } => EventPriority::Network,
+            Event::FetchedCertificateVerified { .. } => EventPriority::Internal,
         }
     }
 
@@ -700,6 +754,12 @@ impl Event {
             Event::TransactionTimer { .. } => "TransactionTimer",
             Event::TransactionNeeded { .. } => "TransactionNeeded",
             Event::TransactionReceived { .. } => "TransactionReceived",
+
+            // Certificate Fetch Protocol
+            Event::CertificateTimer { .. } => "CertificateTimer",
+            Event::CertificateNeeded { .. } => "CertificateNeeded",
+            Event::CertificateReceived { .. } => "CertificateReceived",
+            Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
         }
     }
 }

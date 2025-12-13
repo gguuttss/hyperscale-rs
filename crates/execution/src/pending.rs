@@ -5,9 +5,10 @@
 //! an event back and we look up the pending state to continue processing.
 
 use hyperscale_types::{
-    BlockHeight, NodeId, RoutableTransaction, ShardGroupId, StateCertificate, StateProvision,
-    StateVoteBlock,
+    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateCertificate, StateProvision,
+    StateVoteBlock, TransactionCertificate,
 };
+use std::collections::HashSet;
 
 /// Tracks a pending provision broadcast waiting for state fetch.
 ///
@@ -58,4 +59,21 @@ pub struct PendingStateVoteVerification {
 pub struct PendingCertificateVerification {
     /// The certificate awaiting verification.
     pub certificate: StateCertificate,
+}
+
+/// Tracks a fetched TransactionCertificate awaiting verification.
+///
+/// A TransactionCertificate contains multiple StateCertificates (one per shard).
+/// We must verify each embedded StateCertificate's signature before using
+/// the TransactionCertificate to complete a pending block.
+#[derive(Debug, Clone)]
+pub struct PendingFetchedCertificateVerification {
+    /// The full TransactionCertificate being verified.
+    pub certificate: TransactionCertificate,
+    /// Block hash this certificate is needed for.
+    pub block_hash: Hash,
+    /// Shards whose StateCertificates still need verification.
+    pub pending_shards: HashSet<ShardGroupId>,
+    /// Whether any shard verification has failed.
+    pub has_failed: bool,
 }

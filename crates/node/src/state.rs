@@ -746,6 +746,69 @@ impl StateMachine for NodeStateMachine {
                     .bft
                     .on_transaction_fetch_received(*block_hash, transactions.clone());
             }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Certificate Fetch Protocol
+            // ═══════════════════════════════════════════════════════════════════════
+            Event::CertificateTimer { block_hash } => {
+                return self.bft.on_certificate_fetch_timer(*block_hash);
+            }
+
+            Event::CertificateNeeded {
+                block_hash,
+                proposer,
+                missing_cert_hashes,
+            } => {
+                // The runner will handle this by making a request to the proposer or peers.
+                // Return an action that signals the runner to fetch certificates.
+                tracing::info!(
+                    block_hash = ?block_hash,
+                    proposer = ?proposer,
+                    missing_count = missing_cert_hashes.len(),
+                    "Certificate fetch needed - runner should request from peer"
+                );
+                // Return the event as-is in an action for the runner to handle.
+                // The runner will make the network request and deliver CertificateReceived.
+                return vec![Action::EnqueueInternal {
+                    event: Event::CertificateNeeded {
+                        block_hash: *block_hash,
+                        proposer: *proposer,
+                        missing_cert_hashes: missing_cert_hashes.clone(),
+                    },
+                }];
+            }
+
+            Event::CertificateReceived {
+                block_hash,
+                certificates,
+            } => {
+                // Verify each fetched certificate's embedded StateCertificates against
+                // our current topology. This ensures we don't accept forged certificates
+                // from Byzantine peers.
+                let mut actions = Vec::new();
+                for cert in certificates {
+                    actions.extend(
+                        self.execution
+                            .verify_fetched_certificate(*block_hash, cert.clone()),
+                    );
+                }
+                return actions;
+            }
+
+            Event::FetchedCertificateVerified {
+                block_hash,
+                certificate,
+            } => {
+                // Cancel local certificate building - we're using the fetched one
+                self.execution
+                    .cancel_certificate_building(&certificate.transaction_hash);
+
+                // Certificate has been verified - add to pending block
+                return self.bft.on_certificate_fetch_received(
+                    *block_hash,
+                    vec![std::sync::Arc::new(certificate.clone())],
+                );
+            }
         }
 
         // Event not handled by any sub-machine

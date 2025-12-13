@@ -104,6 +104,22 @@ pub struct InboundTransactionRequest {
     pub channel_id: u64,
 }
 
+/// An inbound certificate fetch request from another peer.
+///
+/// The runner receives this, looks up the requested certificates from execution state,
+/// and sends the response via `Libp2pAdapter::send_certificate_response()`.
+#[derive(Debug)]
+pub struct InboundCertificateRequest {
+    /// The requesting peer.
+    pub peer: Libp2pPeerId,
+    /// The block hash the certificates are for.
+    pub block_hash: hyperscale_types::Hash,
+    /// The certificate hashes being requested (transaction hashes).
+    pub cert_hashes: Vec<hyperscale_types::Hash>,
+    /// Opaque response channel ID (used to send the response).
+    pub channel_id: u64,
+}
+
 /// Commands sent to the swarm task.
 enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
@@ -145,6 +161,17 @@ enum SwarmCommand {
 
     /// Send a response to a transaction request (by channel ID).
     SendTransactionResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Request certificates from a peer (for pending block completion).
+    RequestCertificates {
+        peer: Libp2pPeerId,
+        block_hash: hyperscale_types::Hash,
+        cert_hashes: Vec<hyperscale_types::Hash>,
+        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
+    },
+
+    /// Send a response to a certificate request (by channel ID).
+    SendCertificateResponse { channel_id: u64, response: Vec<u8> },
 }
 
 /// Network errors.
@@ -315,6 +342,10 @@ pub struct Libp2pAdapter {
     #[allow(dead_code)]
     tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
 
+    /// Channel for inbound certificate fetch requests (sent to runner for processing).
+    #[allow(dead_code)]
+    cert_request_tx: mpsc::Sender<InboundCertificateRequest>,
+
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
@@ -335,9 +366,10 @@ impl Libp2pAdapter {
     ///
     /// # Returns
     ///
-    /// A tuple of (adapter, sync_request_rx, tx_request_rx) where:
+    /// A tuple of (adapter, sync_request_rx, tx_request_rx, cert_request_rx) where:
     /// - sync_request_rx receives inbound sync block requests
-    /// - tx_request_rx receives inbound transaction fetch requests (higher priority)
+    /// - tx_request_rx receives inbound transaction fetch requests
+    /// - cert_request_rx receives inbound certificate fetch requests
     pub async fn new(
         config: Libp2pConfig,
         keypair: identity::Keypair,
@@ -351,6 +383,7 @@ impl Libp2pAdapter {
             Arc<Self>,
             mpsc::Receiver<InboundSyncRequest>,
             mpsc::Receiver<InboundTransactionRequest>,
+            mpsc::Receiver<InboundCertificateRequest>,
         ),
         NetworkError,
     > {
@@ -438,6 +471,7 @@ impl Libp2pAdapter {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(100); // Buffer for inbound sync requests
         let (tx_request_tx, tx_request_rx) = mpsc::channel(100); // Buffer for inbound transaction requests
+        let (cert_request_tx, cert_request_rx) = mpsc::channel(100); // Buffer for inbound certificate requests
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {
@@ -453,6 +487,7 @@ impl Libp2pAdapter {
             shutdown_tx: Some(shutdown_tx),
             sync_request_tx: sync_request_tx.clone(),
             tx_request_tx: tx_request_tx.clone(),
+            cert_request_tx: cert_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
         });
 
@@ -468,12 +503,13 @@ impl Libp2pAdapter {
             shutdown_rx,
             sync_request_tx,
             tx_request_tx,
+            cert_request_tx,
             rate_limit_config,
             tx_validator,
             cached_peer_count,
         ));
 
-        Ok((adapter, sync_request_rx, tx_request_rx))
+        Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
     }
 
     /// Register a validator's peer ID mapping.
@@ -708,6 +744,50 @@ impl Libp2pAdapter {
             .map_err(|_| NetworkError::NetworkShutdown)
     }
 
+    /// Request certificates from a peer for pending block completion.
+    ///
+    /// Returns the raw response bytes. The caller is responsible for decoding.
+    pub async fn request_certificates(
+        &self,
+        peer: Libp2pPeerId,
+        block_hash: hyperscale_types::Hash,
+        cert_hashes: Vec<hyperscale_types::Hash>,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.command_tx
+            .send(SwarmCommand::RequestCertificates {
+                peer,
+                block_hash,
+                cert_hashes,
+                response_tx: tx,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)?;
+
+        // Wait for response with timeout
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_) => Err(NetworkError::Timeout),
+        }
+    }
+
+    /// Send a certificate response for an inbound request.
+    ///
+    /// The `channel_id` comes from the inbound request.
+    pub fn send_certificate_response(
+        &self,
+        channel_id: u64,
+        response: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        self.command_tx
+            .send(SwarmCommand::SendCertificateResponse {
+                channel_id,
+                response,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)
+    }
+
     /// Background event loop that processes swarm events and routes messages.
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
@@ -719,6 +799,7 @@ impl Libp2pAdapter {
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
         tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
+        cert_request_tx: mpsc::Sender<InboundCertificateRequest>,
         rate_limit_config: RateLimitConfig,
         tx_validator: Arc<TransactionValidation>,
         cached_peer_count: Arc<AtomicUsize>,
@@ -767,6 +848,7 @@ impl Libp2pAdapter {
                         &mut next_channel_id,
                         &sync_request_tx,
                         &tx_request_tx,
+                        &cert_request_tx,
                         &mut rate_limiter,
                         &tx_validator,
                     ).await;
@@ -888,6 +970,42 @@ impl Libp2pAdapter {
                     warn!(channel_id, "Unknown channel ID for transaction response");
                 }
             }
+            SwarmCommand::RequestCertificates {
+                peer,
+                block_hash,
+                cert_hashes,
+                response_tx,
+            } => {
+                // Encode certificate request using SBOR
+                use hyperscale_messages::request::GetCertificatesRequest;
+                let request = GetCertificatesRequest::new(block_hash, cert_hashes);
+                let data = sbor::basic_encode(&request).unwrap_or_default();
+                let req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, data);
+                pending_requests.insert(req_id, response_tx);
+                debug!(
+                    "Sent certificate request to {:?} for block {:?}",
+                    peer, block_hash
+                );
+            }
+            SwarmCommand::SendCertificateResponse {
+                channel_id,
+                response,
+            } => {
+                if let Some(channel) = pending_response_channels.remove(&channel_id) {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, response)
+                    {
+                        warn!("Failed to send certificate response: {:?}", e);
+                    }
+                } else {
+                    warn!(channel_id, "Unknown channel ID for certificate response");
+                }
+            }
         }
     }
 
@@ -906,6 +1024,7 @@ impl Libp2pAdapter {
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::Sender<InboundSyncRequest>,
         tx_request_tx: &mpsc::Sender<InboundTransactionRequest>,
+        cert_request_tx: &mpsc::Sender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
         tx_validator: &Arc<TransactionValidation>,
     ) {
@@ -1138,45 +1257,73 @@ impl Libp2pAdapter {
                         pending_response_channels.remove(&channel_id);
                     }
                 } else if request.len() > 8 {
-                    // Transaction fetch request - decode and send to runner
-                    use hyperscale_messages::request::GetTransactionsRequest;
+                    // Try to decode as transaction or certificate fetch request
+                    use hyperscale_messages::request::{
+                        GetCertificatesRequest, GetTransactionsRequest,
+                    };
 
-                    match sbor::basic_decode::<GetTransactionsRequest>(&request) {
-                        Ok(tx_request) => {
-                            // Allocate a channel ID and store the response channel
-                            let channel_id = *next_channel_id;
-                            *next_channel_id = next_channel_id.wrapping_add(1);
-                            pending_response_channels.insert(channel_id, channel);
+                    if let Ok(tx_request) = sbor::basic_decode::<GetTransactionsRequest>(&request) {
+                        // Transaction fetch request
+                        let channel_id = *next_channel_id;
+                        *next_channel_id = next_channel_id.wrapping_add(1);
+                        pending_response_channels.insert(channel_id, channel);
 
-                            debug!(
-                                peer = %peer,
-                                block_hash = ?tx_request.block_hash,
-                                tx_count = tx_request.tx_hashes.len(),
-                                channel_id = channel_id,
-                                is_validator = is_validator,
-                                "Received transaction fetch request"
-                            );
+                        debug!(
+                            peer = %peer,
+                            block_hash = ?tx_request.block_hash,
+                            tx_count = tx_request.tx_hashes.len(),
+                            channel_id = channel_id,
+                            is_validator = is_validator,
+                            "Received transaction fetch request"
+                        );
 
-                            // Send to runner for processing
-                            let inbound_request = InboundTransactionRequest {
-                                peer,
-                                block_hash: tx_request.block_hash,
-                                tx_hashes: tx_request.tx_hashes,
+                        let inbound_request = InboundTransactionRequest {
+                            peer,
+                            block_hash: tx_request.block_hash,
+                            tx_hashes: tx_request.tx_hashes,
+                            channel_id,
+                        };
+
+                        if tx_request_tx.send(inbound_request).await.is_err() {
+                            warn!(
                                 channel_id,
-                            };
+                                "Failed to send transaction request to runner (channel full or closed)"
+                            );
+                            pending_response_channels.remove(&channel_id);
+                        }
+                    } else if let Ok(cert_request) =
+                        sbor::basic_decode::<GetCertificatesRequest>(&request)
+                    {
+                        // Certificate fetch request
+                        let channel_id = *next_channel_id;
+                        *next_channel_id = next_channel_id.wrapping_add(1);
+                        pending_response_channels.insert(channel_id, channel);
 
-                            if tx_request_tx.send(inbound_request).await.is_err() {
-                                warn!(
-                                    channel_id,
-                                    "Failed to send transaction request to runner (channel full or closed)"
-                                );
-                                // Remove the channel since we can't process this request
-                                pending_response_channels.remove(&channel_id);
-                            }
+                        debug!(
+                            peer = %peer,
+                            block_hash = ?cert_request.block_hash,
+                            cert_count = cert_request.cert_hashes.len(),
+                            channel_id = channel_id,
+                            is_validator = is_validator,
+                            "Received certificate fetch request"
+                        );
+
+                        let inbound_request = InboundCertificateRequest {
+                            peer,
+                            block_hash: cert_request.block_hash,
+                            cert_hashes: cert_request.cert_hashes,
+                            channel_id,
+                        };
+
+                        if cert_request_tx.send(inbound_request).await.is_err() {
+                            warn!(
+                                channel_id,
+                                "Failed to send certificate request to runner (channel full or closed)"
+                            );
+                            pending_response_channels.remove(&channel_id);
                         }
-                        Err(e) => {
-                            warn!(peer = %peer, error = ?e, "Failed to decode transaction request");
-                        }
+                    } else {
+                        warn!(peer = %peer, len = request.len(), "Failed to decode request (not tx or cert)");
                     }
                 } else {
                     warn!(peer = %peer, len = request.len(), "Invalid request (too short)");

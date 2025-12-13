@@ -52,4 +52,10 @@ pub enum TimerId {
         /// The block hash that needs transactions fetched.
         block_hash: hyperscale_types::Hash,
     },
+    /// Certificate fetch timer for a specific block.
+    /// Fires after a timeout if pending block is still missing certificates.
+    CertificateFetch {
+        /// The block hash that needs certificates fetched.
+        block_hash: hyperscale_types::Hash,
+    },
 }

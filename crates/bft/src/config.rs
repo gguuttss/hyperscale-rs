@@ -27,6 +27,11 @@ pub struct BftConfig {
     /// If a pending block is still incomplete after this duration, request
     /// the missing transactions directly from the proposer or a peer.
     pub transaction_fetch_timeout: Duration,
+
+    /// Timeout before fetching missing certificates from peers.
+    /// If a pending block is still missing certificates after this duration,
+    /// request them directly from the proposer or a peer.
+    pub certificate_fetch_timeout: Duration,
 }
 
 impl Default for BftConfig {
@@ -39,6 +44,7 @@ impl Default for BftConfig {
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(50),
+            certificate_fetch_timeout: Duration::from_millis(100),
         }
     }
 }

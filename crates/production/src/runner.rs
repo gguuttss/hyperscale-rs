@@ -1,8 +1,8 @@
 //! Production runner implementation.
 
 use crate::network::{
-    compute_peer_id_for_validator, InboundSyncRequest, InboundTransactionRequest, Libp2pAdapter,
-    Libp2pConfig, NetworkError,
+    compute_peer_id_for_validator, InboundCertificateRequest, InboundSyncRequest,
+    InboundTransactionRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::storage::RocksDbStorage;
@@ -348,7 +348,7 @@ impl ProductionRunnerBuilder {
 
         // Create network adapter with transaction validation
         // Pass both channels - consensus for BFT messages, transaction for mempool
-        let (network, sync_request_rx, tx_request_rx) = Libp2pAdapter::new(
+        let (network, sync_request_rx, tx_request_rx, cert_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
@@ -402,6 +402,7 @@ impl ProductionRunnerBuilder {
             genesis_config: self.genesis_config,
             sync_request_rx,
             tx_request_rx,
+            cert_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
         })
@@ -470,6 +471,8 @@ pub struct ProductionRunner {
     sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
     /// Inbound transaction fetch request channel (from network adapter).
     tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
+    /// Inbound certificate fetch request channel (from network adapter).
+    cert_request_rx: mpsc::Receiver<InboundCertificateRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
@@ -728,6 +731,17 @@ impl ProductionRunner {
                                 continue;
                             }
 
+                            // Check for CertificateNeeded - handle specially (network fetch)
+                            if let Event::CertificateNeeded {
+                                block_hash,
+                                proposer,
+                                missing_cert_hashes,
+                            } = event
+                            {
+                                self.handle_certificate_fetch_needed(block_hash, proposer, missing_cert_hashes).await;
+                                continue;
+                            }
+
                             // Process event synchronously (fast)
                             let actions = {
                                 let sm_span = span!(Level::DEBUG, "state_machine.handle");
@@ -867,6 +881,24 @@ impl ProductionRunner {
                     let _tx_guard = tx_span.enter();
 
                     self.handle_inbound_transaction_request(request);
+                    // Reset batch counter - we yielded, now back to prioritizing consensus
+                    consensus_batch_count = 0;
+                }
+
+                // HIGH PRIORITY: Handle inbound certificate fetch requests from peers
+                // These are needed for active consensus, so process before sync
+                Some(request) = self.cert_request_rx.recv() => {
+                    let cert_span = span!(
+                        Level::DEBUG,
+                        "handle_cert_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        cert_count = request.cert_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _cert_guard = cert_span.enter();
+
+                    self.handle_inbound_certificate_request(request);
                     // Reset batch counter - we yielded, now back to prioritizing consensus
                     consensus_batch_count = 0;
                 }
@@ -2034,6 +2066,141 @@ impl ProductionRunner {
                 channel_id = channel_id,
                 error = ?e,
                 "Failed to send transaction response"
+            );
+        }
+    }
+
+    /// Handle a CertificateNeeded event - fetch missing certificates from the proposer.
+    ///
+    /// Makes an outbound request to the proposer to get the missing certificates,
+    /// then delivers them to the state machine via CertificateReceived.
+    async fn handle_certificate_fetch_needed(
+        &self,
+        block_hash: Hash,
+        proposer: ValidatorId,
+        missing_cert_hashes: Vec<Hash>,
+    ) {
+        use hyperscale_messages::response::GetCertificatesResponse;
+
+        tracing::info!(
+            block_hash = ?block_hash,
+            proposer = ?proposer,
+            missing_count = missing_cert_hashes.len(),
+            "Fetching missing certificates from proposer"
+        );
+
+        // Get the peer ID for the proposer
+        let Some(peer_id) = self.network.peer_for_validator(proposer).await else {
+            tracing::warn!(
+                proposer = ?proposer,
+                "Cannot fetch certificates: proposer peer ID not known"
+            );
+            return;
+        };
+
+        // Make the request to the proposer
+        match self
+            .network
+            .request_certificates(peer_id, block_hash, missing_cert_hashes.clone())
+            .await
+        {
+            Ok(response_bytes) => {
+                // Decode the response
+                match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {
+                    Ok(response) => {
+                        let cert_count = response.count();
+                        tracing::info!(
+                            block_hash = ?block_hash,
+                            received = cert_count,
+                            requested = missing_cert_hashes.len(),
+                            "Received certificates from proposer"
+                        );
+
+                        if cert_count > 0 {
+                            // Send to state machine for verification
+                            let event = Event::CertificateReceived {
+                                block_hash,
+                                certificates: response.into_certificates(),
+                            };
+
+                            if let Err(e) = self.consensus_tx.send(event).await {
+                                tracing::error!(error = ?e, "Failed to send CertificateReceived event");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            block_hash = ?block_hash,
+                            error = ?e,
+                            "Failed to decode certificate fetch response"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    block_hash = ?block_hash,
+                    proposer = ?proposer,
+                    error = ?e,
+                    "Failed to fetch certificates from proposer"
+                );
+            }
+        }
+    }
+
+    /// Handle an inbound certificate fetch request from a peer.
+    ///
+    /// Looks up requested certificates from execution state and sends them back.
+    fn handle_inbound_certificate_request(&self, request: InboundCertificateRequest) {
+        use hyperscale_messages::response::GetCertificatesResponse;
+
+        let channel_id = request.channel_id;
+
+        tracing::debug!(
+            peer = %request.peer,
+            block_hash = ?request.block_hash,
+            cert_count = request.cert_hashes.len(),
+            channel_id = channel_id,
+            "Handling inbound certificate request"
+        );
+
+        // Look up certificates from execution state
+        let execution = self.state.execution();
+        let mut found_certificates = Vec::new();
+
+        for cert_hash in &request.cert_hashes {
+            if let Some(cert) = execution.get_finalized_certificate(cert_hash) {
+                found_certificates.push((*cert).clone());
+            }
+        }
+
+        tracing::debug!(
+            block_hash = ?request.block_hash,
+            requested = request.cert_hashes.len(),
+            found = found_certificates.len(),
+            "Responding to certificate fetch request"
+        );
+
+        // Encode the response
+        let response = GetCertificatesResponse::new(found_certificates);
+        let response_bytes = match sbor::basic_encode(&response) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to encode certificate response");
+                sbor::basic_encode(&GetCertificatesResponse::empty()).unwrap_or_default()
+            }
+        };
+
+        // Send response via network adapter
+        if let Err(e) = self
+            .network
+            .send_certificate_response(channel_id, response_bytes)
+        {
+            tracing::warn!(
+                block_hash = ?request.block_hash,
+                channel_id = channel_id,
+                error = ?e,
+                "Failed to send certificate response"
             );
         }
     }

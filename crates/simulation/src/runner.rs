@@ -610,9 +610,21 @@ impl SimulationRunner {
                     None
                 };
 
+                // CertificateNeeded: the runner fetches certificates from peers
+                let cert_fetch_info = if let Event::CertificateNeeded {
+                    block_hash,
+                    proposer,
+                    missing_cert_hashes,
+                } = &event
+                {
+                    Some((*block_hash, *proposer, missing_cert_hashes.clone()))
+                } else {
+                    None
+                };
+
                 // Schedule the event so the state machine knows about it
-                // (Skip TransactionNeeded as we handle it directly)
-                if tx_fetch_info.is_none() {
+                // (Skip TransactionNeeded and CertificateNeeded as we handle them directly)
+                if tx_fetch_info.is_none() && cert_fetch_info.is_none() {
                     self.schedule_event(from, self.now, event);
                 }
 
@@ -628,6 +640,16 @@ impl SimulationRunner {
                         block_hash,
                         proposer,
                         missing_tx_hashes,
+                    );
+                }
+
+                // If it was a certificate fetch request, fetch from proposer's execution state
+                if let Some((block_hash, proposer, missing_cert_hashes)) = cert_fetch_info {
+                    self.handle_certificate_fetch_needed(
+                        from,
+                        block_hash,
+                        proposer,
+                        missing_cert_hashes,
                     );
                 }
             }
@@ -1270,6 +1292,68 @@ impl SimulationRunner {
         self.schedule_event(node, self.now, event);
     }
 
+    /// Handle certificate fetch needed: fetch missing certificates from proposer's execution state.
+    ///
+    /// In production, this would make a network request to the proposer or peers.
+    /// In simulation, we look up certificates from the proposer's execution state directly.
+    pub fn handle_certificate_fetch_needed(
+        &mut self,
+        node: NodeIndex,
+        block_hash: hyperscale_types::Hash,
+        proposer: ValidatorId,
+        missing_cert_hashes: Vec<hyperscale_types::Hash>,
+    ) {
+        // Find the proposer's node index
+        let proposer_node = proposer.0 as NodeIndex;
+
+        if proposer_node as usize >= self.nodes.len() {
+            warn!(
+                node = node,
+                proposer = ?proposer,
+                "Certificate fetch: proposer node not found"
+            );
+            return;
+        }
+
+        // Look up certificates from proposer's execution state
+        let mut found_certificates = Vec::new();
+        {
+            let proposer_state = &self.nodes[proposer_node as usize];
+            let execution = proposer_state.execution();
+
+            for cert_hash in &missing_cert_hashes {
+                if let Some(cert) = execution.get_finalized_certificate(cert_hash) {
+                    found_certificates.push((*cert).clone());
+                }
+            }
+        }
+
+        if found_certificates.is_empty() {
+            debug!(
+                node = node,
+                block_hash = ?block_hash,
+                missing_count = missing_cert_hashes.len(),
+                "Certificate fetch: no certificates found in proposer's execution state"
+            );
+            return;
+        }
+
+        debug!(
+            node = node,
+            block_hash = ?block_hash,
+            found_count = found_certificates.len(),
+            missing_count = missing_cert_hashes.len(),
+            "Certificate fetch: delivering fetched certificates"
+        );
+
+        // Deliver the certificates to the requesting node for verification
+        let event = Event::CertificateReceived {
+            block_hash,
+            certificates: found_certificates,
+        };
+        self.schedule_event(node, self.now, event);
+    }
+
     /// Schedule an event.
     fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: Event) -> EventKey {
         self.sequence += 1;
@@ -1342,6 +1426,7 @@ impl SimulationRunner {
             TimerId::Cleanup => Event::CleanupTimer,
             TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
             TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
+            TimerId::CertificateFetch { block_hash } => Event::CertificateTimer { block_hash },
         }
     }
 
