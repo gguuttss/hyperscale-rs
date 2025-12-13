@@ -184,6 +184,11 @@ impl StateMachine for NodeStateMachine {
             Event::ProposalTimer => {
                 // Check if we should advance the round due to timeout
                 if self.should_advance_round() {
+                    // Reset the timeout so we don't immediately trigger another view change.
+                    // Without this, every subsequent timer tick (every 300ms) would trigger
+                    // another view change since last_qc_time would still be stale.
+                    self.last_qc_time = self.now;
+
                     let max_txs = self.bft.config().max_transactions_per_block;
                     let txs = self.mempool.ready_transactions(max_txs);
                     let deferred = self.livelock.get_pending_deferrals();
