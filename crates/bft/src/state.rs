@@ -1134,9 +1134,29 @@ impl BftState {
     ///
     /// This validation prevents proposers from manipulating consensus time while
     /// allowing for reasonable clock drift between validators.
+    ///
+    /// # Special Cases
+    ///
+    /// - **Genesis blocks**: Skip validation (timestamp is fixed at 0)
+    /// - **Fallback blocks**: Skip validation (they inherit parent's weighted timestamp,
+    ///   which may be older than the delay threshold during extended view changes)
     fn validate_timestamp(&self, header: &BlockHeader) -> Result<(), String> {
         // Skip timestamp validation for genesis blocks (timestamp is fixed at 0)
         if header.is_genesis() {
+            return Ok(());
+        }
+
+        // Skip timestamp validation for fallback blocks.
+        //
+        // Fallback blocks inherit their parent's weighted_timestamp_ms to prevent
+        // time manipulation during view changes. This timestamp may be older than
+        // max_timestamp_delay_ms if multiple view changes occur in succession.
+        //
+        // This is safe because:
+        // 1. Fallback blocks are empty (no transactions) so they can't manipulate state
+        // 2. The timestamp comes from a QC, which was already validated
+        // 3. The weighted timestamp will be corrected when normal blocks resume
+        if header.is_fallback {
             return Ok(());
         }
 
@@ -2769,6 +2789,47 @@ mod tests {
         // Just past max rush (102.001 seconds) - should fail
         let header = make_header_at_height(1, 102_001);
         assert!(state.validate_timestamp(&header).is_err());
+    }
+
+    #[test]
+    fn test_timestamp_validation_skips_fallback_blocks() {
+        let mut state = make_test_state();
+        // Set clock to 100 seconds
+        state.set_time(Duration::from_secs(100));
+
+        // Fallback block with very old timestamp (50 seconds, which would normally fail)
+        // This simulates a fallback block inheriting parent's weighted_timestamp after
+        // multiple view changes spanning more than max_timestamp_delay_ms (30s)
+        let header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 50_000, // 50 seconds - would fail normal validation (now=100s, max_delay=30s)
+            round: 5,          // High round indicates view changes occurred
+            is_fallback: true,
+        };
+
+        // Should pass - fallback blocks skip timestamp validation
+        assert!(
+            state.validate_timestamp(&header).is_ok(),
+            "Fallback blocks should skip timestamp validation"
+        );
+
+        // Verify that a non-fallback block with the same timestamp would fail
+        let normal_header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 50_000,
+            round: 5,
+            is_fallback: false,
+        };
+        assert!(
+            state.validate_timestamp(&normal_header).is_err(),
+            "Non-fallback blocks with old timestamps should fail validation"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
