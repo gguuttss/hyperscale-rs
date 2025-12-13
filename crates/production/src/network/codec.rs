@@ -17,7 +17,7 @@
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_messages::gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
-    StateVoteBlockGossip, TransactionGossip, ViewChangeCertificateGossip, ViewChangeVoteGossip,
+    StateVoteBlockGossip, TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
 use hyperscale_types::ShardGroupId;
@@ -54,10 +54,6 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
             OutboundMessage::BlockHeader(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::BlockVote(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::ViewChangeVote(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::ViewChangeCertificate(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::StateProvision(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
@@ -136,24 +132,8 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
                 trace_context: None,
             })
         }
-        "view_change.vote" => {
-            let gossip: ViewChangeVoteGossip = sbor::basic_decode(payload)
-                .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
-            Ok(DecodedMessage {
-                event: Event::ViewChangeVoteReceived { vote: gossip.vote },
-                trace_context: None,
-            })
-        }
-        "view_change.certificate" => {
-            let gossip: ViewChangeCertificateGossip = sbor::basic_decode(payload)
-                .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
-            Ok(DecodedMessage {
-                event: Event::ViewChangeCertificateReceived {
-                    cert: gossip.certificate,
-                },
-                trace_context: None,
-            })
-        }
+        // Note: view_change.vote and view_change.certificate topics removed
+        // Using HotStuff-2 implicit rounds instead
         "state.provision" => {
             let gossip: StateProvisionGossip = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
@@ -218,8 +198,6 @@ pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crat
     match message {
         OutboundMessage::BlockHeader(_) => Topic::block_header(shard),
         OutboundMessage::BlockVote(_) => Topic::block_vote(shard),
-        OutboundMessage::ViewChangeVote(_) => Topic::view_change_vote(shard),
-        OutboundMessage::ViewChangeCertificate(_) => Topic::view_change_certificate(shard),
         OutboundMessage::StateProvision(_) => Topic::state_provision(shard),
         OutboundMessage::StateVoteBlock(_) => Topic::state_vote(shard),
         OutboundMessage::StateCertificate(_) => Topic::state_certificate(shard),

@@ -78,6 +78,10 @@ pub struct SimulationRunner {
     /// Seen message cache for deduplication (matches libp2p gossipsub behavior).
     /// Key is hash of (recipient, message_hash) to deduplicate per-node.
     seen_messages: HashSet<u64>,
+
+    /// Per-node sync targets. Maps node index to sync target height.
+    /// Used by the runner to track sync progress (replaces SyncState tracking).
+    sync_targets: HashMap<NodeIndex, u64>,
 }
 
 /// Statistics collected during simulation.
@@ -222,6 +226,7 @@ impl SimulationRunner {
             genesis_executed,
             traffic_analyzer: None,
             seen_messages: HashSet::new(),
+            sync_targets: HashMap::new(),
         }
     }
 
@@ -536,9 +541,8 @@ impl SimulationRunner {
             // This handles the case where sync was triggered before target blocks were
             // available on peers. As other nodes commit blocks and broadcast headers,
             // new blocks become available for sync.
-            let node = &self.nodes[node_index as usize];
-            if let Some(sync_target) = node.sync().sync_target() {
-                let current_height = node.bft().committed_height();
+            if let Some(&sync_target) = self.sync_targets.get(&node_index) {
+                let current_height = self.nodes[node_index as usize].bft().committed_height();
                 if current_height < sync_target {
                     self.handle_sync_needed(node_index, sync_target);
                 }
@@ -591,67 +595,47 @@ impl SimulationRunner {
             Action::EnqueueInternal { event } => {
                 // Special handling for events that require runner I/O
 
-                // SyncNeeded: the runner fetches blocks directly
-                let sync_target = if let Event::SyncNeeded { target_height, .. } = &event {
-                    Some(*target_height)
-                } else {
-                    None
-                };
+                // SyncNeeded: the runner fetches blocks directly and sends SyncBlockReadyToApply
+                // Don't pass to state machine - runner handles everything
+                if let Event::SyncNeeded { target_height, .. } = &event {
+                    self.handle_sync_needed(from, *target_height);
+                    return; // Skip scheduling to state machine
+                }
 
                 // TransactionNeeded: the runner fetches transactions from peers
-                let tx_fetch_info = if let Event::TransactionNeeded {
+                if let Event::TransactionNeeded {
                     block_hash,
                     proposer,
                     missing_tx_hashes,
                 } = &event
                 {
-                    Some((*block_hash, *proposer, missing_tx_hashes.clone()))
-                } else {
-                    None
-                };
+                    self.handle_transaction_fetch_needed(
+                        from,
+                        *block_hash,
+                        *proposer,
+                        missing_tx_hashes.clone(),
+                    );
+                    return; // Skip scheduling to state machine
+                }
 
                 // CertificateNeeded: the runner fetches certificates from peers
-                let cert_fetch_info = if let Event::CertificateNeeded {
+                if let Event::CertificateNeeded {
                     block_hash,
                     proposer,
                     missing_cert_hashes,
                 } = &event
                 {
-                    Some((*block_hash, *proposer, missing_cert_hashes.clone()))
-                } else {
-                    None
-                };
-
-                // Schedule the event so the state machine knows about it
-                // (Skip TransactionNeeded and CertificateNeeded as we handle them directly)
-                if tx_fetch_info.is_none() && cert_fetch_info.is_none() {
-                    self.schedule_event(from, self.now, event);
-                }
-
-                // If it was a sync request, fetch the blocks (runner owns sync I/O)
-                if let Some(target_height) = sync_target {
-                    self.handle_sync_needed(from, target_height);
-                }
-
-                // If it was a transaction fetch request, fetch from proposer's mempool
-                if let Some((block_hash, proposer, missing_tx_hashes)) = tx_fetch_info {
-                    self.handle_transaction_fetch_needed(
-                        from,
-                        block_hash,
-                        proposer,
-                        missing_tx_hashes,
-                    );
-                }
-
-                // If it was a certificate fetch request, fetch from proposer's execution state
-                if let Some((block_hash, proposer, missing_cert_hashes)) = cert_fetch_info {
                     self.handle_certificate_fetch_needed(
                         from,
-                        block_hash,
-                        proposer,
-                        missing_cert_hashes,
+                        *block_hash,
+                        *proposer,
+                        missing_cert_hashes.clone(),
                     );
+                    return; // Skip scheduling to state machine
                 }
+
+                // Other internal events get scheduled normally
+                self.schedule_event(from, self.now, event);
             }
 
             // Delegated work executes instantly in simulation
@@ -778,75 +762,7 @@ impl SimulationRunner {
                 );
             }
 
-            Action::VerifyViewChangeVoteSignature {
-                vote,
-                public_key,
-                signing_message,
-            } => {
-                // In simulation, verify the signature instantly
-                let valid = public_key.verify(&signing_message, &vote.signature);
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::ViewChangeVoteSignatureVerified { vote, valid },
-                );
-            }
-
-            Action::VerifyViewChangeHighestQc {
-                vote,
-                public_keys,
-                signing_message,
-            } => {
-                // Verify aggregated BLS signature on the highest_qc
-                let signer_keys: Vec<_> = public_keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
-                    .collect();
-
-                // Verify against domain-separated signing message
-                let valid = if signer_keys.is_empty() {
-                    false
-                } else {
-                    match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                        Ok(aggregated_pk) => aggregated_pk
-                            .verify(&signing_message, &vote.highest_qc.aggregated_signature),
-                        Err(_) => false,
-                    }
-                };
-
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::ViewChangeHighestQcVerified { vote, valid },
-                );
-            }
-
-            Action::VerifyViewChangeCertificateSignature {
-                certificate,
-                public_keys,
-                signing_message,
-            } => {
-                // Verify aggregated BLS signature on the view change certificate
-                // The public_keys are pre-filtered by the state machine based on the signer bitfield
-                let valid = if public_keys.is_empty() {
-                    false
-                } else {
-                    match hyperscale_types::PublicKey::aggregate_bls(&public_keys) {
-                        Ok(aggregated_pk) => aggregated_pk
-                            .verify(&signing_message, &certificate.aggregated_signature),
-                        Err(_) => false,
-                    }
-                };
-
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::ViewChangeCertificateSignatureVerified { certificate, valid },
-                );
-            }
-
+            // Note: View change verification actions removed - using HotStuff-2 implicit rounds
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,
@@ -1013,12 +929,14 @@ impl SimulationRunner {
                 // If this node is syncing, try to fetch more blocks that may now be available.
                 // This handles the case where sync was triggered before all target blocks
                 // were committed on peers.
-                let node_state = &self.nodes[from as usize];
-                if let Some(sync_target) = node_state.sync().sync_target() {
-                    let current_height = node_state.bft().committed_height();
+                if let Some(&sync_target) = self.sync_targets.get(&from) {
+                    let current_height = self.nodes[from as usize].bft().committed_height();
                     if current_height < sync_target {
                         // Still need to sync more blocks - retry fetching
                         self.handle_sync_needed(from, sync_target);
+                    } else {
+                        // Sync complete
+                        self.sync_targets.remove(&from);
                     }
                 }
             }
@@ -1177,45 +1095,45 @@ impl SimulationRunner {
 
     /// Handle sync needed: the simulation runner fetches blocks directly.
     ///
-    /// In production, this would be handled by the SyncManager with network I/O.
-    /// In simulation, we look up blocks from any peer's storage that has them.
+    /// In production, this is handled by SyncManager with network I/O.
+    /// In simulation, we look up blocks from any peer's storage that has them
+    /// and deliver them directly to BFT via SyncBlockReadyToApply.
+    ///
+    /// Note: We send blocks one at a time. When BFT commits a block (via PersistBlock),
+    /// the runner will check if more sync blocks are needed and fetch them.
     pub fn handle_sync_needed(&mut self, node: NodeIndex, target_height: u64) {
-        // Collect information from node state first (immutable borrow)
-        let (start_height, heights_to_skip) = {
-            let node_state = &self.nodes[node as usize];
-            let committed_height = node_state.bft().committed_height();
-            let sync_committed_height = node_state.sync().committed_height();
-            let start = committed_height.max(sync_committed_height) + 1;
+        // Track the sync target (replaces SyncState tracking)
+        // Only update if target is higher than current
+        let current_target = self.sync_targets.get(&node).copied().unwrap_or(0);
+        if target_height > current_target {
+            self.sync_targets.insert(node, target_height);
+        }
+        let effective_target = target_height.max(current_target);
 
-            // Collect which heights are already fetched
-            let mut skip = Vec::new();
-            for h in start..=target_height {
-                if node_state.sync().has_fetched_block(h) {
-                    skip.push(h);
-                }
-            }
-            (start, skip)
-        };
+        // Get node's current committed height from BFT state
+        let committed_height = self.nodes[node as usize].bft().committed_height();
+        let next_height = committed_height + 1;
 
-        // Fetch blocks from start_height to target_height
-        for height in start_height..=target_height {
-            // Skip if sync state already has this block fetched
-            if heights_to_skip.contains(&height) {
-                continue;
-            }
+        // Check if sync is complete
+        if committed_height >= effective_target {
+            self.sync_targets.remove(&node);
+            return;
+        }
 
-            // Find any peer that has this block
-            if let Some((block, qc)) = self.find_block_from_any_peer(height) {
-                // Deliver immediately (simulation has instant storage access)
-                let event = Event::SyncBlockReceived { block, qc };
+        // Only fetch the next block in sequence
+        if next_height <= effective_target {
+            if let Some((block, qc)) = self.find_block_from_any_peer(next_height) {
+                // Deliver directly to BFT - bypasses SyncState entirely
+                let event = Event::SyncBlockReadyToApply { block, qc };
                 self.schedule_event(node, self.now, event);
             } else {
-                warn!(
+                trace!(
                     node = node,
-                    height = height,
-                    "Sync: no peer has block at height"
+                    height = next_height,
+                    target = effective_target,
+                    "Sync: no peer has block at height yet"
                 );
-                break; // Can't continue sync without this block
+                // Block not available yet - will retry when peers commit more blocks
             }
         }
     }
@@ -1422,7 +1340,6 @@ impl SimulationRunner {
     fn timer_to_event(&self, id: TimerId) -> Event {
         match id {
             TimerId::Proposal => Event::ProposalTimer,
-            TimerId::ViewChange => Event::ViewChangeTimer,
             TimerId::Cleanup => Event::CleanupTimer,
             TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
             TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },

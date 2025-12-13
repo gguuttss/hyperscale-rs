@@ -4,7 +4,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash,
     QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate, StateEntry,
     StateProvision, StateVoteBlock, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, ViewChangeCertificate, ViewChangeVote,
+    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -42,10 +42,8 @@ pub enum Event {
     // Timers (priority: Timer)
     // ═══════════════════════════════════════════════════════════════════════
     /// Time to propose a new block (if this node is the proposer).
+    /// Also used for implicit round advancement when no QC is formed.
     ProposalTimer,
-
-    /// View change timeout expired.
-    ViewChangeTimer,
 
     /// Periodic cleanup of stale state.
     CleanupTimer,
@@ -71,14 +69,6 @@ pub enum Event {
     ///
     /// Sender identity comes from vote.voter (ValidatorId).
     BlockVoteReceived { vote: BlockVote },
-
-    /// Received a view change vote.
-    ///
-    /// Sender identity comes from vote.voter (ValidatorId).
-    ViewChangeVoteReceived { vote: ViewChangeVote },
-
-    /// Received a view change certificate.
-    ViewChangeCertificateReceived { cert: ViewChangeCertificate },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Network Messages - Execution (priority: Network)
@@ -132,16 +122,6 @@ pub enum Event {
         height: u64,
         /// The full committed block (includes transactions, certificates, deferrals, aborts).
         block: Block,
-    },
-
-    /// View change completed (round increment).
-    ///
-    /// Includes the highest QC from the view change certificate, which may allow
-    /// the BFT state to update its latest_qc and advance to proposing the next height.
-    ViewChangeCompleted {
-        height: u64,
-        new_round: u64,
-        highest_qc: QuorumCertificate,
     },
 
     /// Transaction execution completed.
@@ -225,45 +205,6 @@ pub enum Event {
         /// Whether the aggregated signature is valid.
         valid: bool,
     },
-
-    /// View change vote signature verification completed.
-    ///
-    /// Callback from `Action::VerifyViewChangeVoteSignature`.
-    ViewChangeVoteSignatureVerified {
-        /// The view change vote that was verified.
-        vote: ViewChangeVote,
-        /// Whether the signature is valid.
-        valid: bool,
-    },
-
-    /// View change highest QC verification completed.
-    ///
-    /// Callback from `Action::VerifyViewChangeHighestQc`.
-    ViewChangeHighestQcVerified {
-        /// The view change vote whose highest_qc was verified.
-        vote: ViewChangeVote,
-        /// Whether the highest_qc's aggregated signature is valid.
-        valid: bool,
-    },
-
-    /// View change certificate signature verification completed.
-    ///
-    /// Callback from `Action::VerifyViewChangeCertificateSignature`.
-    ViewChangeCertificateSignatureVerified {
-        /// The certificate that was verified.
-        certificate: ViewChangeCertificate,
-        /// Whether the aggregated signature is valid.
-        valid: bool,
-    },
-
-    /// View change quorum reached (internal signal).
-    ///
-    /// This is an internal signal emitted when view change vote quorum is reached.
-    /// The node state machine should call `ViewChangeState::apply_view_change()`
-    /// which will emit the actual `ViewChangeCompleted` event.
-    ///
-    /// This separation prevents duplicate `ViewChangeCompleted` events.
-    ViewChangeQuorumReached { height: u64, new_round: u64 },
 
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
@@ -588,8 +529,6 @@ impl Event {
             Event::QuorumCertificateFormed { .. }
             | Event::BlockReadyToCommit { .. }
             | Event::BlockCommitted { .. }
-            | Event::ViewChangeCompleted { .. }
-            | Event::ViewChangeQuorumReached { .. }
             | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
@@ -597,9 +536,6 @@ impl Event {
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
-            | Event::ViewChangeVoteSignatureVerified { .. }
-            | Event::ViewChangeHighestQcVerified { .. }
-            | Event::ViewChangeCertificateSignatureVerified { .. }
             | Event::TransactionsExecuted { .. }
             | Event::CrossShardTransactionExecuted { .. }
             | Event::MerkleRootComputed { .. }
@@ -608,16 +544,13 @@ impl Event {
             | Event::ChainMetadataFetched { .. } => EventPriority::Internal,
 
             // Timer events
-            Event::ProposalTimer
-            | Event::ViewChangeTimer
-            | Event::CleanupTimer
-            | Event::GlobalConsensusTimer => EventPriority::Timer,
+            Event::ProposalTimer | Event::CleanupTimer | Event::GlobalConsensusTimer => {
+                EventPriority::Timer
+            }
 
             // Network events
             Event::BlockHeaderReceived { .. }
             | Event::BlockVoteReceived { .. }
-            | Event::ViewChangeVoteReceived { .. }
-            | Event::ViewChangeCertificateReceived { .. }
             | Event::StateProvisionReceived { .. }
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
@@ -679,14 +612,11 @@ impl Event {
         match self {
             // Timers
             Event::ProposalTimer => "ProposalTimer",
-            Event::ViewChangeTimer => "ViewChangeTimer",
             Event::CleanupTimer => "CleanupTimer",
 
             // Network - BFT
             Event::BlockHeaderReceived { .. } => "BlockHeaderReceived",
             Event::BlockVoteReceived { .. } => "BlockVoteReceived",
-            Event::ViewChangeVoteReceived { .. } => "ViewChangeVoteReceived",
-            Event::ViewChangeCertificateReceived { .. } => "ViewChangeCertificateReceived",
 
             // Network - Execution
             Event::StateProvisionReceived { .. } => "StateProvisionReceived",
@@ -700,8 +630,6 @@ impl Event {
             Event::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
             Event::BlockReadyToCommit { .. } => "BlockReadyToCommit",
             Event::BlockCommitted { .. } => "BlockCommitted",
-            Event::ViewChangeCompleted { .. } => "ViewChangeCompleted",
-            Event::ViewChangeQuorumReached { .. } => "ViewChangeQuorumReached",
             Event::TransactionExecuted { .. } => "TransactionExecuted",
             Event::TransactionStatusChanged { .. } => "TransactionStatusChanged",
 
@@ -711,11 +639,6 @@ impl Event {
             Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
-            Event::ViewChangeVoteSignatureVerified { .. } => "ViewChangeVoteSignatureVerified",
-            Event::ViewChangeHighestQcVerified { .. } => "ViewChangeHighestQcVerified",
-            Event::ViewChangeCertificateSignatureVerified { .. } => {
-                "ViewChangeCertificateSignatureVerified"
-            }
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",

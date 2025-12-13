@@ -306,7 +306,7 @@ pub struct Libp2pAdapter {
     /// Local validator ID (from topology).
     local_validator_id: ValidatorId,
 
-    /// Local shard assignment.
+    /// Local shard assignment (passed to event loop for shard validation).
     #[allow(dead_code)]
     local_shard: ShardGroupId,
 
@@ -420,9 +420,11 @@ impl Libp2pAdapter {
         )
         .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
 
-        // Set up Kademlia DHT
+        // Set up Kademlia DHT for peer discovery
         let store = kad::store::MemoryStore::new(local_peer_id);
-        let kademlia = kad::Behaviour::new(local_peer_id, store);
+        let mut kademlia = kad::Behaviour::new(local_peer_id, store);
+        // Set to server mode so we can serve routing information to peers
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         // Set up request-response protocol
         let req_resp_config = request_response::Config::default();
@@ -507,6 +509,7 @@ impl Libp2pAdapter {
             rate_limit_config,
             tx_validator,
             cached_peer_count,
+            shard,
         ));
 
         Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
@@ -537,8 +540,7 @@ impl Libp2pAdapter {
         let topics = [
             Topic::block_header(shard),
             Topic::block_vote(shard),
-            Topic::view_change_vote(shard),
-            Topic::view_change_certificate(shard),
+            // Note: view_change topics removed - using HotStuff-2 implicit rounds
             Topic::transaction_gossip(shard),
             Topic::state_provision(shard),
             Topic::state_vote(shard),
@@ -803,6 +805,7 @@ impl Libp2pAdapter {
         rate_limit_config: RateLimitConfig,
         tx_validator: Arc<TransactionValidation>,
         cached_peer_count: Arc<AtomicUsize>,
+        local_shard: ShardGroupId,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -816,6 +819,9 @@ impl Libp2pAdapter {
 
         // Rate limiter for inbound sync requests
         let mut rate_limiter = SyncRateLimiter::new(rate_limit_config);
+
+        // Track whether we've bootstrapped Kademlia (do it once after first connection)
+        let mut kademlia_bootstrapped = false;
 
         loop {
             tokio::select! {
@@ -838,6 +844,55 @@ impl Libp2pAdapter {
                         SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
                     );
 
+                    // Handle connection established - add peer to Kademlia for discovery
+                    if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
+                        let addr = endpoint.get_remote_address().clone();
+                        // Add peer to Kademlia routing table for peer discovery
+                        swarm.behaviour_mut().kademlia.add_address(peer_id, addr.clone());
+                        debug!(
+                            peer = %peer_id,
+                            addr = %addr,
+                            "Added peer to Kademlia routing table"
+                        );
+
+                        // Bootstrap Kademlia after first connection to start peer discovery
+                        if !kademlia_bootstrapped {
+                            if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                                warn!("Failed to bootstrap Kademlia: {:?}", e);
+                            } else {
+                                info!("Kademlia bootstrap initiated for peer discovery");
+                                kademlia_bootstrapped = true;
+                            }
+                        }
+                    }
+
+                    // Handle Kademlia events for peer discovery
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad_event)) = &event {
+                        match kad_event {
+                            kad::Event::RoutingUpdated { peer, addresses, .. } => {
+                                debug!(
+                                    peer = %peer,
+                                    num_addresses = addresses.len(),
+                                    "Kademlia routing table updated"
+                                );
+                                // Dial newly discovered peers
+                                for addr in addresses.iter() {
+                                    if swarm.dial(addr.clone()).is_ok() {
+                                        debug!(addr = %addr, "Dialing peer discovered via Kademlia");
+                                    }
+                                }
+                            }
+                            kad::Event::OutboundQueryProgressed { result, .. } => {
+                                if let kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })) = result {
+                                    debug!(num_remaining = num_remaining, "Kademlia bootstrap progress");
+                                }
+                            }
+                            _ => {
+                                trace!("Kademlia event: {:?}", kad_event);
+                            }
+                        }
+                    }
+
                     Self::handle_swarm_event(
                         event,
                         &consensus_tx,
@@ -851,6 +906,7 @@ impl Libp2pAdapter {
                         &cert_request_tx,
                         &mut rate_limiter,
                         &tx_validator,
+                        local_shard,
                     ).await;
 
                     // Update cached peer count after connection changes
@@ -1027,6 +1083,7 @@ impl Libp2pAdapter {
         cert_request_tx: &mpsc::Sender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
         tx_validator: &Arc<TransactionValidation>,
+        local_shard: ShardGroupId,
     ) {
         match event {
             // Handle gossipsub messages
@@ -1056,6 +1113,40 @@ impl Libp2pAdapter {
                     return;
                 }
                 drop(peer_map);
+
+                // Defense-in-depth: Validate that shard-local messages come from the correct shard.
+                // Gossipsub should only deliver messages for subscribed topics, but we
+                // verify anyway to prevent cross-shard contamination.
+                //
+                // Shard-local messages (must match local_shard):
+                // - block.header, block.vote: BFT consensus messages
+                // - state.vote: Execution layer voting (votes are shard-local)
+                //
+                // Cross-shard messages (allowed from any shard):
+                // - state.provision: Sent cross-shard to request state for transactions
+                // - state.certificate: Needed for cross-shard transaction execution
+                // - transaction.gossip: Can be routed to appropriate shard
+                if let Some(parsed_topic) = crate::network::Topic::parse(&topic) {
+                    let msg_type = parsed_topic.message_type();
+                    let is_shard_local_message =
+                        matches!(msg_type, "block.header" | "block.vote" | "state.vote");
+
+                    if is_shard_local_message {
+                        if let Some(topic_shard) = parsed_topic.shard_id() {
+                            if topic_shard != local_shard {
+                                warn!(
+                                    topic = %topic,
+                                    topic_shard = topic_shard.0,
+                                    local_shard = local_shard.0,
+                                    msg_type = msg_type,
+                                    "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
+                                );
+                                metrics::record_invalid_message();
+                                return;
+                            }
+                        }
+                    }
+                }
 
                 // Decode message based on topic
                 match decode_message(&topic, &message.data) {
@@ -1337,9 +1428,10 @@ impl Libp2pAdapter {
                 num_established,
                 ..
             } => {
+                let addr = endpoint.get_remote_address().clone();
                 info!(
                     peer = %peer_id,
-                    addr = %endpoint.get_remote_address(),
+                    addr = %addr,
                     total_connections = num_established.get(),
                     "Connection established"
                 );

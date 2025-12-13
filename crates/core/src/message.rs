@@ -3,8 +3,7 @@
 use crate::Event;
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
-    StateVoteBlockGossip, TraceContext, TransactionGossip, ViewChangeCertificateGossip,
-    ViewChangeVoteGossip,
+    StateVoteBlockGossip, TraceContext, TransactionGossip,
 };
 use sbor::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -24,12 +23,6 @@ pub enum OutboundMessage {
 
     /// Vote on a block header.
     BlockVote(BlockVoteGossip),
-
-    /// Vote to change view (leader timeout).
-    ViewChangeVote(ViewChangeVoteGossip),
-
-    /// Certificate proving view change quorum.
-    ViewChangeCertificate(ViewChangeCertificateGossip),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Execution Messages
@@ -56,8 +49,6 @@ impl OutboundMessage {
         match self {
             OutboundMessage::BlockHeader(_) => "BlockHeader",
             OutboundMessage::BlockVote(_) => "BlockVote",
-            OutboundMessage::ViewChangeVote(_) => "ViewChangeVote",
-            OutboundMessage::ViewChangeCertificate(_) => "ViewChangeCertificate",
             OutboundMessage::StateProvision(_) => "StateProvision",
             OutboundMessage::StateVoteBlock(_) => "StateVoteBlock",
             OutboundMessage::StateCertificate(_) => "StateCertificate",
@@ -69,10 +60,7 @@ impl OutboundMessage {
     pub fn is_bft(&self) -> bool {
         matches!(
             self,
-            OutboundMessage::BlockHeader(_)
-                | OutboundMessage::BlockVote(_)
-                | OutboundMessage::ViewChangeVote(_)
-                | OutboundMessage::ViewChangeCertificate(_)
+            OutboundMessage::BlockHeader(_) | OutboundMessage::BlockVote(_)
         )
     }
 
@@ -117,8 +105,6 @@ impl OutboundMessage {
             // BFT consensus and state vote messages don't carry trace context
             OutboundMessage::BlockHeader(_)
             | OutboundMessage::BlockVote(_)
-            | OutboundMessage::ViewChangeVote(_)
-            | OutboundMessage::ViewChangeCertificate(_)
             | OutboundMessage::StateVoteBlock(_) => {}
         }
     }
@@ -133,12 +119,6 @@ impl OutboundMessage {
                 basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::BlockVote(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
-            }
-            OutboundMessage::ViewChangeVote(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
-            }
-            OutboundMessage::ViewChangeCertificate(gossip) => {
                 basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::StateProvision(gossip) => {
@@ -178,16 +158,6 @@ impl OutboundMessage {
                 }
             }
             OutboundMessage::BlockVote(g) => {
-                if let Ok(encoded) = basic_encode(g) {
-                    encoded.hash(&mut hasher);
-                }
-            }
-            OutboundMessage::ViewChangeVote(g) => {
-                if let Ok(encoded) = basic_encode(g) {
-                    encoded.hash(&mut hasher);
-                }
-            }
-            OutboundMessage::ViewChangeCertificate(g) => {
                 if let Ok(encoded) = basic_encode(g) {
                     encoded.hash(&mut hasher);
                 }
@@ -232,14 +202,6 @@ impl OutboundMessage {
             OutboundMessage::BlockVote(gossip) => Event::BlockVoteReceived {
                 vote: gossip.vote.clone(),
             },
-            OutboundMessage::ViewChangeVote(gossip) => Event::ViewChangeVoteReceived {
-                vote: gossip.vote.clone(),
-            },
-            OutboundMessage::ViewChangeCertificate(gossip) => {
-                Event::ViewChangeCertificateReceived {
-                    cert: gossip.certificate.clone(),
-                }
-            }
             OutboundMessage::StateProvision(gossip) => Event::StateProvisionReceived {
                 provision: gossip.provision.clone(),
             },

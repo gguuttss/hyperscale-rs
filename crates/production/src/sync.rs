@@ -1,26 +1,27 @@
 //! Sync manager for fetching blocks from peers.
 //!
-//! The sync manager handles the I/O aspects of block synchronization:
+//! The sync manager handles all aspects of block synchronization:
 //! - Peer selection (round-robin with failure tracking)
 //! - Parallel block fetches
 //! - Retries with exponential backoff
 //! - Timeout handling
+//! - Block validation and ordering
+//! - Delivery to BFT via SyncBlockReadyToApply events
 //!
-//! The state machine (`SyncState`) handles validation and ordering.
-//! The runner coordinates between them.
+//! This is a complete sync solution - no separate SyncState SubStateMachine needed.
 
 use crate::metrics;
 use crate::network::Libp2pAdapter;
+use crate::sync_error::SyncResponseError;
 use hyperscale_core::Event;
-use hyperscale_sync::SyncResponseError;
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate};
+use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, ShardGroupId};
 use libp2p::PeerId;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Sync State Types (for Status API)
@@ -217,11 +218,12 @@ pub fn validate_sync_response(
 /// Manages sync block fetching for the production runner.
 ///
 /// The sync manager is responsible for:
-/// 1. Receiving sync requests from the state machine (via `SyncNeeded` event)
+/// 1. Receiving sync requests from BFT (via `SyncNeeded` event)
 /// 2. Fetching blocks from peers using request-response protocol
-/// 3. Delivering fetched blocks back to the state machine
+/// 3. Validating and ordering received blocks
+/// 4. Delivering verified blocks directly to BFT for commitment
 ///
-/// The state machine handles validation and ordering of received blocks.
+/// This is a complete sync solution - no separate SyncState SubStateMachine needed.
 pub struct SyncManager {
     /// Configuration.
     config: SyncConfig,
@@ -229,18 +231,27 @@ pub struct SyncManager {
     network: Arc<Libp2pAdapter>,
     /// Event sender for delivering fetched blocks.
     event_tx: mpsc::Sender<Event>,
+    /// Our local shard - we only sync from peers in the same shard.
+    local_shard: ShardGroupId,
     /// Current sync target (if syncing).
     sync_target: Option<(u64, Hash)>,
     /// Heights we need to fetch.
     heights_to_fetch: VecDeque<u64>,
     /// Heights we've successfully fetched (waiting for state machine to apply).
     fetched_heights: HashSet<u64>,
+    /// Fetched blocks waiting to be delivered in order.
+    /// Key is height, value is (block, qc).
+    /// Blocks are delivered to BFT in sequential order starting from committed_height + 1.
+    fetched_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
     /// Currently pending fetch requests.
     pending_fetches: HashMap<u64, PendingFetch>,
     /// Peer reputations for selection and failure tracking.
     peer_reputations: HashMap<PeerId, PeerReputation>,
-    /// Known peers (connected validators).
+    /// Known peers (connected validators) in the same shard.
+    /// Only peers from the local shard are stored here for sync purposes.
     known_peers: Vec<PeerId>,
+    /// Mapping of peer ID to their shard (for filtering).
+    peer_shards: HashMap<PeerId, ShardGroupId>,
     /// Our current committed height (updated by state machine).
     committed_height: u64,
 }
@@ -251,28 +262,47 @@ impl SyncManager {
         config: SyncConfig,
         network: Arc<Libp2pAdapter>,
         event_tx: mpsc::Sender<Event>,
+        local_shard: ShardGroupId,
     ) -> Self {
         Self {
             config,
             network,
             event_tx,
+            local_shard,
             sync_target: None,
             heights_to_fetch: VecDeque::new(),
             fetched_heights: HashSet::new(),
+            fetched_blocks: BTreeMap::new(),
             pending_fetches: HashMap::new(),
             peer_reputations: HashMap::new(),
             known_peers: Vec::new(),
+            peer_shards: HashMap::new(),
             committed_height: 0,
         }
     }
 
-    /// Register a known peer (validator).
-    pub fn register_peer(&mut self, peer_id: PeerId) {
-        if !self.known_peers.contains(&peer_id) {
+    /// Register a known peer (validator) with their shard assignment.
+    ///
+    /// Only peers from the same shard will be used for sync requests.
+    /// This is critical for multi-shard deployments where blocks from different
+    /// shards have different QC signatures that won't verify cross-shard.
+    pub fn register_peer(&mut self, peer_id: PeerId, peer_shard: ShardGroupId) {
+        // Always track the peer's shard
+        self.peer_shards.insert(peer_id, peer_shard);
+
+        // Only add to known_peers if they're in our shard
+        if peer_shard == self.local_shard && !self.known_peers.contains(&peer_id) {
             self.known_peers.push(peer_id);
             self.peer_reputations
                 .insert(peer_id, PeerReputation::default());
-            debug!(?peer_id, "Registered sync peer");
+            debug!(?peer_id, shard = ?peer_shard, "Registered sync peer (same shard)");
+        } else if peer_shard != self.local_shard {
+            trace!(
+                ?peer_id,
+                peer_shard = ?peer_shard,
+                local_shard = ?self.local_shard,
+                "Skipping sync peer registration (different shard)"
+            );
         }
     }
 
@@ -280,7 +310,33 @@ impl SyncManager {
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.known_peers.retain(|p| p != peer_id);
         self.peer_reputations.remove(peer_id);
+        self.peer_shards.remove(peer_id);
         debug!(?peer_id, "Removed sync peer");
+    }
+
+    /// Update known peers from the network's connected peer list.
+    ///
+    /// This should be called periodically to keep the sync manager's peer list
+    /// in sync with actual network connections. Only peers already registered
+    /// with `register_peer` (and in the same shard) will be considered.
+    pub fn update_peers(&mut self, connected_peers: Vec<PeerId>) {
+        // Add new peers that are in our shard
+        for peer_id in &connected_peers {
+            // Only add peers we know are in our shard
+            if let Some(&shard) = self.peer_shards.get(peer_id) {
+                if shard == self.local_shard && !self.known_peers.contains(peer_id) {
+                    self.known_peers.push(*peer_id);
+                    self.peer_reputations
+                        .insert(*peer_id, PeerReputation::default());
+                    debug!(?peer_id, "Added sync peer from network (same shard)");
+                }
+            }
+        }
+
+        // Remove peers that are no longer connected
+        self.known_peers.retain(|p| connected_peers.contains(p));
+        self.peer_reputations
+            .retain(|p, _| connected_peers.contains(p));
     }
 
     /// Check if we're currently syncing.
@@ -326,12 +382,16 @@ impl SyncManager {
     }
 
     /// Update the committed height (called when state machine commits a block).
-    pub fn set_committed_height(&mut self, height: u64) {
+    ///
+    /// Returns true if there are more blocks ready to deliver (caller should
+    /// call `try_deliver_blocks_sync()` to deliver them).
+    pub fn set_committed_height(&mut self, height: u64) -> bool {
         self.committed_height = height;
 
         // Remove heights at or below committed from pending lists
         self.heights_to_fetch.retain(|h| *h > height);
         self.fetched_heights.retain(|h| *h > height);
+        self.fetched_blocks.retain(|h, _| *h > height);
         self.pending_fetches.retain(|h, _| *h > height);
 
         // Check if sync is complete
@@ -340,6 +400,33 @@ impl SyncManager {
                 debug!(height, target, "Sync complete");
                 self.sync_target = None;
                 self.heights_to_fetch.clear();
+                self.fetched_blocks.clear();
+                return false;
+            }
+        }
+
+        // Return true if there are more blocks ready to deliver
+        self.fetched_blocks.contains_key(&(height + 1))
+    }
+
+    /// Try to deliver the next block (non-blocking).
+    ///
+    /// Call this after `set_committed_height()` returns true to deliver
+    /// any consecutive blocks that are now ready. Uses `try_send()` which
+    /// is safe to call from within an async runtime.
+    pub fn try_deliver_blocks_sync(&mut self) {
+        let next_height = self.committed_height + 1;
+
+        if let Some((block, qc)) = self.fetched_blocks.remove(&next_height) {
+            debug!(
+                height = next_height,
+                "Delivering synced block to BFT for verification"
+            );
+
+            // Use try_send (non-blocking) - safe within async runtime
+            let event = Event::SyncBlockReadyToApply { block, qc };
+            if let Err(e) = self.event_tx.try_send(event) {
+                warn!(height = next_height, error = ?e, "Failed to deliver synced block");
             }
         }
     }
@@ -353,20 +440,27 @@ impl SyncManager {
             return;
         }
 
-        debug!(
+        let old_target = self.sync_target.map(|(h, _)| h);
+
+        info!(
             target_height,
             ?target_hash,
+            ?old_target,
             committed = self.committed_height,
             "Starting sync"
         );
 
         self.sync_target = Some((target_height, target_hash));
 
-        // Queue heights to fetch
-        self.heights_to_fetch.clear();
+        // Queue heights to fetch - add any heights we haven't fetched or queued yet.
+        // Always start from committed_height + 1, not from old_target + 1, because
+        // we need to fill any gaps. The checks for fetched_heights, fetched_blocks,
+        // pending_fetches, and heights_to_fetch prevent duplicate queuing.
         for height in (self.committed_height + 1)..=target_height {
             if !self.fetched_heights.contains(&height)
+                && !self.fetched_blocks.contains_key(&height)
                 && !self.pending_fetches.contains_key(&height)
+                && !self.heights_to_fetch.contains(&height)
             {
                 self.heights_to_fetch.push_back(height);
             }
@@ -378,6 +472,7 @@ impl SyncManager {
         debug!("Cancelling sync");
         self.sync_target = None;
         self.heights_to_fetch.clear();
+        self.fetched_blocks.clear();
         self.pending_fetches.clear();
         // Keep fetched_heights - they might still be useful
     }
@@ -413,6 +508,9 @@ impl SyncManager {
     }
 
     /// Handle a received block response.
+    ///
+    /// Validates the block, stores it for ordering, and delivers consecutive
+    /// blocks directly to BFT via `SyncBlockReadyToApply`.
     pub async fn on_block_received(
         &mut self,
         height: u64,
@@ -435,14 +533,22 @@ impl SyncManager {
             // Record metrics
             metrics::record_sync_block_downloaded();
 
-            // Mark as fetched
-            self.fetched_heights.insert(height);
-
-            // Deliver to state machine
-            let event = Event::SyncBlockReceived { block, qc };
-            if let Err(e) = self.event_tx.send(event).await {
-                warn!(height, error = ?e, "Failed to deliver synced block");
+            // Validate block matches QC
+            if !self.validate_block(&block, &qc) {
+                warn!(height, ?from_peer, "Invalid block received during sync");
+                // Re-queue for retry from another peer
+                if !self.heights_to_fetch.contains(&height) {
+                    self.heights_to_fetch.push_back(height);
+                }
+                return;
             }
+
+            // Mark as fetched and store for ordering
+            self.fetched_heights.insert(height);
+            self.fetched_blocks.insert(height, (block, qc));
+
+            // Try to deliver consecutive blocks
+            self.try_deliver_blocks().await;
         } else {
             // Unexpected response (maybe from a retry after we already got it)
             trace!(
@@ -450,6 +556,64 @@ impl SyncManager {
                 ?from_peer,
                 "Unexpected block response (already handled)"
             );
+        }
+    }
+
+    /// Validate a block against its QC.
+    fn validate_block(&self, block: &Block, qc: &QuorumCertificate) -> bool {
+        // Verify the QC certifies this block
+        if qc.block_hash != block.hash() {
+            warn!(
+                block_hash = ?block.hash(),
+                qc_hash = ?qc.block_hash,
+                height = block.header.height.0,
+                "QC block hash mismatch"
+            );
+            return false;
+        }
+
+        // Verify height matches
+        if qc.height != block.header.height {
+            warn!(
+                block_height = block.header.height.0,
+                qc_height = qc.height.0,
+                "QC height mismatch"
+            );
+            return false;
+        }
+
+        // Note: QC signature verification is done by BftState when processing
+        // SyncBlockReadyToApply. We just validate basic properties here.
+        true
+    }
+
+    /// Try to deliver consecutive fetched blocks to BFT.
+    ///
+    /// Delivers blocks in order starting from committed_height + 1.
+    /// Blocks are sent via SyncBlockReadyToApply, which BFT will verify
+    /// (QC signatures) and then commit.
+    ///
+    /// We only deliver one block at a time. When BFT commits that block,
+    /// it calls `set_committed_height()`, which updates our committed_height
+    /// and allows the next block to be delivered on the next tick.
+    async fn try_deliver_blocks(&mut self) {
+        let next_height = self.committed_height + 1;
+
+        // Check if we have the next block ready
+        if let Some((block, qc)) = self.fetched_blocks.remove(&next_height) {
+            debug!(
+                height = next_height,
+                "Delivering synced block to BFT for verification"
+            );
+
+            // Send directly to BFT - bypasses SyncState entirely
+            let event = Event::SyncBlockReadyToApply { block, qc };
+            if let Err(e) = self.event_tx.send(event).await {
+                warn!(height = next_height, error = ?e, "Failed to deliver synced block");
+            }
+
+            // Don't update committed_height here - that happens when BFT
+            // actually commits the block and calls set_committed_height()
         }
     }
 

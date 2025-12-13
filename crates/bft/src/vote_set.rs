@@ -100,11 +100,16 @@ impl VoteSet {
         true
     }
 
-    /// Check if this set has quorum.
+    /// Check if this set has quorum and can build a QC.
     ///
     /// Quorum formula: voted_power * 3 > total_power * 2 (i.e., > 2/3)
+    ///
+    /// Note: This also requires the header to be set (via constructor or `set_header`),
+    /// since building a QC requires the parent_block_hash from the header.
     pub fn has_quorum(&self, total_power: u64) -> bool {
-        !self.qc_built && VotePower::has_quorum(self.voting_power, total_power)
+        !self.qc_built
+            && self.parent_block_hash.is_some()
+            && VotePower::has_quorum(self.voting_power, total_power)
     }
 
     /// Get the current voting power.

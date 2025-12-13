@@ -18,7 +18,6 @@ use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockVote, Hash, KeyPair, PublicKey, QuorumCertificate,
     RoutableTransaction, ShardGroupId, Signature, StateVoteBlock, Topology, ValidatorId,
-    ViewChangeVote,
 };
 use libp2p::identity;
 use parking_lot::RwLock;
@@ -51,21 +50,17 @@ pub enum RunnerError {
 struct PendingVerifications {
     /// Block votes waiting for verification (public key and signing message included).
     block_votes: Vec<(BlockVote, PublicKey, Vec<u8>)>,
-    /// View change votes waiting for verification.
-    view_change_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)>,
     /// State votes waiting for verification (cross-shard execution).
     state_votes: Vec<(StateVoteBlock, PublicKey)>,
 }
 
 impl PendingVerifications {
     fn is_empty(&self) -> bool {
-        self.block_votes.is_empty()
-            && self.view_change_votes.is_empty()
-            && self.state_votes.is_empty()
+        self.block_votes.is_empty() && self.state_votes.is_empty()
     }
 
     fn total_count(&self) -> usize {
-        self.block_votes.len() + self.view_change_votes.len() + self.state_votes.len()
+        self.block_votes.len() + self.state_votes.len()
     }
 }
 
@@ -363,17 +358,40 @@ impl ProductionRunnerBuilder {
         network.subscribe_shard(local_shard).await?;
 
         // Register known validators for peer validation
-        // This allows us to validate that messages come from known validators
-        for &validator_id in topology.local_committee().iter() {
-            if let Some(public_key) = topology.public_key(validator_id) {
-                let peer_id = compute_peer_id_for_validator(&public_key);
-                network.register_validator(validator_id, peer_id).await;
-            }
+        // This allows us to validate that messages come from known validators.
+        // We register ALL validators from the global validator set because:
+        // 1. Cross-shard transactions are gossiped between shards
+        // 2. Validators may receive messages forwarded from other shards
+        // Note: We use global_validator_set() instead of committee_for_shard() because
+        // StaticTopology::with_local_shard() only populates the local shard's committee.
+        for validator in &topology.global_validator_set().validators {
+            let peer_id = compute_peer_id_for_validator(&validator.public_key);
+            network
+                .register_validator(validator.validator_id, peer_id)
+                .await;
         }
 
         // Create sync manager (uses consensus channel for sync events)
-        let sync_manager =
-            SyncManager::new(SyncConfig::default(), network.clone(), consensus_tx.clone());
+        // Pass local_shard so it only syncs from peers in the same shard
+        let mut sync_manager = SyncManager::new(
+            SyncConfig::default(),
+            network.clone(),
+            consensus_tx.clone(),
+            local_shard,
+        );
+
+        // Register validators with sync manager, including their shard assignments.
+        // This is critical for multi-shard sync: we must only sync from peers in our shard,
+        // because blocks from different shards have different QC signatures.
+        for shard_id in 0..topology.num_shards() {
+            let shard = ShardGroupId(shard_id);
+            for &validator_id in topology.committee_for_shard(shard).iter() {
+                if let Some(pk) = topology.public_key(validator_id) {
+                    let peer_id = compute_peer_id_for_validator(&pk);
+                    sync_manager.register_peer(peer_id, shard);
+                }
+            }
+        }
 
         // Create executor
         let executor = Arc::new(RadixExecutor::new(network_definition));
@@ -711,11 +729,12 @@ impl ProductionRunner {
                             let now = self.start_time.elapsed();
                             self.state.set_time(now);
 
-                            // Check for SyncNeeded - handle specially
-                            // The runner handles this directly (sync manager), not the state machine.
+                            // Check for SyncNeeded - handle entirely in SyncManager.
+                            // SyncManager now handles everything: I/O, validation, ordering, delivery.
+                            // It sends SyncBlockReadyToApply directly to BFT when blocks are ready.
                             if let Event::SyncNeeded { target_height, target_hash } = event {
                                 self.sync_manager.start_sync(target_height, target_hash);
-                                continue;
+                                continue; // Don't pass to state machine - SyncManager handles it
                             }
 
                             // Check for TransactionNeeded - handle specially
@@ -768,9 +787,6 @@ impl ProductionRunner {
                                     Action::VerifyVoteSignature { vote, public_key, signing_message } => {
                                         pending.block_votes.push((vote, public_key, signing_message));
                                     }
-                                    Action::VerifyViewChangeVoteSignature { vote, public_key, signing_message } => {
-                                        pending.view_change_votes.push((vote, public_key, signing_message));
-                                    }
                                     Action::VerifyStateVoteSignature { vote, public_key } => {
                                         pending.state_votes.push((vote, public_key));
                                     }
@@ -791,15 +807,18 @@ impl ProductionRunner {
                                 let now = self.start_time.elapsed();
                                 self.state.set_time(now);
 
+                                // Handle SyncNeeded entirely in SyncManager (skip state machine)
+                                if let Event::SyncNeeded { target_height, target_hash } = more_event {
+                                    self.sync_manager.start_sync(target_height, target_hash);
+                                    continue; // Don't pass to state machine
+                                }
+
                                 let more_actions = self.state.handle(more_event);
 
                                 for action in more_actions {
                                     match action {
                                         Action::VerifyVoteSignature { vote, public_key, signing_message } => {
                                             pending.block_votes.push((vote, public_key, signing_message));
-                                        }
-                                        Action::VerifyViewChangeVoteSignature { vote, public_key, signing_message } => {
-                                            pending.view_change_votes.push((vote, public_key, signing_message));
                                         }
                                         Action::VerifyStateVoteSignature { vote, public_key } => {
                                             pending.state_votes.push((vote, public_key));
@@ -925,6 +944,10 @@ impl ProductionRunner {
                 _ = sync_tick.tick() => {
                     let tick_span = span!(Level::TRACE, "sync_tick");
                     let _tick_guard = tick_span.enter();
+
+                    // Update sync manager's peer list from network connections
+                    let connected_peers = self.network.connected_peers().await;
+                    self.sync_manager.update_peers(connected_peers);
 
                     self.sync_manager.tick().await;
                     // Reset batch counter - we yielded, now back to prioritizing consensus
@@ -1192,96 +1215,7 @@ impl ProductionRunner {
                 });
             }
 
-            Action::VerifyViewChangeVoteSignature {
-                vote,
-                public_key,
-                signing_message,
-            } => {
-                let event_tx = self.consensus_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let valid = public_key.verify(&signing_message, &vote.signature);
-                    crate::metrics::record_signature_verification_latency(
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ = event_tx
-                        .blocking_send(Event::ViewChangeVoteSignatureVerified { vote, valid });
-                });
-            }
-
-            Action::VerifyViewChangeHighestQc {
-                vote,
-                public_keys,
-                signing_message,
-            } => {
-                let event_tx = self.consensus_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Get signer keys based on the highest_qc's signer bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
-                        .collect();
-
-                    let valid = if signer_keys.is_empty() {
-                        false
-                    } else {
-                        // Verify against domain-separated signing message
-                        match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => aggregated_pk
-                                .verify(&signing_message, &vote.highest_qc.aggregated_signature),
-                            Err(_) => false,
-                        }
-                    };
-
-                    crate::metrics::record_signature_verification_latency(
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ =
-                        event_tx.blocking_send(Event::ViewChangeHighestQcVerified { vote, valid });
-                });
-            }
-
-            Action::VerifyViewChangeCertificateSignature {
-                certificate,
-                public_keys,
-                signing_message,
-            } => {
-                let event_tx = self.consensus_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Verify aggregated BLS signature on the view change certificate
-                    // The public_keys are pre-filtered by the state machine based on the signer bitfield
-                    let valid = if public_keys.is_empty() {
-                        false
-                    } else {
-                        match hyperscale_types::PublicKey::aggregate_bls(&public_keys) {
-                            Ok(aggregated_pk) => aggregated_pk
-                                .verify(&signing_message, &certificate.aggregated_signature),
-                            Err(_) => false,
-                        }
-                    };
-
-                    crate::metrics::record_signature_verification_latency(
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ = event_tx.blocking_send(Event::ViewChangeCertificateSignatureVerified {
-                        certificate,
-                        valid,
-                    });
-                });
-            }
+            // Note: View change verification actions removed - using HotStuff-2 implicit rounds
 
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
@@ -1475,9 +1409,14 @@ impl ProductionRunner {
                     "Block committed"
                 );
 
-                // Update sync manager's committed height - critical for correct sync behavior
-                // Without this, the sync manager would always try to sync from height 0
-                self.sync_manager.set_committed_height(height);
+                // Update sync manager's committed height - critical for correct sync behavior.
+                // This also returns true if there are more synced blocks ready to deliver.
+                let has_more_blocks = self.sync_manager.set_committed_height(height);
+
+                // If syncing and we have more blocks ready, deliver the next one
+                if has_more_blocks {
+                    self.sync_manager.try_deliver_blocks_sync();
+                }
 
                 // Update RPC status with new block height and view
                 if let Some(ref rpc_status) = self.rpc_status {
@@ -1737,65 +1676,7 @@ impl ProductionRunner {
                 }
             }
 
-            // === VIEW CHANGE VOTES ===
-            if !pending.view_change_votes.is_empty() {
-                let mut ed25519_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)> = Vec::new();
-                let mut bls_votes: Vec<(ViewChangeVote, PublicKey, Vec<u8>)> = Vec::new();
-
-                for (vote, pk, msg) in pending.view_change_votes {
-                    match &pk {
-                        PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
-                        PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
-                    }
-                }
-
-                // Process Ed25519 view change votes using batch verification
-                if !ed25519_votes.is_empty() {
-                    let messages: Vec<&[u8]> =
-                        ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
-                    let signatures: Vec<Signature> = ed25519_votes
-                        .iter()
-                        .map(|(v, _, _)| v.signature.clone())
-                        .collect();
-                    let pubkeys: Vec<PublicKey> =
-                        ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
-
-                    let batch_valid =
-                        PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
-
-                    if batch_valid {
-                        for (vote, _, _) in ed25519_votes {
-                            let _ =
-                                event_tx.blocking_send(Event::ViewChangeVoteSignatureVerified {
-                                    vote,
-                                    valid: true,
-                                });
-                        }
-                    } else {
-                        for (vote, pk, msg) in ed25519_votes {
-                            let valid = pk.verify(&msg, &vote.signature);
-                            if !valid {
-                                crate::metrics::record_signature_verification_failure();
-                            }
-                            let _ =
-                                event_tx.blocking_send(Event::ViewChangeVoteSignatureVerified {
-                                    vote,
-                                    valid,
-                                });
-                        }
-                    }
-                }
-
-                // Process BLS view change votes individually
-                for (vote, pk, msg) in bls_votes {
-                    let valid = pk.verify(&msg, &vote.signature);
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ = event_tx
-                        .blocking_send(Event::ViewChangeVoteSignatureVerified { vote, valid });
-                }
-            }
+            // Note: View change vote batch verification removed - using HotStuff-2 implicit rounds
 
             // === STATE VOTES (cross-shard execution) ===
             if !pending.state_votes.is_empty() {

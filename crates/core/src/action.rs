@@ -4,8 +4,7 @@ use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate,
-    ViewChangeCertificate, ViewChangeVote, VotePower,
+    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate, VotePower,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,57 +115,6 @@ pub enum Action {
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
         /// The signing message (domain_tag || shard_group || height || round || qc.block_hash).
-        /// Pre-computed by state machine since it has the shard_group context.
-        signing_message: Vec<u8>,
-    },
-
-    /// Verify a view change vote's signature.
-    ///
-    /// View change votes must be verified before being counted toward quorum.
-    /// The signature is over (shard_group, height, new_round).
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ViewChangeVoteSignatureVerified` when complete.
-    VerifyViewChangeVoteSignature {
-        /// The view change vote to verify.
-        vote: ViewChangeVote,
-        /// Public key of the voter (pre-resolved by state machine).
-        public_key: PublicKey,
-        /// The signing message (shard_group || height || new_round).
-        /// Pre-computed by state machine since it has the shard_group context.
-        signing_message: Vec<u8>,
-    },
-
-    /// Verify the highest QC attached to a view change vote.
-    ///
-    /// View change votes include the voter's highest QC. This QC must be verified
-    /// before being used to determine the new proposer's starting point.
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ViewChangeHighestQcVerified` when complete.
-    VerifyViewChangeHighestQc {
-        /// The view change vote containing the highest_qc.
-        vote: ViewChangeVote,
-        /// Public keys of the QC signers (pre-resolved from highest_qc.signers bitfield).
-        public_keys: Vec<PublicKey>,
-        /// The signing message for the QC (domain_tag || shard_group || height || round || block_hash).
-        /// Pre-computed by state machine since it has the shard_group context.
-        signing_message: Vec<u8>,
-    },
-
-    /// Verify a ViewChangeCertificate's aggregated BLS signature.
-    ///
-    /// The certificate proves quorum was reached for a view change. Its aggregated
-    /// signature must be verified before applying the view change.
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ViewChangeCertificateSignatureVerified` when complete.
-    VerifyViewChangeCertificateSignature {
-        /// The certificate to verify.
-        certificate: ViewChangeCertificate,
-        /// Public keys of the signers (pre-resolved from certificate's signer bitfield).
-        public_keys: Vec<PublicKey>,
-        /// The signing message (view_change: || shard_group || height || new_round).
         /// Pre-computed by state machine since it has the shard_group context.
         signing_message: Vec<u8>,
     },
@@ -421,9 +369,6 @@ impl Action {
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::VerifyViewChangeVoteSignature { .. }
-                | Action::VerifyViewChangeHighestQc { .. }
-                | Action::VerifyViewChangeCertificateSignature { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::ComputeMerkleRoot { .. }
@@ -478,11 +423,6 @@ impl Action {
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifyViewChangeVoteSignature { .. } => "VerifyViewChangeVoteSignature",
-            Action::VerifyViewChangeHighestQc { .. } => "VerifyViewChangeHighestQc",
-            Action::VerifyViewChangeCertificateSignature { .. } => {
-                "VerifyViewChangeCertificateSignature"
-            }
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",

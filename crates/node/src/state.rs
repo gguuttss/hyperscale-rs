@@ -1,11 +1,10 @@
 //! Node state machine.
 
-use hyperscale_bft::{BftConfig, BftState, RecoveredState, ViewChangeState};
+use hyperscale_bft::{BftConfig, BftState, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::MempoolState;
-use hyperscale_sync::{SyncConfig, SyncState};
 use hyperscale_types::{Block, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +15,11 @@ pub type NodeIndex = u32;
 
 /// Combined node state machine.
 ///
-/// Composes BFT, view change, execution, mempool, livelock, and sync into a single state machine.
+/// Composes BFT, execution, mempool, and livelock into a single state machine.
+/// View changes are handled implicitly via local round advancement in BftState (HotStuff-2 style).
+///
+/// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
+/// The runner sends SyncBlockReadyToApply events directly to BFT when synced blocks are ready.
 pub struct NodeStateMachine {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
@@ -24,11 +27,8 @@ pub struct NodeStateMachine {
     /// Network topology (single source of truth).
     topology: Arc<dyn Topology>,
 
-    /// BFT consensus state.
+    /// BFT consensus state (includes implicit round advancement).
     bft: BftState,
-
-    /// View change state for liveness.
-    view_change: ViewChangeState,
 
     /// Execution state.
     execution: ExecutionState,
@@ -39,11 +39,11 @@ pub struct NodeStateMachine {
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
 
-    /// Sync state for catching up when behind.
-    sync: SyncState,
-
     /// Current time.
     now: Duration,
+
+    /// Time of last QC formation (for round timeout detection).
+    last_qc_time: Duration,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -74,9 +74,6 @@ impl NodeStateMachine {
         bft_config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
-        // Total validators for sync peer selection
-        let total_validators = topology.local_committee().len() as u32;
-
         let local_shard = topology.local_shard();
 
         Self {
@@ -89,17 +86,11 @@ impl NodeStateMachine {
                 bft_config.clone(),
                 recovered,
             ),
-            view_change: ViewChangeState::new(
-                local_shard,
-                signing_key.clone(),
-                topology.clone(),
-                bft_config.view_change_timeout,
-            ),
             execution: ExecutionState::new(topology.clone(), signing_key),
             mempool: MempoolState::new(topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
-            sync: SyncState::new(SyncConfig::default(), total_validators),
             now: Duration::ZERO,
+            last_qc_time: Duration::ZERO,
         }
     }
 
@@ -133,24 +124,9 @@ impl NodeStateMachine {
         &mut self.bft
     }
 
-    /// Get a reference to the view change state.
-    pub fn view_change(&self) -> &ViewChangeState {
-        &self.view_change
-    }
-
-    /// Get a mutable reference to the view change state.
-    pub fn view_change_mut(&mut self) -> &mut ViewChangeState {
-        &mut self.view_change
-    }
-
     /// Get a reference to the execution state.
     pub fn execution(&self) -> &ExecutionState {
         &self.execution
-    }
-
-    /// Get a reference to the sync state.
-    pub fn sync(&self) -> &SyncState {
-        &self.sync
     }
 
     /// Get a reference to the livelock state.
@@ -158,24 +134,13 @@ impl NodeStateMachine {
         &self.livelock
     }
 
-    /// Check if we're currently syncing.
-    pub fn is_syncing(&self) -> bool {
-        self.sync.is_syncing()
-    }
-
     /// Initialize the node with a genesis block.
     ///
     /// Returns actions to be processed (e.g., initial timers).
     pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
-        let mut actions = self.bft.initialize_genesis(genesis);
-
-        // Also set up the view change timer
-        actions.push(Action::SetTimer {
-            id: hyperscale_core::TimerId::ViewChange,
-            duration: Duration::from_secs(5), // Default view change timeout
-        });
-
-        actions
+        self.bft.initialize_genesis(genesis)
+        // Note: No separate view change timer - round advancement is handled
+        // implicitly via the proposal timer (HotStuff-2 style)
     }
 
     /// Handle cleanup timer.
@@ -189,20 +154,22 @@ impl NodeStateMachine {
 
     /// Handle block committed event.
     ///
-    /// This updates view change state to reset timeout on progress,
-    /// and notifies sync state of progress.
-    fn on_block_committed(&mut self, height: u64) -> Vec<Action> {
-        // Reset view change timeout on progress
-        self.view_change.reset_timeout(height + 1); // Next height to work on
+    /// Resets round timeout tracking.
+    fn on_block_committed(&mut self, _height: u64) -> Vec<Action> {
+        // Reset round advancement timeout - progress was made
+        self.last_qc_time = self.now;
 
-        // Update highest QC in view change state
-        if let Some(qc) = self.bft.latest_qc() {
-            self.view_change.update_highest_qc(qc.clone());
-        }
+        // Note: Sync progress tracking is now handled by the runner
+        // (production: SyncManager, simulation: runner.sync_targets)
+        vec![]
+    }
 
-        // Notify sync state of committed height and get any follow-up actions
-        // (e.g., sending the next synced block for verification)
-        self.sync.set_committed_height(height)
+    /// Check if we should advance the round due to timeout.
+    ///
+    /// Called from proposal timer to detect if no QC has formed.
+    fn should_advance_round(&self) -> bool {
+        let timeout = self.bft.config().view_change_timeout;
+        self.now.saturating_sub(self.last_qc_time) >= timeout
     }
 }
 
@@ -213,120 +180,29 @@ impl StateMachine for NodeStateMachine {
             // Timer events
             Event::CleanupTimer => return self.on_cleanup_timer(),
 
-            // View change timer goes to ViewChangeState
-            Event::ViewChangeTimer => {
-                return self.view_change.on_view_change_timer();
-            }
-
-            // View change votes and certificates go to ViewChangeState
-            Event::ViewChangeVoteReceived { vote } => {
-                // Check if the vote is for a higher height - this means we're behind
-                // and need to sync before we can participate in view change.
-                let vote_height = vote.height.0;
-                let our_height = self.bft.committed_height();
-
-                if vote_height > our_height + 1 {
-                    // We're significantly behind - trigger sync using the highest_qc from the vote
-                    // The vote's highest_qc tells us what blocks the sender has committed
-                    let highest_qc = &vote.highest_qc;
-                    if !highest_qc.is_genesis() && highest_qc.height.0 > our_height {
-                        tracing::info!(
-                            our_height,
-                            vote_height,
-                            qc_height = highest_qc.height.0,
-                            "Detected we're behind from view change vote, triggering sync"
-                        );
-                        return vec![Action::EnqueueInternal {
-                            event: Event::SyncNeeded {
-                                target_height: highest_qc.height.0,
-                                target_hash: highest_qc.block_hash,
-                            },
-                        }];
-                    }
-                }
-
-                // Delegate verification to runner (async)
-                return self.view_change.on_view_change_vote(vote.clone());
-            }
-
-            // View change vote signature verification completed
-            Event::ViewChangeVoteSignatureVerified { vote, valid } => {
-                let mut actions = self
-                    .view_change
-                    .on_vote_signature_verified(vote.clone(), *valid);
-
-                // Check if quorum was reached (ViewChangeQuorumReached will be in actions)
-                for action in &actions {
-                    if let Action::EnqueueInternal {
-                        event: Event::ViewChangeQuorumReached { height, new_round },
-                    } = action
-                    {
-                        // Apply view change when quorum is reached
-                        tracing::info!(height, new_round, "View change quorum reached");
-                        actions.extend(self.view_change.apply_view_change(*height, *new_round));
-                        break;
-                    }
-                }
-                return actions;
-            }
-
-            // View change highest QC verification completed
-            Event::ViewChangeHighestQcVerified { vote, valid } => {
-                let mut actions = self
-                    .view_change
-                    .on_highest_qc_verified(vote.clone(), *valid);
-
-                // Check if quorum was reached (ViewChangeQuorumReached will be in actions)
-                for action in &actions {
-                    if let Action::EnqueueInternal {
-                        event: Event::ViewChangeQuorumReached { height, new_round },
-                    } = action
-                    {
-                        // Apply view change when quorum is reached
-                        tracing::info!(height, new_round, "View change quorum reached");
-                        actions.extend(self.view_change.apply_view_change(*height, *new_round));
-                        break;
-                    }
-                }
-                return actions;
-            }
-
-            // View change certificate signature verification completed
-            Event::ViewChangeCertificateSignatureVerified { certificate, valid } => {
-                return self
-                    .view_change
-                    .on_certificate_signature_verified(certificate.clone(), *valid);
-            }
-
-            Event::ViewChangeCertificateReceived { cert } => {
-                // Check if the certificate is for a higher height - this means we're behind
-                let cert_height = cert.height.0;
-                let our_height = self.bft.committed_height();
-
-                if cert_height > our_height + 1 {
-                    // We're significantly behind - trigger sync using the highest_qc from the cert
-                    let highest_qc = &cert.highest_qc;
-                    if !highest_qc.is_genesis() && highest_qc.height.0 > our_height {
-                        tracing::info!(
-                            our_height,
-                            cert_height,
-                            qc_height = highest_qc.height.0,
-                            "Detected we're behind from view change certificate, triggering sync"
-                        );
-                        return vec![Action::EnqueueInternal {
-                            event: Event::SyncNeeded {
-                                target_height: highest_qc.height.0,
-                                target_hash: highest_qc.block_hash,
-                            },
-                        }];
-                    }
-                }
-
-                return self.view_change.on_view_change_certificate(cert.clone());
-            }
-
-            // ProposalTimer needs mempool transactions, pending deferrals, aborts, and certificates
+            // ProposalTimer handles both proposal AND implicit round advancement
             Event::ProposalTimer => {
+                // Check if we should advance the round due to timeout
+                if self.should_advance_round() {
+                    let max_txs = self.bft.config().max_transactions_per_block;
+                    let txs = self.mempool.ready_transactions(max_txs);
+                    let deferred = self.livelock.get_pending_deferrals();
+                    let current_height =
+                        hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
+                    let aborted = self.mempool.get_timed_out_transactions(
+                        current_height,
+                        30, // execution_timeout_blocks
+                        3,  // max_retries
+                    );
+                    let certificates = self.execution.get_finalized_certificates();
+
+                    tracing::info!("Round timeout - advancing round (implicit view change)");
+                    return self
+                        .bft
+                        .advance_round(&txs, deferred, aborted, certificates);
+                }
+
+                // Normal proposal timer - try to propose if we're the proposer
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let txs = self.mempool.ready_transactions(max_txs);
                 // Get pending deferrals from livelock state
@@ -368,7 +244,11 @@ impl StateMachine for NodeStateMachine {
             }
 
             // QuorumCertificateFormed may trigger immediate proposal, so pass mempool
+            // Also reset the QC timeout since progress was made
             Event::QuorumCertificateFormed { block_hash, qc } => {
+                // Reset timeout - QC formed means progress
+                self.last_qc_time = self.now;
+
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let txs = self.mempool.ready_transactions(max_txs);
                 let deferred = self.livelock.get_pending_deferrals();
@@ -389,19 +269,11 @@ impl StateMachine for NodeStateMachine {
                 );
             }
 
-            // ViewChangeQuorumReached is an internal signal that's already handled
-            // in the verification callback handlers above. If it somehow gets enqueued
-            // separately, we can safely ignore it (quorum was already applied).
-            Event::ViewChangeQuorumReached { .. } => {
-                return vec![];
-            }
-
             // Other BFT events don't need mempool context
             Event::BlockVoteReceived { .. }
             | Event::BlockReadyToCommit { .. }
             | Event::VoteSignatureVerified { .. }
-            | Event::QcSignatureVerified { .. }
-            | Event::ViewChangeCompleted { .. } => {
+            | Event::QcSignatureVerified { .. } => {
                 if let Some(actions) = self.bft.try_handle(&event) {
                     return actions;
                 }
@@ -551,15 +423,18 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Sync protocol events
-            Event::SyncNeeded {
-                target_height,
-                target_hash,
-            } => {
-                return self.sync.on_sync_needed(*target_height, *target_hash);
+            // Note: SyncNeeded and SyncBlockReceived are now handled entirely by the runner.
+            // The runner sends SyncBlockReadyToApply directly when blocks are ready.
+            Event::SyncNeeded { .. } => {
+                // Runner handles this - should not reach state machine
+                tracing::warn!(
+                    "SyncNeeded event reached NodeStateMachine - should be handled by runner"
+                );
             }
 
-            Event::SyncBlockReceived { block, qc } => {
-                return self.sync.on_block_received(block.clone(), qc.clone());
+            Event::SyncBlockReceived { .. } => {
+                // Runner handles this - should not reach state machine
+                tracing::warn!("SyncBlockReceived event reached NodeStateMachine - should be handled by runner");
             }
 
             Event::SyncBlockReadyToApply { block, qc } => {
@@ -569,11 +444,8 @@ impl StateMachine for NodeStateMachine {
 
             Event::SyncComplete { height } => {
                 tracing::info!(height, "Sync complete, resuming normal consensus");
-                // Cancel sync state (if not already done)
-                let actions = self.sync.cancel_sync();
-                // Reset view change timeout since we've caught up
-                self.view_change.reset_timeout(*height + 1);
-                return actions;
+                // Reset round timeout since we've caught up
+                self.last_qc_time = self.now;
             }
 
             Event::ChainMetadataFetched { .. } => {
@@ -819,11 +691,9 @@ impl StateMachine for NodeStateMachine {
     fn set_time(&mut self, now: Duration) {
         self.now = now;
         self.bft.set_time(now);
-        self.view_change.set_time(now);
         self.execution.set_time(now);
         self.mempool.set_time(now);
         self.livelock.set_time(now);
-        self.sync.set_time(now);
     }
 
     fn now(&self) -> Duration {

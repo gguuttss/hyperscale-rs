@@ -148,10 +148,14 @@ pub struct BftState {
     /// Key: (height, validator_id), Value: block_hash
     ///
     /// This prevents Byzantine validators from voting for multiple blocks at the same height
-    /// across different VoteSets. When we receive a vote, we check if this validator
-    /// already voted for a DIFFERENT block at this height - if so, we reject the vote
-    /// and log the equivocation attempt.
-    received_votes_by_height: HashMap<(u64, ValidatorId), Hash>,
+    /// AND round across different VoteSets. With HotStuff-2 style voting, validators can
+    /// legitimately vote for different blocks at the same height if they're at different rounds
+    /// (due to unlock on round advancement). True equivocation is voting for different blocks
+    /// at the SAME height AND round.
+    ///
+    /// Maps (height, voter) -> (block_hash, round) so we can distinguish legitimate revotes
+    /// (different round) from Byzantine equivocation (same round, different block).
+    received_votes_by_height: HashMap<(u64, ValidatorId), (Hash, u64)>,
 
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> (Block, QC).
@@ -720,6 +724,13 @@ impl BftState {
         // Vote for our own fallback block
         actions.extend(self.create_vote(block_hash, height, round));
 
+        // Set proposal timer in case this fallback block doesn't get quorum.
+        // Without this timer, consensus could stall if the block doesn't reach quorum.
+        actions.push(Action::SetTimer {
+            id: TimerId::Proposal,
+            duration: self.config.proposal_interval,
+        });
+
         actions
     }
 
@@ -955,6 +966,10 @@ impl BftState {
                     "Updated latest_qc from received block header"
                 );
                 self.latest_qc = Some(header.parent_qc.clone());
+
+                // HotStuff-2 unlock: when we see a higher QC, we can safely unlock
+                // our vote locks at or below that QC's height
+                self.maybe_unlock_for_qc(&header.parent_qc);
             }
         }
 
@@ -1599,25 +1614,55 @@ impl BftState {
             return vec![];
         }
 
-        // Check for equivocation: has this validator voted for a DIFFERENT block at this height?
-        // This is critical for BFT safety - a validator must not vote for conflicting blocks.
+        // HotStuff-2 voting rules: A validator can vote for different blocks at the same height
+        // as long as they're at different rounds. This is because validators can unlock their
+        // votes when they advance rounds (no QC formed within timeout).
+        //
+        // Equivocation (Byzantine behavior) is voting for DIFFERENT blocks at the SAME round.
+        // Voting for different blocks at different rounds is legitimate HotStuff-2 behavior.
+        //
+        // We track votes by (height, voter) -> (block_hash, round) to detect true equivocation.
         let vote_key = (height, vote.voter);
-        if let Some(&existing_block) = self.received_votes_by_height.get(&vote_key) {
+        if let Some(&(existing_block, existing_round)) =
+            self.received_votes_by_height.get(&vote_key)
+        {
             if existing_block != block_hash {
-                // EQUIVOCATION DETECTED: This validator voted for different blocks at the same height!
-                // This is Byzantine behavior. Log it and reject the vote.
-                warn!(
+                if vote.round == existing_round {
+                    // EQUIVOCATION: Same round, different block - this is Byzantine behavior
+                    warn!(
+                        voter = ?vote.voter,
+                        height = height,
+                        round = vote.round,
+                        existing_block = ?existing_block,
+                        new_block = ?block_hash,
+                        "EQUIVOCATION DETECTED: validator voted for different blocks at same height AND round"
+                    );
+                    // TODO: Generate equivocation proof for slashing
+                    return vec![];
+                } else if vote.round < existing_round {
+                    // Old vote from a previous round - ignore it (we already have a newer vote)
+                    trace!(
+                        voter = ?vote.voter,
+                        height = height,
+                        old_round = vote.round,
+                        new_round = existing_round,
+                        "Ignoring old vote from previous round"
+                    );
+                    return vec![];
+                }
+                // vote.round > existing_round: This is a legitimate HotStuff-2 revote after unlock
+                // The validator advanced rounds and voted for a new block. This is expected.
+                debug!(
                     voter = ?vote.voter,
                     height = height,
-                    existing_block = ?existing_block,
+                    old_round = existing_round,
+                    new_round = vote.round,
+                    old_block = ?existing_block,
                     new_block = ?block_hash,
-                    "EQUIVOCATION DETECTED: validator voted for different blocks at same height"
+                    "Accepting revote after round advancement (HotStuff-2 unlock)"
                 );
-                // TODO: In a production system, we might want to generate an equivocation proof
-                // that can be used to slash the Byzantine validator's stake.
-                return vec![];
             }
-            // Same block - this is a duplicate vote, VoteSet will handle it
+            // Same block - this is a duplicate vote (possibly at different round), VoteSet will handle it
         }
 
         // Pre-compute topology values before mutable borrows
@@ -1629,8 +1674,9 @@ impl BftState {
             .get(&block_hash)
             .map(|pb| pb.header().clone());
 
-        // Record that this validator voted for this block at this height
-        self.received_votes_by_height.insert(vote_key, block_hash);
+        // Record that this validator voted for this block at this height and round
+        self.received_votes_by_height
+            .insert(vote_key, (block_hash, vote.round));
 
         // Get or create vote set
         let vote_set = self
@@ -1792,6 +1838,10 @@ impl BftState {
 
         if should_update {
             self.latest_qc = Some(qc.clone());
+
+            // HotStuff-2 unlock: when a QC forms, we can safely unlock
+            // our vote locks at or below that QC's height
+            self.maybe_unlock_for_qc(&qc);
         }
 
         let mut actions = vec![];
@@ -2128,6 +2178,8 @@ impl BftState {
             .is_none_or(|existing| qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(qc.clone());
+            // HotStuff-2 unlock for synced QC
+            self.maybe_unlock_for_qc(&qc);
         }
 
         // Also cache the parent_qc from the block header if it's newer
@@ -2138,6 +2190,8 @@ impl BftState {
                 .is_none_or(|existing| block.header.parent_qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(block.header.parent_qc.clone());
+            // HotStuff-2 unlock for parent QC
+            self.maybe_unlock_for_qc(&block.header.parent_qc);
         }
 
         // Clean up old state
@@ -2198,228 +2252,173 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // View Change
     // ═══════════════════════════════════════════════════════════════════════════
+    // Implicit Round Advancement (HotStuff-2 Style)
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle view change timer firing (BFT-level fallback).
+    /// Advance the round locally (implicit view change).
     ///
-    /// Note: The primary view change logic is in `ViewChangeState`, which handles
-    /// timeout detection, vote collection, and certificate creation. This method
-    /// is only called if BftState handles the timer directly (e.g., in tests).
-    /// In production, `NodeState` routes the timer to `ViewChangeState` instead.
-    pub fn on_view_change_timer(&mut self) -> Vec<Action> {
-        vec![Action::SetTimer {
-            id: TimerId::ViewChange,
-            duration: self.config.view_change_timeout,
-        }]
-    }
-
-    /// Handle view change completion (round increment).
+    /// This is called when a timeout occurs and we need to try a new round.
+    /// Unlike explicit view changes, this doesn't require coordinated voting -
+    /// each validator advances locally.
     ///
-    /// When a view change completes:
-    /// 1. Update our view/round
-    /// 2. Update our latest_qc if the view change certificate has a newer one
-    /// 3. If highest_qc is at current height, we already have a QC - just wait for next proposal
-    /// 4. If we're the new proposer, build and broadcast a fallback block
-    /// 5. Otherwise, restart the proposal timer to wait for the new proposer
-    #[instrument(skip(self, highest_qc), fields(height = height, new_round = new_round))]
-    pub fn on_view_change_completed(
+    /// Returns actions to propose if we're the new proposer.
+    #[instrument(skip(self, _mempool, _deferrals, _aborts, _certificates), fields(new_round = self.view + 1))]
+    pub fn advance_round(
         &mut self,
-        height: u64,
-        new_round: u64,
-        highest_qc: QuorumCertificate,
+        _mempool: &[Arc<RoutableTransaction>],
+        _deferrals: Vec<TransactionDefer>,
+        _aborts: Vec<TransactionAbort>,
+        _certificates: Vec<Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
-        // Only update if this is for our current height
-        if height != self.committed_height + 1 {
-            debug!(
-                height = height,
-                expected = self.committed_height + 1,
-                "View change for unexpected height"
-            );
-            return vec![];
-        }
+        // The next height to propose is one above the highest certified block,
+        // NOT one above the committed block. This matches on_proposal_timer behavior.
+        let height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height.0 + 1)
+            .unwrap_or(self.committed_height + 1);
+        let old_round = self.view;
+        self.view += 1;
 
-        // Update our view/round
-        self.view = new_round;
+        info!(
+            validator = ?self.validator_id(),
+            height = height,
+            old_round = old_round,
+            new_round = self.view,
+            "Advancing round locally (implicit view change)"
+        );
 
-        // Update our latest_qc if the view change certificate has a newer one
-        // This is critical: if there's a QC at the current height, we should know about it
-        //
-        // IMPORTANT: If the highest_qc height is significantly ahead of our committed_height,
-        // we need to trigger sync. This handles the case where we receive view change
-        // votes/certificates from validators who have seen more blocks than us.
-        // Without this check, we could update latest_qc to a high height without having
-        // the actual blocks, which would prevent the sync trigger in on_block_header
-        // (since it uses max(latest_qc.height, committed_height) to determine if we need sync).
-        let mut sync_action = None;
-        if !highest_qc.is_genesis() {
-            let should_update = self
-                .latest_qc
-                .as_ref()
-                .is_none_or(|existing| highest_qc.height.0 > existing.height.0);
-            if should_update {
-                // Check if we need to sync before updating latest_qc
-                // We need sync if the QC references blocks we don't have
-                if highest_qc.height.0 > self.committed_height + 1 {
-                    info!(
-                        validator = ?self.validator_id(),
-                        qc_height = highest_qc.height.0,
-                        committed_height = self.committed_height,
-                        "View change has QC ahead of committed height, triggering sync"
-                    );
-                    sync_action = Some(Action::EnqueueInternal {
-                        event: Event::SyncNeeded {
-                            target_height: highest_qc.height.0,
-                            target_hash: highest_qc.block_hash,
-                        },
-                    });
-                }
-                info!(
-                    validator = ?self.validator_id(),
-                    qc_height = highest_qc.height.0,
-                    qc_block = ?highest_qc.block_hash,
-                    "Updating latest_qc from view change certificate"
-                );
-                self.latest_qc = Some(highest_qc.clone());
-            }
-        }
-
-        // If the highest_qc is at the current height (the view change height),
-        // that means a QC already exists for a block at this height.
-        // We need to process this QC to potentially commit blocks and propose the next height.
-        //
-        // IMPORTANT: Reset the view/round to 0 because the next height (N+1) should start
-        // at round 0, not at the view change round. The view change was for height N, not N+1.
-        if highest_qc.height.0 == height {
-            let next_height = height + 1;
-
-            info!(
-                validator = ?self.validator_id(),
-                height = height,
-                new_round = new_round,
-                qc_block = ?highest_qc.block_hash,
-                next_height = next_height,
-                "QC already exists at view change height, resetting view and triggering QC processing"
-            );
-
-            // Reset view to 0 for the next height's proposal
-            self.view = 0;
-
-            // Clear vote-lock for the next height if we had one.
-            // The previous block at next_height didn't get a QC (hence the view change),
-            // so we need to allow proposing a new block at that height.
-            // This is safe because the view change certificate proves consensus moved on.
-            if self.voted_heights.remove(&next_height).is_some() {
-                info!(
-                    validator = ?self.validator_id(),
-                    height = next_height,
-                    "Cleared vote-lock for next height after view change with QC at current height"
-                );
-            }
-
-            // Emit a QuorumCertificateFormed event so the node state machine can handle it
-            // (it has access to mempool data needed for the next proposal).
-            let mut actions = vec![Action::EnqueueInternal {
-                event: Event::QuorumCertificateFormed {
-                    block_hash: highest_qc.block_hash,
-                    qc: highest_qc,
-                },
-            }];
-            if let Some(action) = sync_action {
-                actions.push(action);
-            }
-            return actions;
-        }
-
-        // If the highest_qc from the view change is for a height BEFORE the current height,
-        // then no block at the current height was certified. In this case, it's safe to
-        // unlock our vote because:
-        //
-        // 1. The block we voted for never reached quorum (no QC formed)
-        // 2. No honest validator could have committed based on our vote
-        // 3. The view change certificate proves consensus has moved on
-        //
-        // This prevents the deadlock where all validators are locked to an uncertified
-        // block and no progress can be made.
-        //
-        // Reference: https://decentralizedthoughts.github.io/2023-04-01-hotstuff-2/
-        // "if the leader obtains a lock (a quorum certificate) from the preceding view,
-        // it knows that it has obtained the maximal locked value that possibly exists"
-        if highest_qc.height.0 < height {
-            // The highest QC is from a previous height, meaning no block at this height
-            // was certified. Safe to unlock and reset vote tracking.
+        // HotStuff-2 unlock: If no QC has formed at this height, we can safely
+        // clear our vote lock. This is determined by checking if latest_qc is
+        // still below our current height.
+        let latest_qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+        if latest_qc_height < height {
+            // No QC formed at current height - safe to unlock
             let had_vote = self.voted_heights.remove(&height).is_some();
-
-            // Also clear vote tracking for this height so we accept new votes from
-            // validators who previously voted for the uncertified block. This is safe
-            // because the view change certificate proves no QC formed.
             let cleared_votes = self.clear_vote_tracking_for_height(height);
 
             if had_vote || cleared_votes > 0 {
                 info!(
                     validator = ?self.validator_id(),
                     height = height,
-                    new_round = new_round,
-                    highest_qc_height = highest_qc.height.0,
+                    new_round = self.view,
+                    latest_qc_height = latest_qc_height,
                     cleared_votes = cleared_votes,
                     "Unlocking vote at height (no QC formed, safe per HotStuff-2)"
                 );
             }
         }
 
-        info!(
-            validator = ?self.validator_id(),
-            height = height,
-            new_round = new_round,
-            "Applied view change"
-        );
-
         // Check if we're the new proposer for this height/round
-        if self.should_propose(height, new_round) {
-            // Check if we've already voted at this height - if so, we're locked to that block
-            // and must re-propose it (not create a new fallback block).
-            // NOTE: After the HotStuff-2 unlock above, this will only be true if
-            // the highest_qc was at the current height (meaning a QC exists).
-            if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
+        if self.should_propose(height, self.view) {
+            // Check if we've already voted at this height - if so, we're locked
+            if let Some(&(existing_hash, _)) = self.voted_heights.get(&height) {
                 info!(
                     validator = ?self.validator_id(),
                     height = height,
-                    existing_round = existing_round,
-                    new_round = new_round,
+                    new_round = self.view,
                     existing_block = ?existing_hash,
-                    "Vote-locked to certified block at this height, re-proposing"
+                    "Vote-locked at this height, re-proposing"
                 );
-
-                // Re-propose the block we're locked to so other validators can vote on it
-                let mut actions = self.repropose_locked_block(existing_hash, height);
-                if let Some(action) = sync_action {
-                    actions.push(action);
-                }
-                return actions;
+                return self.repropose_locked_block(existing_hash, height);
             }
 
             info!(
                 validator = ?self.validator_id(),
                 height = height,
-                new_round = new_round,
-                "We are the new proposer after view change - building fallback block"
+                new_round = self.view,
+                "We are the new proposer after round advance - building block"
             );
 
-            // Build and broadcast fallback block
-            let mut actions = self.build_and_broadcast_fallback_block(height, new_round);
-            if let Some(action) = sync_action {
-                actions.push(action);
-            }
-            return actions;
+            // Build and broadcast a new block (use fallback block builder)
+            return self.build_and_broadcast_fallback_block(height, self.view);
         }
 
-        // Not the proposer - restart the proposal timer to wait for new proposer
-        let mut actions = vec![Action::SetTimer {
+        // Not the proposer - just reschedule the timer
+        vec![Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
-        }];
-        if let Some(action) = sync_action {
-            actions.push(action);
+        }]
+    }
+
+    /// Called when we receive a QC from a block header that allows us to unlock.
+    ///
+    /// # HotStuff-2 Unlock Rule
+    ///
+    /// When we see a QC at height H, we can safely remove vote locks at heights ≤ H:
+    ///
+    /// - **Heights < H**: These are older heights where consensus has clearly moved past.
+    ///   Any block we voted for at these heights either got committed or was abandoned.
+    ///
+    /// - **Height = H (same height as QC)**: If we voted for a different block B' at height H
+    ///   but the QC is for block B, then B' can never get a QC (since 2f+1 already voted for B,
+    ///   leaving at most f honest validators who could vote for B'). Our lock is now irrelevant.
+    ///   If we voted for the same block B, unlocking is trivially safe.
+    ///
+    /// This enables voting for new blocks at height H+1 that extend the newly certified block,
+    /// even if we previously voted for a different block at H+1 that didn't get a QC.
+    ///
+    /// # Safety Argument
+    ///
+    /// The key invariant is: once a QC exists for block B at height H, no conflicting block
+    /// at height H can ever get a QC (quorum intersection). Therefore, unlocking vote locks
+    /// at height H is safe - any conflicting vote would be "dead" anyway.
+    ///
+    /// # View Synchronization
+    ///
+    /// This method also synchronizes our view/round to match the QC. In HotStuff-2,
+    /// liveness requires that nodes eventually reach the same view. When we see a QC
+    /// formed at round R, we know the network has made progress, so we advance our
+    /// view to at least R (ready to participate in round R or later).
+    ///
+    /// This is the key mechanism that prevents view divergence: nodes that fall behind
+    /// (e.g., due to network partitions or slow clocks) will catch up when they see
+    /// QCs from the rest of the network.
+    pub fn maybe_unlock_for_qc(&mut self, qc: &QuorumCertificate) {
+        if qc.is_genesis() {
+            return;
         }
-        actions
+
+        // View synchronization: advance our view to match the QC's round.
+        // This ensures liveness by keeping nodes in sync with network progress.
+        //
+        // We sync to qc.round (not qc.round + 1) because:
+        // - The QC proves consensus succeeded at this round
+        // - We should be ready to participate in this round or later
+        // - The proposer for the next height will use their current view
+        if qc.round > self.view {
+            info!(
+                validator = ?self.validator_id(),
+                old_view = self.view,
+                new_view = qc.round,
+                qc_height = qc.height.0,
+                "View synchronization: advancing view to match QC"
+            );
+            self.view = qc.round;
+        }
+
+        // Remove vote locks for heights at or below the QC height.
+        // This is safe because:
+        // 1. Heights < H: consensus has moved past these heights
+        // 2. Height = H: if we voted for a different block, it can never get a QC (quorum intersection)
+        let qc_height = qc.height.0;
+        let unlocked: Vec<u64> = self
+            .voted_heights
+            .keys()
+            .filter(|h| **h <= qc_height)
+            .copied()
+            .collect();
+
+        for height in unlocked {
+            if self.voted_heights.remove(&height).is_some() {
+                trace!(
+                    validator = ?self.validator_id(),
+                    height = height,
+                    qc_height = qc_height,
+                    "Unlocked vote due to higher QC"
+                );
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2884,7 +2883,6 @@ impl SubStateMachine for BftState {
                 // Note: In real usage, mempool, deferrals, and certificates would be passed in
                 Some(self.on_proposal_timer(&[], vec![], vec![], vec![]))
             }
-            Event::ViewChangeTimer => Some(self.on_view_change_timer()),
             Event::BlockHeaderReceived {
                 header,
                 tx_hashes,
@@ -2916,16 +2914,9 @@ impl SubStateMachine for BftState {
             Event::QcSignatureVerified { block_hash, valid } => {
                 Some(self.on_qc_signature_verified(*block_hash, *valid))
             }
-            Event::ViewChangeCompleted {
-                height,
-                new_round,
-                highest_qc,
-            } => Some(self.on_view_change_completed(*height, *new_round, highest_qc.clone())),
             Event::ChainMetadataFetched { height, hash, qc } => {
                 Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))
             }
-            // Note: ViewChangeVoteReceived and ViewChangeCertificateReceived are handled
-            // by ViewChangeState, not directly by BftState
             _ => None,
         }
     }
@@ -3440,11 +3431,22 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Fallback Block Tests
+    // Implicit Round Advancement Tests (HotStuff-2 Style)
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_fallback_block_on_view_change_if_proposer() {
+    fn test_advance_round_increments_view() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        let initial_view = state.view;
+        let _actions = state.advance_round(&[], vec![], vec![], vec![]);
+
+        assert_eq!(state.view, initial_view + 1, "View should increment by 1");
+    }
+
+    #[test]
+    fn test_advance_round_proposer_broadcasts() {
         use hyperscale_core::Action;
 
         let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
@@ -3459,103 +3461,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
 
-        // Validator 1 - will be proposer at (height=1, round=0) since (1+0)%4 = 1
-        let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(
-            1,
-            keys[1].clone(),
-            topology,
-            BftConfig::default(),
-            RecoveredState::default(),
-        );
-
-        state.set_time(Duration::from_secs(100));
-
-        // Simulate view change completion at height 1, round 0
-        // Validator 1 should be the proposer
-        // Pass genesis QC since there's no QC at this height yet
-        let actions = state.on_view_change_completed(1, 0, QuorumCertificate::genesis());
-
-        // Should broadcast a fallback block
-        let has_broadcast = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
-        assert!(has_broadcast, "Proposer should broadcast fallback block");
-    }
-
-    #[test]
-    fn test_no_fallback_block_if_not_proposer() {
-        use hyperscale_core::Action;
-
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
-                public_key: k.public_key(),
-                voting_power: 1,
-            })
-            .collect();
-        let validator_set = ValidatorSet::new(validators);
-
-        // Validator 0 - NOT the proposer at (height=1, round=0) since (1+0)%4 = 1
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
-        let mut state = BftState::new(
-            0,
-            keys[0].clone(),
-            topology,
-            BftConfig::default(),
-            RecoveredState::default(),
-        );
-
-        state.set_time(Duration::from_secs(100));
-
-        // Simulate view change completion at height 1, round 0
-        // Validator 0 is NOT the proposer
-        // Pass genesis QC since there's no QC at this height yet
-        let actions = state.on_view_change_completed(1, 0, QuorumCertificate::genesis());
-
-        // Should NOT broadcast (just set timer)
-        let has_broadcast = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
-        assert!(
-            !has_broadcast,
-            "Non-proposer should not broadcast fallback block"
-        );
-
-        // Should set timer to wait for proposer
-        let has_timer = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::Proposal,
-                    ..
-                }
-            )
-        });
-        assert!(has_timer, "Should set proposal timer to wait for proposer");
-    }
-
-    #[test]
-    fn test_fallback_block_inherits_parent_timestamp() {
-        use hyperscale_core::OutboundMessage;
-        use hyperscale_types::SignerBitfield;
-
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
-                public_key: k.public_key(),
-                voting_power: 1,
-            })
-            .collect();
-        let validator_set = ValidatorSet::new(validators);
-
-        // Validator 2 will be proposer at (height=1, round=1) since (1+1)%4 = 2
+        // Validator 2 - will be proposer at (height=1, round=1) since (1+1)%4 = 2
         let topology = Arc::new(StaticTopology::new(ValidatorId(2), 1, validator_set));
         let mut state = BftState::new(
             2,
@@ -3565,55 +3471,142 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Set current time way ahead
-        state.set_time(Duration::from_secs(1000));
+        state.set_time(Duration::from_secs(100));
 
-        // Set up a latest_qc with timestamp 500 seconds
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        signers.set(1);
-        signers.set(2);
+        // Advance to round 1 - validator 2 becomes proposer
+        let actions = state.advance_round(&[], vec![], vec![], vec![]);
 
-        let parent_qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"parent"),
-            height: BlockHeight(0),
-            parent_block_hash: Hash::ZERO,
+        // Should broadcast a fallback block
+        let has_broadcast = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
+        assert!(
+            has_broadcast,
+            "Proposer should broadcast after round advance"
+        );
+    }
+
+    #[test]
+    fn test_advance_round_unlocks_when_no_qc() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Simulate having voted at height 1
+        let block_hash = Hash::from_bytes(b"voted_block");
+        state.voted_heights.insert(1, (block_hash, 0));
+
+        // Advance round - should unlock since no QC at height 1
+        let _actions = state.advance_round(&[], vec![], vec![], vec![]);
+
+        assert!(
+            !state.voted_heights.contains_key(&1),
+            "Vote lock should be cleared when no QC at height"
+        );
+    }
+
+    #[test]
+    fn test_maybe_unlock_for_qc() {
+        let mut state = make_test_state();
+
+        // Set up vote locks at heights 1, 2, 3
+        state
+            .voted_heights
+            .insert(1, (Hash::from_bytes(b"block1"), 0));
+        state
+            .voted_heights
+            .insert(2, (Hash::from_bytes(b"block2"), 0));
+        state
+            .voted_heights
+            .insert(3, (Hash::from_bytes(b"block3"), 0));
+
+        // Receive QC at height 2 - should unlock heights 1 and 2
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"qc_block"),
+            height: BlockHeight(2),
+            parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
+            signers: SignerBitfield::empty(),
             aggregated_signature: Signature::zero(),
-            signers,
             voting_power: VotePower(3),
-            weighted_timestamp_ms: 500_000, // Parent timestamp is 500 seconds
+            weighted_timestamp_ms: 100_000,
         };
-        state.latest_qc = Some(parent_qc);
 
-        // Trigger view change - validator 2 is proposer for (height=1, round=1)
-        // Pass genesis QC since there's no QC at this height yet
-        let actions = state.on_view_change_completed(1, 1, QuorumCertificate::genesis());
+        state.maybe_unlock_for_qc(&qc);
 
-        // Find the broadcast action and extract the header
-        for action in actions {
-            if let Action::BroadcastToShard {
-                message: OutboundMessage::BlockHeader(gossip),
-                ..
-            } = action
-            {
-                // Fallback block should inherit parent timestamp (500_000), NOT current time (1000_000)
-                assert_eq!(
-                    gossip.header.timestamp, 500_000,
-                    "Fallback block should inherit parent's weighted timestamp"
-                );
-                assert!(
-                    gossip.header.is_fallback,
-                    "Should be marked as fallback block"
-                );
-                assert!(
-                    gossip.transaction_hashes.is_empty(),
-                    "Fallback block should have no transactions"
-                );
-                return;
-            }
-        }
-        panic!("Expected BroadcastToShard action with BlockHeader");
+        assert!(
+            !state.voted_heights.contains_key(&1),
+            "Height 1 should be unlocked"
+        );
+        assert!(
+            !state.voted_heights.contains_key(&2),
+            "Height 2 should be unlocked"
+        );
+        assert!(
+            state.voted_heights.contains_key(&3),
+            "Height 3 should remain locked"
+        );
+    }
+
+    #[test]
+    fn test_view_sync_on_higher_qc() {
+        let mut state = make_test_state();
+
+        // Start at view 5
+        state.view = 5;
+
+        // Receive QC formed at round 10 - should advance view to 10
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"qc_block"),
+            height: BlockHeight(2),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 10,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+
+        state.maybe_unlock_for_qc(&qc);
+
+        assert_eq!(state.view, 10, "View should sync to QC's round");
+    }
+
+    #[test]
+    fn test_view_sync_does_not_regress() {
+        let mut state = make_test_state();
+
+        // Start at view 15
+        state.view = 15;
+
+        // Receive QC formed at round 10 - should NOT regress view
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"qc_block"),
+            height: BlockHeight(2),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 10,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+
+        state.maybe_unlock_for_qc(&qc);
+
+        assert_eq!(state.view, 15, "View should NOT regress to lower QC round");
+    }
+
+    #[test]
+    fn test_genesis_qc_does_not_sync_view() {
+        let mut state = make_test_state();
+
+        // Start at view 5
+        state.view = 5;
+
+        // Genesis QC should not affect view
+        let genesis_qc = QuorumCertificate::genesis();
+        state.maybe_unlock_for_qc(&genesis_qc);
+
+        assert_eq!(state.view, 5, "Genesis QC should not change view");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3970,27 +3963,28 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
+        let round = 0u64; // Same round for both votes - true equivocation
         let voter = ValidatorId(1);
 
         // Create two different blocks at the same height
         let block_a_hash = Hash::from_bytes(b"block_a_at_height_1");
         let block_b_hash = Hash::from_bytes(b"block_b_at_height_1");
 
-        // Create vote for block A from validator 1
+        // Create vote for block A from validator 1 at round 0
         let vote_a = BlockVote {
             block_hash: block_a_hash,
             height: BlockHeight(height),
-            round: 0,
+            round,
             voter,
             signature: keys[1].sign(block_a_hash.as_bytes()),
             timestamp: 100_000,
         };
 
-        // Create vote for block B from SAME validator 1 (equivocation!)
+        // Create vote for block B from SAME validator 1 at SAME round (equivocation!)
         let vote_b = BlockVote {
             block_hash: block_b_hash,
             height: BlockHeight(height),
-            round: 1,
+            round, // Same round - this is true equivocation
             voter,
             signature: keys[1].sign(block_b_hash.as_bytes()),
             timestamp: 100_001,
@@ -4015,10 +4009,10 @@ mod tests {
         );
         assert_eq!(
             state.received_votes_by_height.get(&(height, voter)),
-            Some(&block_a_hash)
+            Some(&(block_a_hash, round))
         );
 
-        // Now try to add vote B (equivocation attempt)
+        // Now try to add vote B (equivocation attempt at same round)
         state.pending_vote_verifications.insert(
             (block_b_hash, voter),
             PendingVoteVerification {
@@ -4029,13 +4023,13 @@ mod tests {
         );
         let actions = state.on_vote_signature_verified(vote_b, true);
 
-        // Vote B should be REJECTED (equivocation detected)
+        // Vote B should be REJECTED (equivocation detected - same height AND round)
         assert!(actions.is_empty(), "Equivocating vote should be rejected");
 
         // We should still be tracking vote A
         assert_eq!(
             state.received_votes_by_height.get(&(height, voter)),
-            Some(&block_a_hash),
+            Some(&(block_a_hash, round)),
             "Original vote should still be tracked"
         );
 
@@ -4047,6 +4041,105 @@ mod tests {
                 "Equivocating vote should not be added to vote set"
             );
         }
+    }
+
+    #[test]
+    fn test_hotstuff2_allows_revote_at_higher_round() {
+        // HotStuff-2 allows validators to vote for different blocks at the same height
+        // if they're at different rounds (due to unlock on round advancement).
+        // This is NOT equivocation - it's legitimate behavior after timeout.
+        let (mut state, keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let voter = ValidatorId(1);
+
+        // Create two different blocks at the same height
+        let block_a_hash = Hash::from_bytes(b"block_a_at_height_1");
+        let block_b_hash = Hash::from_bytes(b"block_b_at_height_1");
+
+        // Create vote for block A at round 0
+        let vote_a = BlockVote {
+            block_hash: block_a_hash,
+            height: BlockHeight(height),
+            round: 0,
+            voter,
+            signature: keys[1].sign(block_a_hash.as_bytes()),
+            timestamp: 100_000,
+        };
+
+        // Create vote for block B at round 1 (after round advancement)
+        let vote_b = BlockVote {
+            block_hash: block_b_hash,
+            height: BlockHeight(height),
+            round: 1, // Higher round - legitimate revote
+            voter,
+            signature: keys[1].sign(block_b_hash.as_bytes()),
+            timestamp: 100_001,
+        };
+
+        // Add pending block B so we can vote on it
+        // For height=1, round=1: proposer = (1 + 1) % 4 = 2
+        let parent_qc = QuorumCertificate::genesis();
+        let header_b = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: parent_qc.block_hash,
+            parent_qc: parent_qc.clone(),
+            proposer: ValidatorId(2), // Correct proposer for (height=1, round=1)
+            timestamp: 100_001,
+            round: 1,
+            is_fallback: true,
+        };
+        state
+            .pending_blocks
+            .insert(block_b_hash, PendingBlock::new(header_b, vec![], vec![]));
+
+        // Add vote A
+        state.pending_vote_verifications.insert(
+            (block_a_hash, voter),
+            PendingVoteVerification {
+                vote: vote_a.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        state.on_vote_signature_verified(vote_a, true);
+
+        // Vote A should be recorded at round 0
+        assert_eq!(
+            state.received_votes_by_height.get(&(height, voter)),
+            Some(&(block_a_hash, 0))
+        );
+
+        // Now add vote B at higher round - should be ACCEPTED (HotStuff-2 revote)
+        state.pending_vote_verifications.insert(
+            (block_b_hash, voter),
+            PendingVoteVerification {
+                vote: vote_b.clone(),
+                voting_power: 1,
+                committee_index: 1,
+            },
+        );
+        let _actions = state.on_vote_signature_verified(vote_b, true);
+
+        // Vote B should be ACCEPTED (different round = legitimate revote)
+        // Note: actions may be empty because quorum isn't reached yet (1 vote != quorum)
+        // The key test is that the vote was accepted and tracking was updated.
+
+        // Tracking should now show vote B at round 1 (higher round replaces lower)
+        assert_eq!(
+            state.received_votes_by_height.get(&(height, voter)),
+            Some(&(block_b_hash, 1)),
+            "Higher round vote should replace lower round vote"
+        );
+
+        // Vote set for block B should have the vote
+        assert!(
+            state.vote_sets.contains_key(&block_b_hash),
+            "Vote should create a vote set for block B"
+        );
+        let vote_set = state.vote_sets.get(&block_b_hash).unwrap();
+        assert_eq!(vote_set.voting_power(), 1, "Vote set should have 1 vote");
     }
 
     #[test]
@@ -4106,7 +4199,7 @@ mod tests {
         // But we should still have the original vote tracked
         assert_eq!(
             state.received_votes_by_height.get(&(height, voter)),
-            Some(&block_hash)
+            Some(&(block_hash, 0)) // round 0
         );
     }
 
@@ -4121,7 +4214,7 @@ mod tests {
             let block_hash = Hash::from_bytes(format!("block_{}", height).as_bytes());
             state
                 .received_votes_by_height
-                .insert((height, voter), block_hash);
+                .insert((height, voter), (block_hash, 0)); // round 0
         }
 
         assert_eq!(state.received_votes_by_height.len(), 3);
@@ -4298,46 +4391,83 @@ mod tests {
         );
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Extended View Change Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
     #[test]
-    fn test_view_change_with_qc_at_current_height_emits_qc_formed() {
-        // When view change completes and highest_qc.height == view_change_height,
-        // we should emit QuorumCertificateFormed to process the QC instead of proposing
-        let (mut state, _keys) = make_multi_validator_state();
+    fn test_multiple_consecutive_view_changes_unlock_and_revote() {
+        // Scenario: Multiple view changes occur before any QC forms.
+        // Each view change unlocks votes at the current height and then
+        // (if we're the proposer) creates a new fallback block and votes for it.
+        //
+        // Note: advance_round unlocks votes at the height we're PROPOSING for,
+        // which is latest_qc.height + 1 (or committed_height + 1 if no QC).
+        // Without any QC, we're always proposing for height 1.
+        //
+        // The flow is: unlock -> check if proposer -> create fallback -> vote for it
+        // So the old vote is replaced with a new vote for the fallback block.
+        let mut state = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        let view_change_height = 1u64;
-        let new_round = 5u64;
+        let height = 1u64;
 
-        // Create a QC at the view change height
-        let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_at_height_1"),
-            height: BlockHeight(view_change_height),
-            parent_block_hash: Hash::from_bytes(b"parent"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
-            voting_power: VotePower(3),
-            weighted_timestamp_ms: 100_000,
-        };
+        // Round 0: Vote for block A at height 1
+        let block_a = Hash::from_bytes(b"block_a_round_0");
+        state.voted_heights.insert(height, (block_a, 0));
+        assert!(state.voted_heights.contains_key(&height));
 
-        // Trigger view change with this QC
-        let actions = state.on_view_change_completed(view_change_height, new_round, qc.clone());
-
-        // Should emit QuorumCertificateFormed, not broadcast a fallback block
-        let has_qc_formed = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::EnqueueInternal {
-                    event: Event::QuorumCertificateFormed { .. }
-                }
-            )
-        });
+        // Round 1: First view change
+        // Validator 0 is proposer for (1, 1) since (1+1)%4 = 2... wait no.
+        // make_test_state creates a validator with ValidatorId(0).
+        // proposer_for(1, 0) = (1+0)%4 = 1 = ValidatorId(1)
+        // proposer_for(1, 1) = (1+1)%4 = 2 = ValidatorId(2)
+        // So ValidatorId(0) is NOT the proposer at round 1.
+        state.view = 0; // Reset for clean test
+        let _actions = state.advance_round(&[], vec![], vec![], vec![]);
+        assert_eq!(state.view, 1);
+        // Vote lock should be cleared (no QC at height 1, latest_qc_height = 0 < 1)
+        // Since we're NOT the proposer, no new vote is created
         assert!(
-            has_qc_formed,
-            "Should emit QuorumCertificateFormed when QC exists at view change height"
+            !state.voted_heights.contains_key(&height),
+            "Vote lock should be cleared after first view change (not proposer)"
         );
 
-        // Should NOT have a broadcast action (we're not proposing)
+        // Simulate voting for block B at round 1 (externally, as if we received a proposal)
+        let block_b = Hash::from_bytes(b"block_b_round_1");
+        state.voted_heights.insert(height, (block_b, 1));
+
+        // Round 2: Second view change - not proposer, should unlock
+        // proposer_for(1, 2) = (1+2)%4 = 3 = ValidatorId(3)
+        let _actions = state.advance_round(&[], vec![], vec![], vec![]);
+        assert_eq!(state.view, 2);
+        assert!(
+            !state.voted_heights.contains_key(&height),
+            "Vote lock should be cleared after second view change (not proposer)"
+        );
+
+        // Simulate voting for block C at round 2
+        let block_c = Hash::from_bytes(b"block_c_round_2");
+        state.voted_heights.insert(height, (block_c, 2));
+
+        // Round 3: Third view change - not proposer, should unlock
+        // proposer_for(1, 3) = (1+3)%4 = 0 = ValidatorId(0) - WE ARE THE PROPOSER!
+        let actions = state.advance_round(&[], vec![], vec![], vec![]);
+        assert_eq!(state.view, 3);
+        // Since we're the proposer, we create a fallback block and vote for it
+        // So there WILL be a vote at height 1 (for the new fallback block)
+        assert!(
+            state.voted_heights.contains_key(&height),
+            "Should have a new vote at height 1 (we're the proposer, voted for fallback)"
+        );
+        let (new_hash, new_round) = state.voted_heights.get(&height).unwrap();
+        assert_eq!(*new_round, 3, "Vote should be at round 3");
+        assert_ne!(
+            *new_hash, block_c,
+            "Vote should be for new fallback, not block C"
+        );
+
+        // Verify we broadcast a fallback block
         let has_broadcast = actions.iter().any(|a| {
             matches!(
                 a,
@@ -4347,71 +4477,123 @@ mod tests {
                 }
             )
         });
-        assert!(
-            !has_broadcast,
-            "Should NOT broadcast when QC exists at view change height"
-        );
-
-        // View should be reset to 0 for the next height
-        assert_eq!(state.view, 0, "View should be reset to 0 for next height");
+        assert!(has_broadcast, "Should broadcast fallback block");
     }
 
     #[test]
-    fn test_view_change_updates_latest_qc() {
-        // View change should update latest_qc if the certificate has a newer QC
-        let (mut state, _keys) = make_multi_validator_state();
+    fn test_view_change_does_not_unlock_lower_heights() {
+        // Scenario: We have a QC at height 1, so we're now proposing for height 2.
+        // advance_round should only try to unlock at height 2, not at height 1.
+        // Vote locks at lower heights are preserved (they'll be cleaned up on commit).
+        let mut state = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        // Start with no latest_qc
-        assert!(state.latest_qc.is_none());
-
-        // View change at height 1 (committed_height is 0, so committed_height + 1 = 1)
-        let view_change_height = 1u64;
-        let new_round = 1u64;
-
-        // Create a QC at height 0 (before view change height) - use genesis-like QC
-        // Note: The QC is for the parent height, not the view change height itself
+        // Set up: We have a QC at height 1 (meaning consensus decided for height 1)
+        let qc_block = Hash::from_bytes(b"qc_block_at_1");
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_at_height_0"),
-            height: BlockHeight(0),
-            parent_block_hash: Hash::from_bytes(b"genesis"),
+            block_hash: qc_block,
+            height: BlockHeight(1),
+            parent_block_hash: Hash::ZERO,
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: Signature::zero(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
+        state.latest_qc = Some(qc);
 
-        // Trigger view change with this QC
-        state.on_view_change_completed(view_change_height, new_round, qc.clone());
+        // We have votes at heights 1 and 2
+        state.voted_heights.insert(1, (qc_block, 0));
+        state
+            .voted_heights
+            .insert(2, (Hash::from_bytes(b"block_at_2"), 0));
 
-        // latest_qc should be updated (since height 0 > nothing)
-        assert!(state.latest_qc.is_some());
-        assert_eq!(state.latest_qc.as_ref().unwrap().height.0, 0);
-        assert_eq!(state.latest_qc.as_ref().unwrap().block_hash, qc.block_hash);
+        // View change advances round. With QC at height 1, we propose for height 2.
+        // The unlock check is: latest_qc_height (1) < height (2)? Yes.
+        // So it unlocks at height 2, NOT at height 1.
+        let _actions = state.advance_round(&[], vec![], vec![], vec![]);
+
+        // Vote at height 1 should still be there (advance_round doesn't touch it)
+        assert!(
+            state.voted_heights.contains_key(&1),
+            "Vote lock at height 1 should be preserved (advance_round only unlocks at proposal height)"
+        );
+
+        // Vote at height 2 should be cleared (we're proposing for height 2, no QC there)
+        assert!(
+            !state.voted_heights.contains_key(&2),
+            "Vote lock at height 2 should be cleared (no QC at height 2)"
+        );
     }
 
     #[test]
-    fn test_view_change_clears_vote_lock_for_next_height() {
-        // When view change completes with QC at current height,
-        // we should clear any vote-lock for the next height
-        let (mut state, _keys) = make_multi_validator_state();
+    fn test_qc_arriving_during_view_change_scenario() {
+        // Scenario: We're in the middle of view changes, then receive a QC.
+        // The QC should unlock votes at and below its height.
+        let mut state = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        let view_change_height = 1u64;
-        let next_height = 2u64;
-        let new_round = 5u64;
-
-        // Simulate having voted at the next height (which didn't get a QC)
-        let stale_block_hash = Hash::from_bytes(b"stale_block_at_height_2");
+        // Set up vote locks at multiple heights
         state
             .voted_heights
-            .insert(next_height, (stale_block_hash, 0));
+            .insert(1, (Hash::from_bytes(b"block_1"), 0));
+        state
+            .voted_heights
+            .insert(2, (Hash::from_bytes(b"block_2"), 0));
+        state
+            .voted_heights
+            .insert(3, (Hash::from_bytes(b"block_3"), 0));
 
-        // Create a QC at the view change height
+        // Simulate being at round 5 (multiple view changes happened)
+        state.view = 5;
+
+        // Now receive a QC at height 2 (maybe from a different validator's proposal)
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_at_height_1"),
-            height: BlockHeight(view_change_height),
+            block_hash: Hash::from_bytes(b"qc_block_2"),
+            height: BlockHeight(2),
+            parent_block_hash: Hash::from_bytes(b"parent_1"),
+            round: 3, // Different round from our votes
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+
+        state.maybe_unlock_for_qc(&qc);
+
+        // Heights 1 and 2 should be unlocked
+        assert!(
+            !state.voted_heights.contains_key(&1),
+            "Height 1 should be unlocked by QC at height 2"
+        );
+        assert!(
+            !state.voted_heights.contains_key(&2),
+            "Height 2 should be unlocked by QC at height 2"
+        );
+        // Height 3 should remain locked
+        assert!(
+            state.voted_heights.contains_key(&3),
+            "Height 3 should remain locked"
+        );
+    }
+
+    #[test]
+    fn test_unlock_for_qc_at_same_height_different_block() {
+        // Scenario: We voted for block A at height H, but QC forms for block B at height H.
+        // This proves B won consensus, so our lock on A is now irrelevant and safe to remove.
+        let mut state = make_test_state();
+
+        let block_a = Hash::from_bytes(b"block_a");
+        let block_b = Hash::from_bytes(b"block_b");
+        let height = 5u64;
+
+        // We voted for block A
+        state.voted_heights.insert(height, (block_a, 0));
+
+        // QC forms for block B (different block at same height)
+        let qc = QuorumCertificate {
+            block_hash: block_b, // Different from our vote!
+            height: BlockHeight(height),
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
             signers: SignerBitfield::empty(),
@@ -4420,13 +4602,362 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        // Trigger view change with this QC
-        state.on_view_change_completed(view_change_height, new_round, qc);
+        state.maybe_unlock_for_qc(&qc);
 
-        // Vote lock for next height should be cleared
+        // Our vote lock should be removed - block A can never get a QC now
+        // (2f+1 voted for B, only f+1 honest validators could have voted for A)
         assert!(
-            !state.voted_heights.contains_key(&next_height),
-            "Vote lock for next height should be cleared after view change with QC at current height"
+            !state.voted_heights.contains_key(&height),
+            "Vote lock at height {} should be removed when QC forms for different block",
+            height
+        );
+    }
+
+    #[test]
+    fn test_safety_cannot_vote_for_conflicting_block_after_voting() {
+        // This is the core safety test: once we vote for block A at height H,
+        // we must NEVER vote for a different block B at height H (in any round).
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let block_a = Hash::from_bytes(b"block_a");
+        let block_b = Hash::from_bytes(b"block_b");
+
+        // Vote for block A at height 1
+        state.voted_heights.insert(height, (block_a, 0));
+
+        // Try to vote for block B at the same height - should be blocked
+        let actions = state.try_vote_on_block(block_b, height, 1); // Different round doesn't help
+
+        assert!(
+            actions.is_empty(),
+            "Should not be able to vote for different block at same height"
+        );
+        assert_eq!(
+            state.voted_heights.get(&height),
+            Some(&(block_a, 0)),
+            "Vote lock should still point to original block"
+        );
+    }
+
+    #[test]
+    fn test_can_vote_for_same_block_at_different_round() {
+        // If we already voted for block A at round 0, we can "re-vote" for
+        // block A at round 1 (though it's a no-op since same block).
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 1u64;
+        let block_a = Hash::from_bytes(b"block_a");
+
+        // Vote for block A at round 0
+        state.voted_heights.insert(height, (block_a, 0));
+
+        // Try to vote for same block A at round 1 - should be a no-op (already voted)
+        let actions = state.try_vote_on_block(block_a, height, 1);
+
+        // Should be empty because we already voted for this block
+        assert!(
+            actions.is_empty(),
+            "Re-voting for same block should be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_view_change_with_prior_vote_creates_fallback() {
+        // Scenario:
+        // 1. We vote for block at (height=1, round=0)
+        // 2. View change to round where we become proposer
+        // 3. Since no QC formed at height 1, our vote is unlocked
+        // 4. We create a fresh fallback block (not re-propose)
+        //
+        // This is the correct HotStuff-2 behavior: on view change without QC,
+        // validators are free to vote for new blocks. The new proposer creates
+        // a fallback block to ensure liveness.
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+
+        // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
+        state.set_time(Duration::from_secs(100));
+
+        // Create a block from round 0 that we voted for
+        let original_header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1), // proposer_for(1, 0) = 1
+            timestamp: 100_000,
+            round: 0,
+            is_fallback: false,
+        };
+        let original_block_hash = original_header.hash();
+
+        // Add to pending blocks and vote for it
+        let pending = PendingBlock::new(original_header, vec![], vec![]);
+        state.pending_blocks.insert(original_block_hash, pending);
+        state.voted_heights.insert(1, (original_block_hash, 0));
+
+        // Advance to round 3 where we become the proposer
+        // Since no QC at height 1, vote lock is cleared, then we create fallback
+        state.view = 2; // Will become 3 after advance_round
+
+        let actions = state.advance_round(&[], vec![], vec![], vec![]);
+
+        // The old vote should be replaced with a vote for the new fallback block.
+        // advance_round: 1) unlocks at height 1, 2) creates fallback, 3) votes for it
+        assert!(
+            state.voted_heights.contains_key(&1),
+            "Should have a new vote at height 1 (for the fallback block)"
+        );
+        let (new_block_hash, new_round) = state.voted_heights.get(&1).unwrap();
+        assert_ne!(
+            *new_block_hash, original_block_hash,
+            "Vote should be for the new fallback block, not the original"
+        );
+        assert_eq!(*new_round, 3, "Vote should be at round 3");
+
+        // Should have broadcast action (fallback block)
+        let broadcast_action = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            broadcast_action.is_some(),
+            "Should broadcast fallback block when becoming proposer after view change"
+        );
+
+        // Verify it's a fallback block (not the original)
+        if let Some(Action::BroadcastToShard {
+            message: OutboundMessage::BlockHeader(gossip),
+            ..
+        }) = broadcast_action
+        {
+            assert!(gossip.header().is_fallback, "Should be a fallback block");
+            assert_eq!(
+                gossip.header().round,
+                3,
+                "Fallback block should be at new round"
+            );
+            assert_ne!(
+                gossip.header().hash(),
+                original_block_hash,
+                "Fallback block should be different from original"
+            );
+            // Verify the fallback block hash matches what we voted for
+            assert_eq!(
+                gossip.header().hash(),
+                *new_block_hash,
+                "Fallback block hash should match our vote"
+            );
+        }
+
+        // Should have vote action (we vote for our own fallback)
+        let has_vote = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockVote(_),
+                    ..
+                }
+            )
+        });
+        assert!(has_vote, "Should vote for own fallback block");
+    }
+
+    #[test]
+    fn test_view_change_without_lock_creates_fallback() {
+        // Scenario: View change when we haven't voted at this height yet.
+        // Should create a fallback block (empty block).
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+
+        // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
+        state.set_time(Duration::from_secs(100));
+
+        // No vote lock at height 1 - we haven't voted yet
+        assert!(!state.voted_heights.contains_key(&1));
+
+        // Advance to round 3 where we become proposer
+        state.view = 2;
+        let actions = state.advance_round(&[], vec![], vec![], vec![]);
+
+        // Should create and broadcast a fallback block
+        let broadcast_action = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            broadcast_action.is_some(),
+            "Should broadcast fallback block"
+        );
+
+        // Extract and verify it's a fallback block
+        if let Some(Action::BroadcastToShard {
+            message: OutboundMessage::BlockHeader(gossip),
+            ..
+        }) = broadcast_action
+        {
+            assert!(
+                gossip.header().is_fallback,
+                "Block should be marked as fallback"
+            );
+            assert_eq!(gossip.header().round, 3, "Block should be at round 3");
+        }
+
+        // Should also have a vote action (we vote for our own fallback block)
+        let has_vote = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockVote(_),
+                    ..
+                }
+            )
+        });
+        assert!(has_vote, "Should create vote for own fallback block");
+    }
+
+    #[test]
+    fn test_multiple_heights_vote_locking_independent() {
+        // Verify that vote locks at different heights are independent.
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        let block_h1 = Hash::from_bytes(b"block_height_1");
+        let block_h2 = Hash::from_bytes(b"block_height_2");
+        let block_h3 = Hash::from_bytes(b"block_height_3");
+
+        // Vote at multiple heights
+        state.voted_heights.insert(1, (block_h1, 0));
+        state.voted_heights.insert(2, (block_h2, 0));
+        state.voted_heights.insert(3, (block_h3, 0));
+
+        // QC at height 1 should only unlock height 1
+        let qc_h1 = QuorumCertificate {
+            block_hash: block_h1,
+            height: BlockHeight(1),
+            parent_block_hash: Hash::ZERO,
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+        state.maybe_unlock_for_qc(&qc_h1);
+
+        assert!(
+            !state.voted_heights.contains_key(&1),
+            "Height 1 should be unlocked"
+        );
+        assert!(
+            state.voted_heights.contains_key(&2),
+            "Height 2 should remain locked"
+        );
+        assert!(
+            state.voted_heights.contains_key(&3),
+            "Height 3 should remain locked"
+        );
+    }
+
+    #[test]
+    fn test_genesis_qc_does_not_unlock() {
+        // Genesis QC should not trigger any unlocks (edge case).
+        let mut state = make_test_state();
+
+        state
+            .voted_heights
+            .insert(1, (Hash::from_bytes(b"block_1"), 0));
+
+        let genesis_qc = QuorumCertificate::genesis();
+        state.maybe_unlock_for_qc(&genesis_qc);
+
+        assert!(
+            state.voted_heights.contains_key(&1),
+            "Genesis QC should not unlock any votes"
+        );
+    }
+
+    #[test]
+    fn test_clear_vote_tracking_for_height() {
+        // Test the helper function that clears vote tracking during HotStuff-2 unlock.
+        let mut state = make_test_state();
+
+        // Add vote tracking for multiple validators at height 5
+        let height = 5u64;
+        state
+            .received_votes_by_height
+            .insert((height, ValidatorId(0)), (Hash::from_bytes(b"block_a"), 0));
+        state
+            .received_votes_by_height
+            .insert((height, ValidatorId(1)), (Hash::from_bytes(b"block_b"), 0));
+        state
+            .received_votes_by_height
+            .insert((height, ValidatorId(2)), (Hash::from_bytes(b"block_a"), 1));
+        // Also add tracking at different height
+        state
+            .received_votes_by_height
+            .insert((6, ValidatorId(0)), (Hash::from_bytes(b"block_c"), 0));
+
+        // Clear tracking for height 5
+        let cleared = state.clear_vote_tracking_for_height(height);
+
+        assert_eq!(cleared, 3, "Should clear 3 entries at height 5");
+        assert!(
+            !state
+                .received_votes_by_height
+                .contains_key(&(5, ValidatorId(0))),
+            "Height 5 entries should be cleared"
+        );
+        assert!(
+            state
+                .received_votes_by_height
+                .contains_key(&(6, ValidatorId(0))),
+            "Height 6 entries should remain"
         );
     }
 }

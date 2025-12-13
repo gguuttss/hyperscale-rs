@@ -11,7 +11,6 @@
 //! | Tag | Purpose |
 //! |-----|---------|
 //! | `block_vote:` | BFT block votes |
-//! | `view_change:` | View change votes |
 //! | `STATE_PROVISION` | Cross-shard state provisions |
 //! | `EXEC_VOTE` | Execution state votes |
 //!
@@ -27,11 +26,6 @@ use crate::{BlockHeight, Hash, ShardGroupId};
 ///
 /// Format: `block_vote:` || shard_group_id || height || round || block_hash
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"block_vote:";
-
-/// Domain tag for view change votes.
-///
-/// Format: `view_change:` || shard_group_id || height || new_round
-pub const DOMAIN_VIEW_CHANGE: &[u8] = b"view_change:";
 
 /// Domain tag for cross-shard state provisions.
 ///
@@ -64,24 +58,6 @@ pub fn block_vote_message(
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
-    message
-}
-
-/// Build the signing message for a view change vote.
-///
-/// This is used for:
-/// - Individual view change vote signatures
-/// - ViewChangeCertificate aggregated signature verification
-pub fn view_change_message(
-    shard_group: ShardGroupId,
-    height: BlockHeight,
-    new_round: u64,
-) -> Vec<u8> {
-    let mut message = Vec::with_capacity(60);
-    message.extend_from_slice(DOMAIN_VIEW_CHANGE);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
-    message.extend_from_slice(&height.0.to_le_bytes());
-    message.extend_from_slice(&new_round.to_le_bytes());
     message
 }
 
@@ -149,17 +125,6 @@ mod tests {
     }
 
     #[test]
-    fn test_view_change_message_deterministic() {
-        let shard = ShardGroupId(1);
-
-        let msg1 = view_change_message(shard, BlockHeight(5), 1);
-        let msg2 = view_change_message(shard, BlockHeight(5), 1);
-
-        assert_eq!(msg1, msg2);
-        assert!(msg1.starts_with(DOMAIN_VIEW_CHANGE));
-    }
-
-    #[test]
     fn test_exec_vote_message_deterministic() {
         let tx_hash = Hash::from_bytes(b"tx_hash");
         let state_root = Hash::from_bytes(b"state_root");
@@ -201,12 +166,9 @@ mod tests {
         let hash = Hash::from_bytes(b"same_hash_value_here");
 
         let block_msg = block_vote_message(ShardGroupId(0), 0, 0, &hash);
-        let view_msg = view_change_message(ShardGroupId(0), BlockHeight(0), 0);
         let exec_msg = exec_vote_message(&hash, &hash, ShardGroupId(0), true);
 
         // All messages should be different due to domain tags
-        assert_ne!(block_msg, view_msg);
         assert_ne!(block_msg, exec_msg);
-        assert_ne!(view_msg, exec_msg);
     }
 }

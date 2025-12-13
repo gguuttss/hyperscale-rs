@@ -9,7 +9,6 @@ members = [
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
-    "crates/sync",
     "crates/node",
     "crates/simulation",
     "crates/simulator",
@@ -35,7 +34,6 @@ hyperscale-node = { path = "crates/node" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-engine = { path = "crates/engine" }
-hyperscale-sync = { path = "crates/sync" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-parallel = { path = "crates/parallel" }

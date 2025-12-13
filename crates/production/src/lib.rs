@@ -76,11 +76,13 @@ pub mod rpc;
 mod runner;
 mod storage;
 mod sync;
+pub mod sync_error;
 pub mod telemetry;
 mod thread_pools;
 mod timers;
 
 pub use sync::{SyncConfig, SyncManager};
+pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};
 pub use timers::TimerManager;
 

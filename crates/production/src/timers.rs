@@ -14,7 +14,6 @@ use tracing::{debug, trace};
 fn timer_event(id: TimerId) -> Event {
     match id {
         TimerId::Proposal => Event::ProposalTimer,
-        TimerId::ViewChange => Event::ViewChangeTimer,
         TimerId::Cleanup => Event::CleanupTimer,
         TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
         TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
@@ -163,7 +162,7 @@ mod tests {
         let mut manager = TimerManager::new(event_tx);
 
         manager.set_timer(TimerId::Proposal, Duration::from_millis(10));
-        manager.set_timer(TimerId::ViewChange, Duration::from_millis(20));
+        manager.set_timer(TimerId::Cleanup, Duration::from_millis(20));
 
         assert_eq!(manager.active_count(), 2);
 
@@ -179,14 +178,14 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        // Both should be timer events (Proposal and ViewChange in some order)
+        // Both should be timer events (Proposal and Cleanup in some order)
         let is_proposal = matches!(event1, Event::ProposalTimer);
-        let is_view_change = matches!(event1, Event::ViewChangeTimer);
-        assert!(is_proposal || is_view_change);
+        let is_cleanup = matches!(event1, Event::CleanupTimer);
+        assert!(is_proposal || is_cleanup);
 
         let is_proposal2 = matches!(event2, Event::ProposalTimer);
-        let is_view_change2 = matches!(event2, Event::ViewChangeTimer);
-        assert!(is_proposal2 || is_view_change2);
+        let is_cleanup2 = matches!(event2, Event::CleanupTimer);
+        assert!(is_proposal2 || is_cleanup2);
     }
 
     #[tokio::test]
@@ -196,9 +195,8 @@ mod tests {
 
         manager.set_timer(TimerId::Proposal, Duration::from_millis(50));
         manager.set_timer(TimerId::Cleanup, Duration::from_millis(50));
-        manager.set_timer(TimerId::ViewChange, Duration::from_millis(50));
 
-        assert_eq!(manager.active_count(), 3);
+        assert_eq!(manager.active_count(), 2);
 
         manager.cancel_all();
 

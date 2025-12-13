@@ -170,17 +170,19 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
 
     mkdir -p "$NODE_DATA_DIR"
 
-    # Build genesis validators section - only include validators for THIS shard
+    # Build genesis validators section - include ALL validators from ALL shards
+    # This is required so validators can verify cross-shard messages
     GENESIS_VALIDATORS=""
-    first_validator_in_shard=$((shard * VALIDATORS_PER_SHARD))
-    last_validator_in_shard=$((first_validator_in_shard + VALIDATORS_PER_SHARD - 1))
-    for j in $(seq $first_validator_in_shard $last_validator_in_shard); do
+    for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
         if [ -n "$GENESIS_VALIDATORS" ]; then
             GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 "
         fi
+        # Calculate which shard this validator belongs to
+        validator_shard=$((j / VALIDATORS_PER_SHARD))
         GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
 id = $j
+shard = $validator_shard
 public_key = \"${PUBLIC_KEYS[$j]}\"
 voting_power = 1"
     done

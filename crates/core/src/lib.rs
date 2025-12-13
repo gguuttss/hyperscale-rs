@@ -38,10 +38,8 @@ pub use traits::{StateMachine, SubStateMachine};
 /// Type alias for timer identification.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerId {
-    /// Block proposal timer
+    /// Block proposal timer (also used for implicit round advancement)
     Proposal,
-    /// View change timeout timer
-    ViewChange,
     /// Periodic cleanup timer
     Cleanup,
     /// Global consensus timer (epoch management)

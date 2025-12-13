@@ -456,6 +456,10 @@ pub struct ValidatorEntry {
     /// Validator ID
     pub id: u64,
 
+    /// Shard this validator belongs to
+    #[serde(default)]
+    pub shard: Option<u64>,
+
     /// Hex-encoded public key
     pub public_key: String,
 
@@ -570,6 +574,8 @@ fn build_topology(
     config: &ValidatorConfig,
     local_keypair: &KeyPair,
 ) -> Result<Arc<dyn hyperscale_types::Topology>> {
+    use std::collections::HashMap;
+
     let local_validator_id = ValidatorId(config.node.validator_id);
     let local_shard = ShardGroupId(config.node.shard);
     let num_shards = config.node.num_shards;
@@ -626,15 +632,56 @@ fn build_topology(
 
     let validator_set = ValidatorSet::new(validators);
 
-    Ok(
-        StaticTopology::with_local_shard(
+    // Check if validators have explicit shard assignments
+    let has_shard_assignments = config.genesis.validators.iter().any(|v| v.shard.is_some());
+
+    if has_shard_assignments {
+        // Build shard committees from explicit shard assignments in config
+        // This is required for multi-shard setups where each validator needs to know
+        // about ALL validators across ALL shards for cross-shard message verification
+        let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+
+        for v in &config.genesis.validators {
+            // Use explicit shard if provided, otherwise fall back to validator_id % num_shards
+            let shard = ShardGroupId(v.shard.unwrap_or(v.id % num_shards));
+            shard_committees
+                .entry(shard)
+                .or_default()
+                .push(ValidatorId(v.id));
+        }
+
+        info!(
+            num_shards = num_shards,
+            total_validators = config.genesis.validators.len(),
+            "Building topology with explicit shard assignments"
+        );
+
+        Ok(StaticTopology::with_shard_committees(
+            local_validator_id,
+            local_shard,
+            num_shards,
+            &validator_set,
+            shard_committees,
+        )
+        .into_arc())
+    } else {
+        // Legacy mode: all validators in genesis belong to local shard only
+        // This only works for single-shard deployments
+        if num_shards > 1 {
+            warn!(
+                "Multi-shard deployment without explicit shard assignments in genesis config. \
+                 Cross-shard messages may fail. Add 'shard = N' to each [[genesis.validators]] entry."
+            );
+        }
+
+        Ok(StaticTopology::with_local_shard(
             local_validator_id,
             local_shard,
             num_shards,
             validator_set,
         )
-        .into_arc(),
-    )
+        .into_arc())
+    }
 }
 
 /// Build engine genesis configuration from TOML config.

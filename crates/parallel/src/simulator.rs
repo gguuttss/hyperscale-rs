@@ -228,7 +228,6 @@ impl SimNode {
             self.pending_timers.remove(&timer_id);
             let event = match timer_id {
                 TimerId::Proposal => Event::ProposalTimer,
-                TimerId::ViewChange => Event::ViewChangeTimer,
                 TimerId::Cleanup => Event::CleanupTimer,
                 TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
                 TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
@@ -352,62 +351,7 @@ impl SimNode {
                     .push_back(Event::QcSignatureVerified { block_hash, valid });
             }
 
-            Action::VerifyViewChangeVoteSignature {
-                vote,
-                public_key,
-                signing_message,
-            } => {
-                let valid = public_key.verify(&signing_message, &vote.signature);
-                self.internal_queue
-                    .push_back(Event::ViewChangeVoteSignatureVerified { vote, valid });
-            }
-
-            Action::VerifyViewChangeHighestQc {
-                vote,
-                public_keys,
-                signing_message,
-            } => {
-                let signer_keys: Vec<_> = public_keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
-                    .collect();
-                let valid = if signer_keys.is_empty() {
-                    vote.highest_qc.is_genesis()
-                } else {
-                    cache.verify_aggregated(
-                        &signer_keys,
-                        &signing_message,
-                        &vote.highest_qc.aggregated_signature,
-                    )
-                };
-                self.internal_queue
-                    .push_back(Event::ViewChangeHighestQcVerified { vote, valid });
-            }
-
-            Action::VerifyViewChangeCertificateSignature {
-                certificate,
-                public_keys,
-                signing_message,
-            } => {
-                let signer_keys: Vec<_> = public_keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| certificate.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
-                    .collect();
-                let valid = cache.verify_aggregated(
-                    &signer_keys,
-                    &signing_message,
-                    &certificate.aggregated_signature,
-                );
-                self.internal_queue
-                    .push_back(Event::ViewChangeCertificateSignatureVerified {
-                        certificate,
-                        valid,
-                    });
-            }
+            // Note: View change verification actions removed - using HotStuff-2 implicit rounds
 
             // Transaction execution - cached per shard using real Radix engine.
             // All validators in a shard execute the same block, so results are cached.

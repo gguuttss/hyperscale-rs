@@ -205,15 +205,8 @@ impl Topic {
         Self::shard("block.vote", shard)
     }
 
-    /// Topic for view change vote gossip.
-    pub fn view_change_vote(shard: ShardGroupId) -> Self {
-        Self::shard("view_change.vote", shard)
-    }
-
-    /// Topic for view change certificate gossip.
-    pub fn view_change_certificate(shard: ShardGroupId) -> Self {
-        Self::shard("view_change.certificate", shard)
-    }
+    // Note: view_change.vote and view_change.certificate topics removed
+    // Using HotStuff-2 implicit rounds instead
 
     /// Topic for transaction gossip.
     pub fn transaction_gossip(shard: ShardGroupId) -> Self {
