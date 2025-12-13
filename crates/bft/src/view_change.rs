@@ -8,6 +8,12 @@
 //! This ensures the new proposer learns about the highest certified block and can build
 //! on it, preserving safety. The `highest_qc` is attached as **unsigned data** to allow
 //! BLS signature aggregation.
+//!
+//! # Exponential Backoff
+//!
+//! View change timeouts use exponential backoff to prevent rapid repeated view changes
+//! during network partitions or slow periods. The timeout doubles with each consecutive
+//! view change at the same height, up to a maximum cap.
 
 use hyperscale_types::{
     BlockHeight, KeyPair, PublicKey, QuorumCertificate, ShardGroupId, Signature, SignerBitfield,
@@ -39,6 +45,13 @@ struct PendingHighestQcVerification;
 #[derive(Debug, Clone, Copy)]
 struct PendingCertificateVerification;
 
+/// Maximum multiplier for exponential backoff (2^6 = 64x base timeout).
+const MAX_BACKOFF_EXPONENT: u32 = 6;
+
+/// Maximum allowed gap between highest_qc height and view change height.
+/// This prevents accepting votes with absurdly high QC heights.
+const MAX_QC_HEIGHT_GAP: u64 = 10;
+
 /// View change state for a deterministic BFT node.
 ///
 /// Unlike the async version that uses DashMap and AtomicU64, this version
@@ -53,8 +66,8 @@ pub struct ViewChangeState {
     /// Network topology (single source of truth for committee/shard info).
     topology: Arc<dyn Topology>,
 
-    /// View change timeout duration.
-    timeout: Duration,
+    /// Base view change timeout duration.
+    base_timeout: Duration,
 
     /// Time of last progress (block commit).
     last_progress_time: Duration,
@@ -65,8 +78,14 @@ pub struct ViewChangeState {
     /// Current height being tracked.
     current_height: u64,
 
-    /// Whether we've broadcast a vote for the current timeout.
-    timeout_vote_broadcast: bool,
+    /// The round at which the current height started (for backoff calculation).
+    /// Reset to 0 when height advances.
+    base_round_for_height: u64,
+
+    /// The round we've broadcast a view change vote for (if any).
+    /// None means no vote broadcast yet for current height.
+    /// This tracks which round we voted for, so we can vote again for higher rounds.
+    vote_broadcast_for_round: Option<u64>,
 
     /// Collects view change votes: (height, new_round) -> map of voter -> (signature, highest_qc).
     vote_collector: HashMap<(u64, u64), BTreeMap<ValidatorId, (Signature, QuorumCertificate)>>,
@@ -105,11 +124,12 @@ impl ViewChangeState {
             shard_group,
             signing_key,
             topology,
-            timeout,
+            base_timeout: timeout,
             last_progress_time: Duration::ZERO,
             current_round: 0,
             current_height: 0,
-            timeout_vote_broadcast: false,
+            base_round_for_height: 0,
+            vote_broadcast_for_round: None,
             vote_collector: HashMap::new(),
             highest_qc: QuorumCertificate::genesis(),
             highest_qc_collector: HashMap::new(),
@@ -118,6 +138,18 @@ impl ViewChangeState {
             pending_cert_verifications: HashMap::new(),
             now: Duration::ZERO,
         }
+    }
+
+    /// Calculate the current timeout with exponential backoff.
+    ///
+    /// The timeout doubles for each round increment at the same height,
+    /// up to a maximum of 2^MAX_BACKOFF_EXPONENT times the base timeout.
+    fn current_timeout(&self) -> Duration {
+        let rounds_since_base = self
+            .current_round
+            .saturating_sub(self.base_round_for_height);
+        let exponent = (rounds_since_base as u32).min(MAX_BACKOFF_EXPONENT);
+        self.base_timeout * 2u32.pow(exponent)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -203,16 +235,16 @@ impl ViewChangeState {
 
     /// Check if a view change should occur.
     ///
-    /// Returns true if timeout has elapsed since last progress at the current height.
+    /// Returns true if timeout (with exponential backoff) has elapsed since last progress.
     pub fn should_change_view(&self) -> bool {
         // Don't trigger view change at genesis height
         if self.current_height == 0 {
             return false;
         }
 
-        // Check if timeout elapsed
+        // Check if timeout elapsed (using exponential backoff)
         let elapsed = self.now.saturating_sub(self.last_progress_time);
-        elapsed > self.timeout
+        elapsed > self.current_timeout()
     }
 
     /// Reset timeout due to progress (block committed).
@@ -222,17 +254,18 @@ impl ViewChangeState {
         // Update height
         self.current_height = height;
 
-        // If height increased, reset round to 0
+        // If height increased, reset round and base_round to 0
         if height > old_height {
             self.current_round = 0;
+            self.base_round_for_height = 0;
             debug!(height = height, "Progress made, reset to round 0");
         }
 
         // Update last progress time
         self.last_progress_time = self.now;
 
-        // Reset view change state
-        self.timeout_vote_broadcast = false;
+        // Reset view change state - clear any pending vote broadcast
+        self.vote_broadcast_for_round = None;
         self.cleanup_old_votes(height);
     }
 
@@ -242,10 +275,11 @@ impl ViewChangeState {
     pub fn on_view_change_timer(&mut self) -> Vec<Action> {
         let mut actions = vec![];
 
-        // Always reschedule the timer
+        // Always reschedule the timer with exponential backoff
+        let timeout = self.current_timeout();
         actions.push(Action::SetTimer {
             id: TimerId::ViewChange,
-            duration: self.timeout,
+            duration: timeout,
         });
 
         // Check if we should trigger view change
@@ -254,7 +288,7 @@ impl ViewChangeState {
                 current_height = self.current_height,
                 now = ?self.now,
                 last_progress_time = ?self.last_progress_time,
-                timeout = ?self.timeout,
+                timeout = ?timeout,
                 "View change timer fired but should_change_view = false"
             );
             return actions;
@@ -263,6 +297,7 @@ impl ViewChangeState {
         info!(
             current_height = self.current_height,
             current_round = self.current_round,
+            timeout = ?timeout,
             "View change timer fired, triggering view change"
         );
 
@@ -292,17 +327,19 @@ impl ViewChangeState {
 
     /// Create a view change vote for broadcasting.
     ///
-    /// Returns None if already broadcast for current timeout.
+    /// Returns None if already broadcast a vote for this round or higher.
     pub fn create_view_change_vote(&mut self) -> Option<ViewChangeVote> {
-        // Only create vote once per timeout period
-        if self.timeout_vote_broadcast {
-            return None;
-        }
-        self.timeout_vote_broadcast = true;
-
         let height = BlockHeight(self.current_height);
         let current_round = self.current_round;
         let new_round = current_round + 1;
+
+        // Only create vote if we haven't already voted for this round or higher
+        if let Some(voted_round) = self.vote_broadcast_for_round {
+            if voted_round >= new_round {
+                return None;
+            }
+        }
+        self.vote_broadcast_for_round = Some(new_round);
 
         // Sign the vote: (shard_group, height, new_round)
         let message = Self::view_change_message(self.shard_group, height, new_round);
@@ -430,6 +467,36 @@ impl ViewChangeState {
             return vec![];
         }
 
+        // Bounds check: highest_qc.height should be reasonable relative to view change height.
+        // The QC height should be at most equal to the view change height (can't have QC for future),
+        // and should not be unreasonably far below (prevents accepting stale/malicious QCs).
+        let (height, _new_round) = vote.vote_key();
+        if !vote.highest_qc.is_genesis() {
+            let qc_height = vote.highest_qc.height.0;
+            // QC height must be <= view change height (can't certify future blocks)
+            if qc_height > height.0 {
+                warn!(
+                    voter = ?vote.voter,
+                    qc_height = qc_height,
+                    view_change_height = height.0,
+                    "View change vote contains QC for future height"
+                );
+                return vec![];
+            }
+            // QC height should be within MAX_QC_HEIGHT_GAP of the view change height
+            // (prevents accepting ancient QCs that might cause issues)
+            if height.0.saturating_sub(qc_height) > MAX_QC_HEIGHT_GAP {
+                warn!(
+                    voter = ?vote.voter,
+                    qc_height = qc_height,
+                    view_change_height = height.0,
+                    max_gap = MAX_QC_HEIGHT_GAP,
+                    "View change vote contains QC too far behind view change height"
+                );
+                return vec![];
+            }
+        }
+
         // If highest_qc is genesis, skip QC verification and finalize directly
         if vote.highest_qc.is_genesis() {
             return self.finalize_vote(vote);
@@ -546,9 +613,12 @@ impl ViewChangeState {
                 "View change quorum reached"
             );
 
-            // Emit internal event to trigger view change completion
+            // Emit internal signal to trigger apply_view_change.
+            // Note: We emit ViewChangeQuorumReached (not ViewChangeCompleted) because
+            // apply_view_change will emit ViewChangeCompleted with the correct highest_qc.
+            // This prevents duplicate ViewChangeCompleted events.
             return vec![Action::EnqueueInternal {
-                event: Event::ViewChangeCompleted {
+                event: Event::ViewChangeQuorumReached {
                     height: height.0,
                     new_round,
                 },
@@ -589,10 +659,10 @@ impl ViewChangeState {
         // Finalize vote and check for quorum
         let actions = self.finalize_vote(vote);
 
-        // Check if quorum was reached (ViewChangeCompleted emitted)
+        // Check if quorum was reached (ViewChangeQuorumReached emitted)
         for action in actions {
             if let Action::EnqueueInternal {
-                event: Event::ViewChangeCompleted { height, new_round },
+                event: Event::ViewChangeQuorumReached { height, new_round },
             } = action
             {
                 return Some((height, new_round));
@@ -635,7 +705,9 @@ impl ViewChangeState {
         // Update to new round
         self.current_round = new_round;
         self.last_progress_time = self.now;
-        self.timeout_vote_broadcast = false;
+        // Note: We do NOT reset vote_broadcast_for_round here because we want to
+        // prevent voting for the same round again. The field tracks votes by round
+        // number, so voting for a higher round is still allowed.
 
         info!(
             height = height,
@@ -648,17 +720,30 @@ impl ViewChangeState {
 
         // Build and broadcast certificate
         let mut actions = vec![];
-        if let Some(cert) = self.build_certificate(BlockHeight(height), new_round) {
+        let highest_qc = if let Some(cert) = self.build_certificate(BlockHeight(height), new_round)
+        {
+            let qc = cert.highest_qc.clone();
             let gossip = hyperscale_messages::ViewChangeCertificateGossip { certificate: cert };
             actions.push(Action::BroadcastToShard {
                 shard: self.local_shard(),
                 message: OutboundMessage::ViewChangeCertificate(gossip),
             });
-        }
+            qc
+        } else {
+            // Fallback to our local highest QC
+            self.highest_qc_collector
+                .get(&(height, new_round))
+                .cloned()
+                .unwrap_or_else(QuorumCertificate::genesis)
+        };
 
         // Emit internal event for BFT state to react to
         actions.push(Action::EnqueueInternal {
-            event: Event::ViewChangeCompleted { height, new_round },
+            event: Event::ViewChangeCompleted {
+                height,
+                new_round,
+                highest_qc,
+            },
         });
 
         actions
@@ -855,7 +940,7 @@ impl ViewChangeState {
         // Apply the view change
         self.current_round = cert.new_round();
         self.last_progress_time = self.now;
-        self.timeout_vote_broadcast = false;
+        // Note: We do NOT reset vote_broadcast_for_round here - same reason as apply_view_change.
 
         info!(
             height = cert.height.0,
@@ -869,16 +954,73 @@ impl ViewChangeState {
             event: Event::ViewChangeCompleted {
                 height: cert.height.0,
                 new_round: cert.new_round(),
+                highest_qc: cert.highest_qc.clone(),
             },
         }]
     }
 
-    /// Clean up view change votes for old heights/rounds.
+    /// Clean up view change votes for old heights and old rounds.
+    ///
+    /// Removes:
+    /// - All votes for heights below current_height
+    /// - All votes for old rounds at the current height (rounds <= current_round)
     fn cleanup_old_votes(&mut self, current_height: u64) {
-        self.vote_collector
-            .retain(|(height, _round), _voters| *height >= current_height);
-        self.highest_qc_collector
-            .retain(|(height, _round), _qc| *height >= current_height);
+        let current_round = self.current_round;
+
+        // Remove votes for old heights AND old rounds at current height
+        self.vote_collector.retain(|(height, round), _voters| {
+            if *height < current_height {
+                return false;
+            }
+            if *height == current_height && *round <= current_round {
+                return false;
+            }
+            true
+        });
+
+        self.highest_qc_collector.retain(|(height, round), _qc| {
+            if *height < current_height {
+                return false;
+            }
+            if *height == current_height && *round <= current_round {
+                return false;
+            }
+            true
+        });
+
+        // Also clean up pending verifications for old heights/rounds
+        self.pending_vote_verifications
+            .retain(|(height, round, _voter), _| {
+                if *height < current_height {
+                    return false;
+                }
+                if *height == current_height && *round <= current_round {
+                    return false;
+                }
+                true
+            });
+
+        self.pending_qc_verifications
+            .retain(|(height, round, _voter), _| {
+                if *height < current_height {
+                    return false;
+                }
+                if *height == current_height && *round <= current_round {
+                    return false;
+                }
+                true
+            });
+
+        self.pending_cert_verifications
+            .retain(|(height, round), _| {
+                if *height < current_height {
+                    return false;
+                }
+                if *height == current_height && *round <= current_round {
+                    return false;
+                }
+                true
+            });
     }
 }
 
@@ -1011,5 +1153,185 @@ mod tests {
         state.reset_timeout(2);
         assert_eq!(state.current_round, 0);
         assert_eq!(state.current_height, 2);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_exponential_backoff() {
+        let (mut state, _) = make_test_state();
+        let base_timeout = Duration::from_secs(5);
+
+        state.current_height = 1;
+        state.current_round = 0;
+        state.base_round_for_height = 0;
+
+        // Round 0: 1x base timeout
+        assert_eq!(state.current_timeout(), base_timeout);
+
+        // Round 1: 2x base timeout
+        state.current_round = 1;
+        assert_eq!(state.current_timeout(), base_timeout * 2);
+
+        // Round 2: 4x base timeout
+        state.current_round = 2;
+        assert_eq!(state.current_timeout(), base_timeout * 4);
+
+        // Round 3: 8x base timeout
+        state.current_round = 3;
+        assert_eq!(state.current_timeout(), base_timeout * 8);
+
+        // Round 6: 64x base timeout (MAX_BACKOFF_EXPONENT = 6)
+        state.current_round = 6;
+        assert_eq!(state.current_timeout(), base_timeout * 64);
+
+        // Round 10: still capped at 64x (MAX_BACKOFF_EXPONENT = 6)
+        state.current_round = 10;
+        assert_eq!(state.current_timeout(), base_timeout * 64);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_exponential_backoff_resets_on_height_change() {
+        let (mut state, _) = make_test_state();
+        let base_timeout = Duration::from_secs(5);
+
+        state.current_height = 1;
+        state.current_round = 5;
+        state.base_round_for_height = 0;
+        state.now = Duration::from_secs(100);
+
+        // At round 5, timeout should be 32x base
+        assert_eq!(state.current_timeout(), base_timeout * 32);
+
+        // Reset to new height - backoff should reset
+        state.reset_timeout(2);
+        assert_eq!(state.current_round, 0);
+        assert_eq!(state.base_round_for_height, 0);
+        assert_eq!(state.current_timeout(), base_timeout);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_cleanup_old_rounds() {
+        let (mut state, keys) = make_test_state();
+        state.current_height = 1;
+        state.current_round = 0;
+
+        let shard_group = state.shard_group();
+
+        // Add votes for round 1 at height 1
+        let message = hyperscale_types::view_change_message(shard_group, BlockHeight(1), 1);
+        let signature = keys[1].sign(&message);
+        let vote = ViewChangeVote::new(
+            BlockHeight(1),
+            0,
+            1,
+            ValidatorId(1),
+            QuorumCertificate::genesis(),
+            signature,
+        );
+        state.add_view_change_vote(vote);
+
+        // Add votes for round 2 at height 1
+        let message2 = hyperscale_types::view_change_message(shard_group, BlockHeight(1), 2);
+        let signature2 = keys[2].sign(&message2);
+        let vote2 = ViewChangeVote::new(
+            BlockHeight(1),
+            1,
+            2,
+            ValidatorId(2),
+            QuorumCertificate::genesis(),
+            signature2,
+        );
+        state.add_view_change_vote(vote2);
+
+        // Verify we have votes for both rounds
+        assert!(state.vote_collector.contains_key(&(1, 1)));
+        assert!(state.vote_collector.contains_key(&(1, 2)));
+
+        // Advance to round 1 and cleanup
+        state.current_round = 1;
+        state.cleanup_old_votes(1);
+
+        // Round 1 votes should be cleaned up (round <= current_round)
+        assert!(!state.vote_collector.contains_key(&(1, 1)));
+        // Round 2 votes should still be present
+        assert!(state.vote_collector.contains_key(&(1, 2)));
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_can_vote_for_higher_round_after_view_change() {
+        // This tests the scenario where:
+        // 1. View change to round 1 succeeds
+        // 2. But no progress is made (no blocks committed)
+        // 3. Timer fires again, validator should be able to vote for round 2
+        let (mut state, _) = make_test_state();
+        state.current_height = 1;
+        state.current_round = 0;
+        state.now = Duration::from_secs(10);
+        state.last_progress_time = Duration::ZERO;
+
+        // First vote should succeed (for round 1)
+        let vote1 = state.create_view_change_vote();
+        assert!(vote1.is_some());
+        let vote1 = vote1.unwrap();
+        assert_eq!(vote1.new_view, 1);
+        assert_eq!(state.vote_broadcast_for_round, Some(1));
+
+        // Second vote for same round should fail
+        let vote1_again = state.create_view_change_vote();
+        assert!(vote1_again.is_none());
+
+        // Simulate view change completing to round 1
+        state.current_round = 1;
+        state.last_progress_time = state.now;
+        // Note: vote_broadcast_for_round is NOT reset by apply_view_change
+
+        // Advance time so another view change is triggered
+        state.now = Duration::from_secs(20);
+
+        // Now we should be able to vote for round 2
+        let vote2 = state.create_view_change_vote();
+        assert!(vote2.is_some());
+        let vote2 = vote2.unwrap();
+        assert_eq!(vote2.new_view, 2);
+        assert_eq!(state.vote_broadcast_for_round, Some(2));
+
+        // Third vote for round 2 should fail
+        let vote2_again = state.create_view_change_vote();
+        assert!(vote2_again.is_none());
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_vote_broadcast_reset_on_height_change() {
+        // When height changes (block committed), vote_broadcast_for_round should reset
+        let (mut state, _) = make_test_state();
+        state.current_height = 1;
+        state.current_round = 0;
+        state.now = Duration::from_secs(10);
+        state.last_progress_time = Duration::ZERO;
+
+        // Vote for round 1
+        let vote1 = state.create_view_change_vote();
+        assert!(vote1.is_some());
+        assert_eq!(state.vote_broadcast_for_round, Some(1));
+
+        // Simulate block commit at new height
+        state.reset_timeout(2);
+        assert_eq!(state.current_height, 2);
+        assert_eq!(state.current_round, 0);
+        assert_eq!(state.vote_broadcast_for_round, None);
+
+        // Advance time
+        state.now = Duration::from_secs(20);
+
+        // Should be able to vote for round 1 at new height
+        let vote_new_height = state.create_view_change_vote();
+        assert!(vote_new_height.is_some());
+        let vote_new_height = vote_new_height.unwrap();
+        assert_eq!(vote_new_height.height.0, 2);
+        assert_eq!(vote_new_height.new_view, 1);
     }
 }

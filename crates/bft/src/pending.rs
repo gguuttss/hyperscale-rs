@@ -221,6 +221,38 @@ impl PendingBlock {
     pub fn hash(&self) -> Hash {
         self.header.hash()
     }
+
+    /// Get all transaction hashes (both received and missing).
+    ///
+    /// Used for re-broadcasting block headers after view change.
+    pub fn all_transaction_hashes(&self) -> Vec<Hash> {
+        self.received_transactions
+            .keys()
+            .copied()
+            .chain(self.missing_transaction_hashes.iter().copied())
+            .collect()
+    }
+
+    /// Get all certificate hashes (both received and missing).
+    ///
+    /// Used for re-broadcasting block headers after view change.
+    pub fn all_certificate_hashes(&self) -> Vec<Hash> {
+        self.received_certificates
+            .keys()
+            .copied()
+            .chain(self.missing_certificate_hashes.iter().copied())
+            .collect()
+    }
+
+    /// Get reference to deferred transactions.
+    pub fn deferred(&self) -> &[TransactionDefer] {
+        &self.deferred
+    }
+
+    /// Get reference to aborted transactions.
+    pub fn aborted(&self) -> &[TransactionAbort] {
+        &self.aborted
+    }
 }
 
 #[cfg(test)]

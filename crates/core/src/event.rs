@@ -138,7 +138,14 @@ pub enum Event {
     TransactionAccepted { tx_hash: Hash },
 
     /// View change completed (round increment).
-    ViewChangeCompleted { height: u64, new_round: u64 },
+    ///
+    /// Includes the highest QC from the view change certificate, which may allow
+    /// the BFT state to update its latest_qc and advance to proposing the next height.
+    ViewChangeCompleted {
+        height: u64,
+        new_round: u64,
+        highest_qc: QuorumCertificate,
+    },
 
     /// Transaction execution completed.
     ///
@@ -251,6 +258,15 @@ pub enum Event {
         /// Whether the aggregated signature is valid.
         valid: bool,
     },
+
+    /// View change quorum reached (internal signal).
+    ///
+    /// This is an internal signal emitted when view change vote quorum is reached.
+    /// The node state machine should call `ViewChangeState::apply_view_change()`
+    /// which will emit the actual `ViewChangeCompleted` event.
+    ///
+    /// This separation prevents duplicate `ViewChangeCompleted` events.
+    ViewChangeQuorumReached { height: u64, new_round: u64 },
 
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
@@ -529,6 +545,7 @@ impl Event {
             | Event::BlockCommitted { .. }
             | Event::TransactionAccepted { .. }
             | Event::ViewChangeCompleted { .. }
+            | Event::ViewChangeQuorumReached { .. }
             | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
@@ -635,6 +652,7 @@ impl Event {
             Event::BlockCommitted { .. } => "BlockCommitted",
             Event::TransactionAccepted { .. } => "TransactionAccepted",
             Event::ViewChangeCompleted { .. } => "ViewChangeCompleted",
+            Event::ViewChangeQuorumReached { .. } => "ViewChangeQuorumReached",
             Event::TransactionExecuted { .. } => "TransactionExecuted",
             Event::TransactionStatusChanged { .. } => "TransactionStatusChanged",
 

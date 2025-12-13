@@ -255,10 +255,10 @@ impl StateMachine for NodeStateMachine {
                     .view_change
                     .on_vote_signature_verified(vote.clone(), *valid);
 
-                // Check if quorum was reached (ViewChangeCompleted will be in actions)
+                // Check if quorum was reached (ViewChangeQuorumReached will be in actions)
                 for action in &actions {
                     if let Action::EnqueueInternal {
-                        event: Event::ViewChangeCompleted { height, new_round },
+                        event: Event::ViewChangeQuorumReached { height, new_round },
                     } = action
                     {
                         // Apply view change when quorum is reached
@@ -276,10 +276,10 @@ impl StateMachine for NodeStateMachine {
                     .view_change
                     .on_highest_qc_verified(vote.clone(), *valid);
 
-                // Check if quorum was reached (ViewChangeCompleted will be in actions)
+                // Check if quorum was reached (ViewChangeQuorumReached will be in actions)
                 for action in &actions {
                     if let Action::EnqueueInternal {
-                        event: Event::ViewChangeCompleted { height, new_round },
+                        event: Event::ViewChangeQuorumReached { height, new_round },
                     } = action
                     {
                         // Apply view change when quorum is reached
@@ -387,6 +387,13 @@ impl StateMachine for NodeStateMachine {
                     aborted,
                     certificates,
                 );
+            }
+
+            // ViewChangeQuorumReached is an internal signal that's already handled
+            // in the verification callback handlers above. If it somehow gets enqueued
+            // separately, we can safely ignore it (quorum was already applied).
+            Event::ViewChangeQuorumReached { .. } => {
+                return vec![];
             }
 
             // Other BFT events don't need mempool context
