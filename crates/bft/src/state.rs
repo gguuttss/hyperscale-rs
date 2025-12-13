@@ -173,6 +173,13 @@ pub struct BftState {
     /// When we receive a synced block, we must verify its QC's signature before applying.
     pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
 
+    /// Buffered commits waiting for earlier blocks to commit first.
+    /// Maps height -> (block_hash, QC).
+    /// When we receive a BlockReadyToCommit for height N but we're still at committed_height < N-1,
+    /// we buffer it here and process it once the earlier blocks are committed.
+    /// This handles out-of-order commit events caused by parallel signature verification.
+    pending_commits: std::collections::BTreeMap<u64, (Hash, QuorumCertificate)>,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
     // ═══════════════════════════════════════════════════════════════════════════
@@ -247,6 +254,7 @@ impl BftState {
             pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
+            pending_commits: std::collections::BTreeMap::new(),
             config,
             now: Duration::ZERO,
         }
@@ -1856,72 +1864,135 @@ impl BftState {
             return vec![];
         }
 
-        // Check sequentiality
+        // Buffer out-of-order commits for later processing
+        // This handles the case where signature verification completes out of order,
+        // causing BlockReadyToCommit events to arrive non-sequentially.
         if height != self.committed_height + 1 {
-            warn!(
-                "Non-sequential commit: expected height {}, got {}",
+            debug!(
+                "Buffering out-of-order commit: expected height {}, got {}",
                 self.committed_height + 1,
                 height
             );
+            self.pending_commits.insert(height, (block_hash, qc));
             return vec![];
         }
 
-        info!(
-            validator = ?self.validator_id(),
-            height = height,
-            block_hash = ?block_hash,
-            transactions = block.transactions.len(),
-            "Committing block"
-        );
+        // Commit this block and any buffered subsequent blocks
+        self.commit_block_and_buffered(block_hash, qc)
+    }
 
-        // Update committed state
-        self.committed_height = height;
-        self.committed_hash = block_hash;
+    /// Commit a block and any buffered subsequent blocks that are now ready.
+    ///
+    /// This is called when we have a block at the expected height (committed_height + 1).
+    /// After committing, we check for buffered commits at the next height and process
+    /// them in order.
+    fn commit_block_and_buffered(
+        &mut self,
+        block_hash: Hash,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut current_hash = block_hash;
+        let mut current_qc = qc;
 
-        // Clean up old state
-        self.cleanup_old_state(height);
+        loop {
+            // Get the block to commit
+            let block = if let Some(pending) = self.pending_blocks.get(&current_hash) {
+                pending.block().map(|b| (*b).clone())
+            } else if let Some((block, _)) = self.certified_blocks.get(&current_hash) {
+                Some(block.clone())
+            } else {
+                None
+            };
 
-        // For sync protocol: we need to store the QC that certifies THIS block.
-        //
-        // The `qc` parameter is the QC for the child block (block N+1) that triggered
-        // this commit via the 2-chain rule. Its `aggregated_signature` contains signatures
-        // over block N+1's hash, NOT this block's hash.
-        //
-        // The QC that certifies THIS block (block N) contains signatures over block N's hash.
-        // This QC is embedded in the child block's header as `parent_qc`.
-        //
-        // We look up the child block using `qc.block_hash` and extract its `parent_qc`.
-        let child_block_hash = qc.block_hash;
-        let commit_qc = if let Some(pending) = self.pending_blocks.get(&child_block_hash) {
-            pending.header().parent_qc.clone()
-        } else if let Some((child_block, _)) = self.certified_blocks.get(&child_block_hash) {
-            child_block.header.parent_qc.clone()
-        } else {
-            // Fallback: shouldn't happen in normal operation, but log a warning
-            warn!(
-                "Child block {} not found when committing block {}, using block's own parent_qc",
-                child_block_hash, block_hash
+            let Some(block) = block else {
+                warn!("Block {} not found for commit", current_hash);
+                break;
+            };
+
+            let height = block.header.height.0;
+
+            // Safety check - should always be the next expected height
+            if height != self.committed_height + 1 {
+                warn!(
+                    "Unexpected height in commit_block_and_buffered: expected {}, got {}",
+                    self.committed_height + 1,
+                    height
+                );
+                break;
+            }
+
+            info!(
+                validator = ?self.validator_id(),
+                height = height,
+                block_hash = ?current_hash,
+                transactions = block.transactions.len(),
+                "Committing block"
             );
-            block.header.parent_qc.clone()
-        };
 
-        // Emit actions
-        vec![
-            Action::PersistBlock {
+            // Update committed state
+            self.committed_height = height;
+            self.committed_hash = current_hash;
+
+            // Clean up old state
+            self.cleanup_old_state(height);
+
+            // For sync protocol: we need to store the QC that certifies THIS block.
+            //
+            // The `current_qc` parameter is the QC for the child block (block N+1) that triggered
+            // this commit via the 2-chain rule. Its `aggregated_signature` contains signatures
+            // over block N+1's hash, NOT this block's hash.
+            //
+            // The QC that certifies THIS block (block N) contains signatures over block N's hash.
+            // This QC is embedded in the child block's header as `parent_qc`.
+            //
+            // We look up the child block using `current_qc.block_hash` and extract its `parent_qc`.
+            let child_block_hash = current_qc.block_hash;
+            let commit_qc = if let Some(pending) = self.pending_blocks.get(&child_block_hash) {
+                pending.header().parent_qc.clone()
+            } else if let Some((child_block, _)) = self.certified_blocks.get(&child_block_hash) {
+                child_block.header.parent_qc.clone()
+            } else {
+                // Fallback: shouldn't happen in normal operation, but log a warning
+                warn!(
+                    "Child block {} not found when committing block {}, using block's own parent_qc",
+                    child_block_hash, current_hash
+                );
+                block.header.parent_qc.clone()
+            };
+
+            // Emit actions for this block
+            actions.push(Action::PersistBlock {
                 block: block.clone(),
                 qc: commit_qc,
-            },
-            Action::EmitCommittedBlock {
+            });
+            actions.push(Action::EmitCommittedBlock {
                 block: block.clone(),
-            },
-            Action::EnqueueInternal {
+            });
+            actions.push(Action::EnqueueInternal {
                 event: Event::BlockCommitted {
-                    block_hash,
+                    block_hash: current_hash,
                     height,
                     block: block.clone(),
                 },
-            },
-        ]
+            });
+
+            // Check if the next height is buffered
+            let next_height = height + 1;
+            if let Some((next_hash, next_qc)) = self.pending_commits.remove(&next_height) {
+                debug!(
+                    "Processing buffered commit for height {} after committing {}",
+                    next_height, height
+                );
+                current_hash = next_hash;
+                current_qc = next_qc;
+            } else {
+                // No more buffered commits
+                break;
+            }
+        }
+
+        actions
     }
 
     /// Handle a synced block that's ready to be applied.
@@ -2220,6 +2291,42 @@ impl BftState {
             }];
         }
 
+        // If the highest_qc from the view change is for a height BEFORE the current height,
+        // then no block at the current height was certified. In this case, it's safe to
+        // unlock our vote because:
+        //
+        // 1. The block we voted for never reached quorum (no QC formed)
+        // 2. No honest validator could have committed based on our vote
+        // 3. The view change certificate proves consensus has moved on
+        //
+        // This prevents the deadlock where all validators are locked to an uncertified
+        // block and no progress can be made.
+        //
+        // Reference: https://decentralizedthoughts.github.io/2023-04-01-hotstuff-2/
+        // "if the leader obtains a lock (a quorum certificate) from the preceding view,
+        // it knows that it has obtained the maximal locked value that possibly exists"
+        if highest_qc.height.0 < height {
+            // The highest QC is from a previous height, meaning no block at this height
+            // was certified. Safe to unlock and reset vote tracking.
+            let had_vote = self.voted_heights.remove(&height).is_some();
+
+            // Also clear vote tracking for this height so we accept new votes from
+            // validators who previously voted for the uncertified block. This is safe
+            // because the view change certificate proves no QC formed.
+            let cleared_votes = self.clear_vote_tracking_for_height(height);
+
+            if had_vote || cleared_votes > 0 {
+                info!(
+                    validator = ?self.validator_id(),
+                    height = height,
+                    new_round = new_round,
+                    highest_qc_height = highest_qc.height.0,
+                    cleared_votes = cleared_votes,
+                    "Unlocking vote at height (no QC formed, safe per HotStuff-2)"
+                );
+            }
+        }
+
         info!(
             validator = ?self.validator_id(),
             height = height,
@@ -2230,7 +2337,9 @@ impl BftState {
         // Check if we're the new proposer for this height/round
         if self.should_propose(height, new_round) {
             // Check if we've already voted at this height - if so, we're locked to that block
-            // and must re-propose it (not create a new fallback block)
+            // and must re-propose it (not create a new fallback block).
+            // NOTE: After the HotStuff-2 unlock above, this will only be true if
+            // the highest_qc was at the current height (meaning a QC exists).
             if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
                 info!(
                     validator = ?self.validator_id(),
@@ -2238,7 +2347,7 @@ impl BftState {
                     existing_round = existing_round,
                     new_round = new_round,
                     existing_block = ?existing_hash,
-                    "Vote-locked at this height, re-proposing locked block"
+                    "Vote-locked to certified block at this height, re-proposing"
                 );
 
                 // Re-propose the block we're locked to so other validators can vote on it
@@ -2495,6 +2604,35 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Clear vote tracking for a specific height (used during HotStuff-2 unlock).
+    ///
+    /// This removes all recorded votes for the given height, allowing validators
+    /// to vote again after a view change proves no QC formed. This is safe because
+    /// the view change certificate provides proof that consensus has moved on.
+    ///
+    /// Returns the number of vote entries cleared.
+    fn clear_vote_tracking_for_height(&mut self, height: u64) -> usize {
+        let mut cleared = 0;
+
+        // Clear received_votes_by_height for this height
+        // This allows us to accept new votes from validators who previously voted
+        self.received_votes_by_height.retain(|(h, _), _| {
+            if *h == height {
+                cleared += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Clear vote sets for blocks at this height
+        // Note: vote_sets are keyed by block_hash, so we need to check the height
+        self.vote_sets
+            .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h != height));
+
+        cleared
+    }
 
     /// Clean up old state after commit.
     fn cleanup_old_state(&mut self, committed_height: u64) {

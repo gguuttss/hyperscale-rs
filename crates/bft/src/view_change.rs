@@ -548,11 +548,8 @@ impl ViewChangeState {
             return self.finalize_vote(vote);
         }
 
-        // Get public keys for QC signers
-        let signer_keys: Vec<PublicKey> = vote
-            .highest_qc
-            .signers
-            .set_indices()
+        // Get public keys for ALL committee members (runner will filter by signer bitfield)
+        let committee_keys: Vec<PublicKey> = (0..self.topology.local_committee_size())
             .filter_map(|idx| {
                 self.topology
                     .local_validator_at_index(idx)
@@ -560,8 +557,8 @@ impl ViewChangeState {
             })
             .collect();
 
-        if signer_keys.is_empty() {
-            warn!(voter = ?vote.voter, "No valid signer keys for highest_qc");
+        if committee_keys.is_empty() {
+            warn!(voter = ?vote.voter, "No valid committee keys for highest_qc verification");
             return vec![];
         }
 
@@ -580,7 +577,7 @@ impl ViewChangeState {
         // Delegate QC signature verification to runner
         vec![Action::VerifyViewChangeHighestQc {
             vote,
-            public_keys: signer_keys,
+            public_keys: committee_keys,
             signing_message,
         }]
     }
