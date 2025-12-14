@@ -32,6 +32,22 @@ pub struct BftConfig {
     /// If a pending block is still missing certificates after this duration,
     /// request them directly from the proposer or a peer.
     pub certificate_fetch_timeout: Duration,
+
+    /// Timeout for removing stale incomplete pending blocks.
+    /// If a pending block remains incomplete (missing transactions/certificates)
+    /// after this duration, it is removed from pending_blocks. This allows sync
+    /// to be triggered when a later block header arrives, since has_block_at_height()
+    /// will no longer return true for the stale block's height.
+    ///
+    /// This prevents a node from getting permanently stuck when transaction/certificate
+    /// fetches fail repeatedly (e.g., proposer offline, network issues).
+    pub stale_pending_block_timeout: Duration,
+
+    /// Interval between cleanup timer fires.
+    /// The cleanup timer performs periodic housekeeping tasks:
+    /// - Removes stale pending blocks that have been incomplete too long
+    /// - Checks sync health and triggers catch-up sync if needed
+    pub cleanup_interval: Duration,
 }
 
 impl Default for BftConfig {
@@ -45,6 +61,8 @@ impl Default for BftConfig {
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(50),
             certificate_fetch_timeout: Duration::from_millis(100),
+            stale_pending_block_timeout: Duration::from_secs(30),
+            cleanup_interval: Duration::from_secs(1),
         }
     }
 }

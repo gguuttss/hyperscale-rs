@@ -1,7 +1,7 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine};
+use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::MempoolState;
@@ -145,11 +145,27 @@ impl NodeStateMachine {
 
     /// Handle cleanup timer.
     fn on_cleanup_timer(&mut self) -> Vec<Action> {
+        // Reschedule the cleanup timer
+        let mut actions = vec![Action::SetTimer {
+            id: TimerId::Cleanup,
+            duration: self.bft.config().cleanup_interval,
+        }];
+
         // Clean up expired tombstones in livelock state
         self.livelock.cleanup();
 
+        // Clean up stale incomplete pending blocks in BFT state.
+        // This prevents nodes from getting stuck when transaction/certificate
+        // fetches fail permanently (e.g., proposer offline).
+        self.bft.cleanup_stale_pending_blocks();
+
+        // Check if we're behind and need to catch up via sync.
+        // This handles the case where we have a higher latest_qc than committed_height,
+        // meaning the network has progressed but we're stuck.
+        actions.extend(self.bft.check_sync_health());
+
         // TODO: Clean up other stale state (mempool, execution, etc.)
-        vec![]
+        actions
     }
 
     /// Handle block committed event.
@@ -627,6 +643,19 @@ impl StateMachine for NodeStateMachine {
                     *block_hash,
                     vec![std::sync::Arc::new(certificate.clone())],
                 );
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Fetch Failure Events
+            // When transaction/certificate fetch fails permanently, remove the pending
+            // block so sync can be triggered when a later block header arrives.
+            // ═══════════════════════════════════════════════════════════════════════
+            Event::TransactionFetchFailed { block_hash } => {
+                return self.bft.on_fetch_failed(*block_hash);
+            }
+
+            Event::CertificateFetchFailed { block_hash } => {
+                return self.bft.on_fetch_failed(*block_hash);
             }
         }
 

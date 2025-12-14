@@ -713,9 +713,21 @@ impl FetchManager {
             match kind {
                 FetchKind::Transaction => {
                     self.tx_fetches.remove(&block_hash);
+                    // Notify BFT that transaction fetch permanently failed
+                    // so it can remove the pending block and allow sync
+                    let event = Event::TransactionFetchFailed { block_hash };
+                    if let Err(e) = self.event_tx.try_send(event) {
+                        warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
+                    }
                 }
                 FetchKind::Certificate => {
                     self.cert_fetches.remove(&block_hash);
+                    // Notify BFT that certificate fetch permanently failed
+                    // so it can remove the pending block and allow sync
+                    let event = Event::CertificateFetchFailed { block_hash };
+                    if let Err(e) = self.event_tx.try_send(event) {
+                        warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
+                    }
                 }
             }
             return;

@@ -132,6 +132,10 @@ pub struct BftState {
     /// Pending blocks being assembled (hash -> pending block).
     pending_blocks: HashMap<Hash, PendingBlock>,
 
+    /// Tracks when each pending block was created (hash -> creation time).
+    /// Used to detect stale pending blocks that should be removed to allow sync.
+    pending_block_created_at: HashMap<Hash, Duration>,
+
     /// Vote sets for blocks (hash -> vote set).
     vote_sets: HashMap<Hash, VoteSet>,
 
@@ -257,6 +261,7 @@ impl BftState {
             latest_qc: recovered.latest_qc,
             genesis_block: None,
             pending_blocks: HashMap::new(),
+            pending_block_created_at: HashMap::new(),
             vote_sets: HashMap::new(),
             voted_heights,
             received_votes_by_height: HashMap::new(),
@@ -367,11 +372,17 @@ impl BftState {
             "Initialized genesis block"
         );
 
-        // Set initial proposal timer
-        vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }]
+        // Set initial timers
+        vec![
+            Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: self.config.proposal_interval,
+            },
+            Action::SetTimer {
+                id: TimerId::Cleanup,
+                duration: self.config.cleanup_interval,
+            },
+        ]
     }
 
     /// Request recovery from storage.
@@ -423,11 +434,17 @@ impl BftState {
             "Recovered chain state from storage"
         );
 
-        // Set proposal timer to resume consensus
-        vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }]
+        // Set timers to resume consensus and background tasks
+        vec![
+            Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: self.config.proposal_interval,
+            },
+            Action::SetTimer {
+                id: TimerId::Cleanup,
+                duration: self.config.cleanup_interval,
+            },
+        ]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -631,6 +648,7 @@ impl BftState {
         }
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
+            self.pending_block_created_at.insert(block_hash, self.now);
             self.certified_blocks
                 .insert(block_hash, ((*constructed).clone(), parent_qc));
         }
@@ -716,6 +734,7 @@ impl BftState {
         let mut pending = PendingBlock::new(header.clone(), vec![], vec![]);
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
+            self.pending_block_created_at.insert(block_hash, self.now);
             self.certified_blocks
                 .insert(block_hash, ((*constructed).clone(), parent_qc));
         }
@@ -948,8 +967,9 @@ impl BftState {
             }
         }
 
-        // Store pending block
+        // Store pending block with creation timestamp for stale detection
         self.pending_blocks.insert(block_hash, pending);
+        self.pending_block_created_at.insert(block_hash, self.now);
 
         // Update our latest_qc from the received header's parent_qc
         // This is how QCs propagate through the network - via block proposals
@@ -1939,7 +1959,18 @@ impl BftState {
                         .insert(block_hash, (height, qc));
                 }
             } else {
-                warn!("Block {} not found for commit", block_hash);
+                // Block not in pending_blocks - check if it's in certified_blocks
+                let in_certified = self.certified_blocks.contains_key(&block_hash);
+                warn!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    qc_height = qc.height.0,
+                    committed_height = self.committed_height,
+                    in_certified_blocks = in_certified,
+                    certified_blocks_count = self.certified_blocks.len(),
+                    pending_blocks_count = self.pending_blocks.len(),
+                    "Block not found for commit"
+                );
             }
             return vec![];
         };
@@ -2248,8 +2279,8 @@ impl BftState {
         // Clean up old state
         self.cleanup_old_state(height);
 
-        // Emit actions
-        vec![
+        // Emit actions for the synced block
+        let mut actions = vec![
             Action::PersistBlock {
                 block: block.clone(),
                 qc,
@@ -2264,7 +2295,54 @@ impl BftState {
                     block: block.clone(),
                 },
             },
-        ]
+        ];
+
+        // After syncing a block, check if we have buffered commits for subsequent heights
+        // that can now be processed. This handles the case where:
+        // 1. Block N was incomplete, blocking commits
+        // 2. Blocks N+1, N+2, ... were complete but buffered in pending_commits
+        // 3. Sync provided block N
+        // 4. Now we can drain the pending_commits buffer
+        actions.extend(self.drain_pending_commits());
+
+        actions
+    }
+
+    /// Drain buffered out-of-order commits that are now ready to be processed.
+    ///
+    /// Called after committing a block (via sync or normal consensus) to check
+    /// if there are buffered commits at subsequent heights that can now proceed.
+    fn drain_pending_commits(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        loop {
+            let next_height = self.committed_height + 1;
+
+            // Check if we have a buffered commit for the next height
+            let Some((block_hash, qc)) = self.pending_commits.remove(&next_height) else {
+                break;
+            };
+
+            debug!(
+                validator = ?self.validator_id(),
+                height = next_height,
+                block_hash = ?block_hash,
+                "Processing buffered commit after sync"
+            );
+
+            // Try to commit this block - it should be complete since it was buffered
+            // in pending_commits (not pending_commits_awaiting_data)
+            let commit_actions = self.on_block_ready_to_commit(block_hash, qc);
+            actions.extend(commit_actions);
+
+            // If on_block_ready_to_commit didn't actually commit (e.g., block not found),
+            // stop trying to drain further
+            if self.committed_height < next_height {
+                break;
+            }
+        }
+
+        actions
     }
 
     /// Try to apply all consecutive verified synced blocks.
@@ -2787,6 +2865,45 @@ impl BftState {
         actions
     }
 
+    /// Handle permanent fetch failure for a block.
+    ///
+    /// Called when the runner gives up on fetching transactions/certificates
+    /// after max retries. We remove the pending block and any associated buffered
+    /// commit to allow sync to be triggered.
+    pub fn on_fetch_failed(&mut self, block_hash: Hash) -> Vec<Action> {
+        if let Some(pending) = self.pending_blocks.remove(&block_hash) {
+            let height = pending.header().height.0;
+            warn!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                height = height,
+                missing_txs = pending.missing_transaction_count(),
+                missing_certs = pending.missing_certificate_count(),
+                "Removing pending block due to permanent fetch failure"
+            );
+            self.pending_block_created_at.remove(&block_hash);
+        }
+
+        // Also clean up any buffered commit that was waiting for this block's data.
+        // Without this, the entry would stay in pending_commits_awaiting_data forever
+        // since the block will never complete.
+        if self
+            .pending_commits_awaiting_data
+            .remove(&block_hash)
+            .is_some()
+        {
+            debug!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                "Removed buffered commit awaiting data for failed fetch"
+            );
+        }
+
+        // Sync will be triggered by check_sync_health() when it detects we can't
+        // make progress (next block to commit is missing or incomplete)
+        vec![]
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Transaction Monitoring
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2947,6 +3064,10 @@ impl BftState {
         self.pending_blocks
             .retain(|_, pending| pending.header().height.0 > committed_height);
 
+        // Also clean up pending_block_created_at to match pending_blocks
+        self.pending_block_created_at
+            .retain(|hash, _| self.pending_blocks.contains_key(hash));
+
         // Remove vote sets at or below committed height
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h > committed_height));
@@ -2966,6 +3087,159 @@ impl BftState {
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
             .retain(|_, (height, _)| *height > committed_height);
+    }
+
+    /// Clean up stale incomplete pending blocks.
+    ///
+    /// Removes pending blocks that:
+    /// 1. Are incomplete (still waiting for transactions/certificates)
+    /// 2. Have been pending longer than `stale_pending_block_timeout`
+    ///
+    /// This prevents a node from getting stuck when transaction/certificate
+    /// fetches fail permanently. By removing stale incomplete blocks, we allow
+    /// sync to be triggered when a later block header arrives.
+    ///
+    /// Returns the number of blocks removed.
+    pub fn cleanup_stale_pending_blocks(&mut self) -> usize {
+        let timeout = self.config.stale_pending_block_timeout;
+        let now = self.now;
+        let mut removed = 0;
+
+        // Collect hashes of stale incomplete blocks
+        let stale_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(hash, pending)| {
+                // Only remove incomplete blocks
+                if pending.is_complete() {
+                    return false;
+                }
+                // Check if it's been pending too long
+                if let Some(&created_at) = self.pending_block_created_at.get(*hash) {
+                    now.saturating_sub(created_at) >= timeout
+                } else {
+                    // No creation time tracked - shouldn't happen, but remove anyway
+                    true
+                }
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        // Remove stale blocks and their associated buffered commits
+        for hash in stale_hashes {
+            if let Some(pending) = self.pending_blocks.remove(&hash) {
+                let height = pending.header().height.0;
+                warn!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?hash,
+                    height = height,
+                    missing_txs = pending.missing_transaction_count(),
+                    missing_certs = pending.missing_certificate_count(),
+                    "Removing stale incomplete pending block to allow sync"
+                );
+                self.pending_block_created_at.remove(&hash);
+
+                // Also clean up any buffered commit that was waiting for this block's data.
+                // Without this, the entry would stay in pending_commits_awaiting_data forever.
+                self.pending_commits_awaiting_data.remove(&hash);
+
+                removed += 1;
+            }
+        }
+
+        removed
+    }
+
+    /// Check if we're behind and need to catch up via sync.
+    ///
+    /// This is called periodically by the cleanup timer to detect when:
+    /// 1. We have a latest_qc at a height higher than committed_height
+    /// 2. We can't make progress because the next block to commit is missing or incomplete
+    ///
+    /// If we detect we're stuck, we trigger sync to the latest_qc height.
+    /// This handles edge cases where:
+    /// - Block headers are dropped
+    /// - Transaction/certificate fetches fail permanently
+    /// - A block in the middle of the chain is incomplete while later blocks are ready
+    pub fn check_sync_health(&mut self) -> Vec<Action> {
+        let Some(latest_qc) = &self.latest_qc else {
+            return vec![];
+        };
+
+        let qc_height = latest_qc.height.0;
+        let qc_hash = latest_qc.block_hash;
+
+        // If we're already at or past the QC height, nothing to do
+        if self.committed_height >= qc_height {
+            return vec![];
+        }
+
+        // Check if we can make progress from our current position.
+        // The critical check is whether we have a COMPLETE block at the next height
+        // we need to commit. Having blocks at higher heights doesn't help if we're
+        // stuck on an earlier incomplete block.
+        let next_needed_height = self.committed_height + 1;
+
+        // Log sync health status when behind
+        let gap = qc_height.saturating_sub(self.committed_height);
+        if gap > 5 {
+            let has_next = self.has_complete_block_at_height(next_needed_height);
+            let pending_commit_count = self.pending_commits.len();
+            let pending_data_count = self.pending_commits_awaiting_data.len();
+            debug!(
+                validator = ?self.validator_id(),
+                committed_height = self.committed_height,
+                next_needed_height = next_needed_height,
+                qc_height = qc_height,
+                gap = gap,
+                has_next_complete = has_next,
+                pending_commits = pending_commit_count,
+                pending_commits_awaiting_data = pending_data_count,
+                certified_blocks = self.certified_blocks.len(),
+                pending_blocks = self.pending_blocks.len(),
+                "Sync health check status"
+            );
+        }
+
+        if self.has_complete_block_at_height(next_needed_height) {
+            // We have the next block ready - commits should proceed normally
+            // But if we're significantly behind, something is wrong with the commit flow.
+            // This can happen after sync when the node's view of the chain diverges from
+            // what it was voting on - the blocks in certified_blocks may have different
+            // hashes than what the QCs reference.
+            if gap > 10 {
+                warn!(
+                    validator = ?self.validator_id(),
+                    committed_height = self.committed_height,
+                    next_needed_height = next_needed_height,
+                    qc_height = qc_height,
+                    gap = gap,
+                    "Have complete block at next height but significantly behind - triggering sync to recover"
+                );
+                // Force sync to get the correct blocks from the canonical chain
+                return vec![Action::StartSync {
+                    target_height: qc_height,
+                    target_hash: qc_hash,
+                }];
+            }
+            return vec![];
+        }
+
+        // We're behind and can't make progress - the next block we need is either
+        // missing entirely or incomplete (waiting for transactions/certificates).
+        // Trigger sync to get the complete block data.
+        info!(
+            validator = ?self.validator_id(),
+            committed_height = self.committed_height,
+            next_needed_height = next_needed_height,
+            qc_height = qc_height,
+            "Sync health check: can't make progress, triggering catch-up sync"
+        );
+
+        vec![Action::StartSync {
+            target_height: qc_height,
+            target_hash: qc_hash,
+        }]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3010,6 +3284,11 @@ impl BftState {
     /// - `pending_synced_block_verifications` (received via sync, verifying QC)
     ///
     /// This is used to determine if we need to sync for a block.
+    ///
+    /// Note: We include ALL pending_blocks (even incomplete ones) because:
+    /// 1. Incomplete blocks will eventually be cleaned up by `cleanup_stale_pending_blocks()`
+    /// 2. The cleanup timer runs every second, so stale blocks won't prevent sync for long
+    /// 3. Being too aggressive about triggering sync causes performance issues
     fn has_block_at_height(&self, height: u64) -> bool {
         // Already committed
         if height <= self.committed_height {
@@ -3035,6 +3314,53 @@ impl BftState {
         }
 
         // In pending synced block verifications
+        if self
+            .pending_synced_block_verifications
+            .values()
+            .any(|p| p.block.header.height.0 == height)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if we have a COMPLETE block at the given height that can be committed.
+    ///
+    /// Unlike `has_block_at_height`, this only returns true if the block is fully
+    /// constructed and ready for commit. Incomplete pending blocks (waiting for
+    /// transactions/certificates) return false.
+    ///
+    /// Returns true if:
+    /// - Height is already committed
+    /// - Block is in `pending_blocks` AND is complete (has all data, block constructed)
+    /// - Block is in `certified_blocks` (always complete)
+    /// - Block is in `pending_synced_block_verifications` (synced blocks are always complete)
+    fn has_complete_block_at_height(&self, height: u64) -> bool {
+        // Already committed
+        if height <= self.committed_height {
+            return true;
+        }
+
+        // In pending blocks - but only if complete and constructed
+        if self
+            .pending_blocks
+            .values()
+            .any(|pb| pb.header().height.0 == height && pb.is_complete() && pb.block().is_some())
+        {
+            return true;
+        }
+
+        // In certified blocks (always complete)
+        if self
+            .certified_blocks
+            .values()
+            .any(|(block, _)| block.header.height.0 == height)
+        {
+            return true;
+        }
+
+        // In pending synced block verifications (synced blocks are always complete)
         if self
             .pending_synced_block_verifications
             .values()
@@ -3323,7 +3649,6 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verification_delegates_to_runner() {
-        use crate::pending::PendingBlock;
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
@@ -3350,19 +3675,10 @@ mod tests {
         // Set time for timestamp validation
         state.set_time(Duration::from_secs(100));
 
-        // Create parent block at height 1 (needed to avoid sync trigger)
+        // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        let parent_header = BlockHeader {
-            height: BlockHeight(1),
-            parent_hash: Hash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
-            proposer: ValidatorId(1),
-            timestamp: 99_000,
-            round: 0,
-            is_fallback: false,
-        };
-        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
-        state.pending_blocks.insert(parent_hash, parent_pending);
+        state.committed_height = 1;
+        state.committed_hash = parent_hash;
 
         // Create a block at height 2 with a non-genesis parent QC
         let mut signers = SignerBitfield::new(4);
@@ -3411,7 +3727,6 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verified_success_triggers_vote() {
-        use crate::pending::PendingBlock;
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
@@ -3437,19 +3752,10 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        // Create parent block at height 1 (needed to avoid sync trigger)
+        // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        let parent_header = BlockHeader {
-            height: BlockHeight(1),
-            parent_hash: Hash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
-            proposer: ValidatorId(1),
-            timestamp: 99_000,
-            round: 0,
-            is_fallback: false,
-        };
-        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
-        state.pending_blocks.insert(parent_hash, parent_pending);
+        state.committed_height = 1;
+        state.committed_hash = parent_hash;
 
         // Create block header with non-genesis QC
         let mut signers = SignerBitfield::new(4);
@@ -3503,7 +3809,6 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verified_failure_rejects_block() {
-        use crate::pending::PendingBlock;
         use hyperscale_types::SignerBitfield;
 
         let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
@@ -3528,19 +3833,10 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        // Create parent block at height 1 (needed to avoid sync trigger)
+        // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        let parent_header = BlockHeader {
-            height: BlockHeight(1),
-            parent_hash: Hash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
-            proposer: ValidatorId(1),
-            timestamp: 99_000,
-            round: 0,
-            is_fallback: false,
-        };
-        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
-        state.pending_blocks.insert(parent_hash, parent_pending);
+        state.committed_height = 1;
+        state.committed_hash = parent_hash;
 
         // Create block header
         let mut signers = SignerBitfield::new(4);
