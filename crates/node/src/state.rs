@@ -382,7 +382,14 @@ impl StateMachine for NodeStateMachine {
 
             // SubmitTransaction needs special handling to add gossip broadcast
             Event::SubmitTransaction { tx } => {
-                let mut actions = self.mempool.on_submit_transaction_arc(Arc::clone(tx));
+                let mut actions = Vec::new();
+
+                // Only add to our mempool if this transaction involves our shard.
+                // Cross-shard transactions that don't touch our shard should only be
+                // forwarded via gossip, not stored locally.
+                if self.topology.involves_local_shard(tx) {
+                    actions.extend(self.mempool.on_submit_transaction_arc(Arc::clone(tx)));
+                }
 
                 // Broadcast transaction to all shards involved in this transaction
                 let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
@@ -419,6 +426,12 @@ impl StateMachine for NodeStateMachine {
             // TransactionGossipReceived: add to mempool AND notify BFT
             // The BFT might have pending blocks waiting for this transaction
             Event::TransactionGossipReceived { tx } => {
+                // Only add to our mempool if this transaction involves our shard.
+                // Cross-shard transactions that don't touch our shard should be ignored.
+                if !self.topology.involves_local_shard(tx) {
+                    return vec![];
+                }
+
                 let tx_hash = tx.hash();
                 let mut actions = self.mempool.on_transaction_gossip_arc(Arc::clone(tx));
 
