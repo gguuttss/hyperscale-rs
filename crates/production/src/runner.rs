@@ -743,20 +743,8 @@ impl ProductionRunner {
                     let now = self.start_time.elapsed();
                     self.state.set_time(now);
 
-                    // Check for CertificateNeeded - handle specially (network fetch)
-                    // This can come through callbacks when BFT emits it as EnqueueInternal
-                    if let Event::CertificateNeeded {
-                        block_hash,
-                        proposer,
-                        missing_cert_hashes,
-                    } = event
-                    {
-                        self.handle_certificate_fetch_needed(block_hash, proposer, missing_cert_hashes).await;
-                        continue;
-                    }
-
-                    // Process callback event - these go directly to state machine
-                    let actions = self.state.handle(event);
+                    // Dispatch event through unified handler
+                    let actions = self.dispatch_event(event).await;
 
                     for action in actions {
                         if let Err(e) = self.process_action(action).await {
@@ -788,39 +776,9 @@ impl ProductionRunner {
                             let now = self.start_time.elapsed();
                             self.state.set_time(now);
 
-                            // Check for SyncNeeded - handle entirely in SyncManager.
-                            // SyncManager now handles everything: I/O, validation, ordering, delivery.
-                            // It sends SyncBlockReadyToApply directly to BFT when blocks are ready.
-                            if let Event::SyncNeeded { target_height, target_hash } = event {
-                                self.sync_manager.start_sync(target_height, target_hash);
-                                continue; // Don't pass to state machine - SyncManager handles it
-                            }
-
-                            // Check for TransactionNeeded - handle specially
-                            // The runner handles this directly (network fetch), not the state machine.
-                            // If we passed it to state.handle(), it would re-enqueue itself infinitely.
-                            if let Event::TransactionNeeded {
-                                block_hash,
-                                proposer,
-                                missing_tx_hashes,
-                            } = event
-                            {
-                                self.handle_transaction_fetch_needed(block_hash, proposer, missing_tx_hashes).await;
-                                continue;
-                            }
-
-                            // Check for CertificateNeeded - handle specially (network fetch)
-                            if let Event::CertificateNeeded {
-                                block_hash,
-                                proposer,
-                                missing_cert_hashes,
-                            } = event
-                            {
-                                self.handle_certificate_fetch_needed(block_hash, proposer, missing_cert_hashes).await;
-                                continue;
-                            }
-
                             // Process event synchronously (fast)
+                            // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
+                            // are now Actions emitted by the state machine and handled in process_action().
                             let actions = {
                                 let sm_span = span!(Level::DEBUG, "state_machine.handle");
                                 let _sm_guard = sm_span.enter();
@@ -865,12 +823,6 @@ impl ProductionRunner {
                                 // Update time for each event
                                 let now = self.start_time.elapsed();
                                 self.state.set_time(now);
-
-                                // Handle SyncNeeded entirely in SyncManager (skip state machine)
-                                if let Event::SyncNeeded { target_height, target_hash } = more_event {
-                                    self.sync_manager.start_sync(target_height, target_hash);
-                                    continue; // Don't pass to state machine
-                                }
 
                                 let more_actions = self.state.handle(more_event);
 
@@ -1670,6 +1622,36 @@ impl ProductionRunner {
             Action::FetchEpochConfig { epoch } => {
                 tracing::debug!(?epoch, "FetchEpochConfig - not yet implemented");
             }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Runner I/O Requests (network fetches)
+            // These are requests from the state machine for the runner to perform
+            // network I/O. Results are delivered back as Events.
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::StartSync {
+                target_height,
+                target_hash,
+            } => {
+                self.sync_manager.start_sync(target_height, target_hash);
+            }
+
+            Action::FetchTransactions {
+                block_hash,
+                proposer,
+                tx_hashes,
+            } => {
+                self.handle_transaction_fetch_needed(block_hash, proposer, tx_hashes)
+                    .await;
+            }
+
+            Action::FetchCertificates {
+                block_hash,
+                proposer,
+                cert_hashes,
+            } => {
+                self.handle_certificate_fetch_needed(block_hash, proposer, cert_hashes)
+                    .await;
+            }
         }
 
         Ok(())
@@ -1918,6 +1900,8 @@ impl ProductionRunner {
                 proposer = ?proposer,
                 "Cannot fetch transactions: proposer peer ID not known"
             );
+            // Re-arm timer to retry - proposer may become known later
+            self.rearm_transaction_fetch_timer(block_hash);
             return;
         };
 
@@ -1950,6 +1934,17 @@ impl ProductionRunner {
                                 tracing::error!(error = ?e, "Failed to send TransactionReceived event");
                             }
                         }
+
+                        // If we didn't get all transactions, re-arm timer to retry
+                        if tx_count < missing_tx_hashes.len() {
+                            tracing::debug!(
+                                block_hash = ?block_hash,
+                                received = tx_count,
+                                requested = missing_tx_hashes.len(),
+                                "Partial transaction fetch - rearming timer for retry"
+                            );
+                            self.rearm_transaction_fetch_timer(block_hash);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1957,6 +1952,8 @@ impl ProductionRunner {
                             error = ?e,
                             "Failed to decode transaction fetch response"
                         );
+                        // Re-arm timer to retry
+                        self.rearm_transaction_fetch_timer(block_hash);
                     }
                 }
             }
@@ -1967,8 +1964,31 @@ impl ProductionRunner {
                     error = ?e,
                     "Failed to fetch transactions from proposer"
                 );
+                // Re-arm timer to retry
+                self.rearm_transaction_fetch_timer(block_hash);
             }
         }
+    }
+
+    /// Re-arm the transaction fetch timer for retry with backoff.
+    ///
+    /// Spawns a delayed task that sends the timer event to trigger a retry.
+    /// The BFT state machine will re-emit TransactionNeeded if still incomplete.
+    fn rearm_transaction_fetch_timer(&self, block_hash: Hash) {
+        // Use 100ms retry interval (2x the initial 50ms timeout)
+        const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+        let consensus_tx = self.consensus_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RETRY_INTERVAL).await;
+            let event = Event::TransactionTimer { block_hash };
+            if consensus_tx.send(event).await.is_err() {
+                tracing::warn!(
+                    ?block_hash,
+                    "Failed to send transaction fetch retry timer event"
+                );
+            }
+        });
     }
 
     /// Handle an inbound transaction fetch request from a peer.
@@ -2053,6 +2073,8 @@ impl ProductionRunner {
                 proposer = ?proposer,
                 "Cannot fetch certificates: proposer peer ID not known"
             );
+            // Re-arm timer to retry - proposer may become known later
+            self.rearm_certificate_fetch_timer(block_hash);
             return;
         };
 
@@ -2085,6 +2107,17 @@ impl ProductionRunner {
                                 tracing::error!(error = ?e, "Failed to send CertificateReceived event");
                             }
                         }
+
+                        // If we didn't get all certificates, re-arm timer to retry
+                        if cert_count < missing_cert_hashes.len() {
+                            tracing::debug!(
+                                block_hash = ?block_hash,
+                                received = cert_count,
+                                requested = missing_cert_hashes.len(),
+                                "Partial certificate fetch - rearming timer for retry"
+                            );
+                            self.rearm_certificate_fetch_timer(block_hash);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2092,6 +2125,8 @@ impl ProductionRunner {
                             error = ?e,
                             "Failed to decode certificate fetch response"
                         );
+                        // Re-arm timer to retry
+                        self.rearm_certificate_fetch_timer(block_hash);
                     }
                 }
             }
@@ -2102,8 +2137,31 @@ impl ProductionRunner {
                     error = ?e,
                     "Failed to fetch certificates from proposer"
                 );
+                // Re-arm timer to retry
+                self.rearm_certificate_fetch_timer(block_hash);
             }
         }
+    }
+
+    /// Re-arm the certificate fetch timer for retry with backoff.
+    ///
+    /// Spawns a delayed task that sends the timer event to trigger a retry.
+    /// The BFT state machine will re-emit CertificateNeeded if still incomplete.
+    fn rearm_certificate_fetch_timer(&self, block_hash: Hash) {
+        // Use 200ms retry interval (2x the initial 100ms timeout)
+        const RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+        let consensus_tx = self.consensus_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RETRY_INTERVAL).await;
+            let event = Event::CertificateTimer { block_hash };
+            if consensus_tx.send(event).await.is_err() {
+                tracing::warn!(
+                    ?block_hash,
+                    "Failed to send certificate fetch retry timer event"
+                );
+            }
+        });
     }
 
     /// Handle an inbound certificate fetch request from a peer.
@@ -2161,5 +2219,14 @@ impl ProductionRunner {
                 "Failed to send certificate response"
             );
         }
+    }
+
+    /// Dispatch an event to the state machine.
+    ///
+    /// All events are now passed directly to the state machine. Runner I/O requests
+    /// (sync, transaction fetch, certificate fetch) are now Actions emitted by the
+    /// state machine and handled in process_action().
+    async fn dispatch_event(&mut self, event: Event) -> Vec<Action> {
+        self.state.handle(event)
     }
 }

@@ -615,49 +615,36 @@ impl SimulationRunner {
             }
 
             Action::EnqueueInternal { event } => {
-                // Special handling for events that require runner I/O
-
-                // SyncNeeded: the runner fetches blocks directly and sends SyncBlockReadyToApply
-                // Don't pass to state machine - runner handles everything
-                if let Event::SyncNeeded { target_height, .. } = &event {
-                    self.handle_sync_needed(from, *target_height);
-                    return; // Skip scheduling to state machine
-                }
-
-                // TransactionNeeded: the runner fetches transactions from peers
-                if let Event::TransactionNeeded {
-                    block_hash,
-                    proposer,
-                    missing_tx_hashes,
-                } = &event
-                {
-                    self.handle_transaction_fetch_needed(
-                        from,
-                        *block_hash,
-                        *proposer,
-                        missing_tx_hashes.clone(),
-                    );
-                    return; // Skip scheduling to state machine
-                }
-
-                // CertificateNeeded: the runner fetches certificates from peers
-                if let Event::CertificateNeeded {
-                    block_hash,
-                    proposer,
-                    missing_cert_hashes,
-                } = &event
-                {
-                    self.handle_certificate_fetch_needed(
-                        from,
-                        *block_hash,
-                        *proposer,
-                        missing_cert_hashes.clone(),
-                    );
-                    return; // Skip scheduling to state machine
-                }
-
-                // Other internal events get scheduled normally
+                // Internal events get scheduled for immediate processing
                 self.schedule_event(from, self.now, event);
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════
+            // Runner I/O Requests (network fetches)
+            // These are requests from the state machine for the runner to perform
+            // network I/O. Results are delivered back as Events.
+            // ═══════════════════════════════════════════════════════════════════════
+            Action::StartSync {
+                target_height,
+                target_hash: _,
+            } => {
+                self.handle_sync_needed(from, target_height);
+            }
+
+            Action::FetchTransactions {
+                block_hash,
+                proposer,
+                tx_hashes,
+            } => {
+                self.handle_transaction_fetch_needed(from, block_hash, proposer, tx_hashes);
+            }
+
+            Action::FetchCertificates {
+                block_hash,
+                proposer,
+                cert_hashes,
+            } => {
+                self.handle_certificate_fetch_needed(from, block_hash, proposer, cert_hashes);
             }
 
             // Delegated work executes instantly in simulation

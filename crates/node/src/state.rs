@@ -430,15 +430,9 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Sync protocol events
-            // Note: SyncNeeded and SyncBlockReceived are now handled entirely by the runner.
+            // Note: SyncNeeded is now Action::StartSync (emitted by BFT, handled by runner).
+            // SyncBlockReceived is handled by the runner's SyncManager.
             // The runner sends SyncBlockReadyToApply directly when blocks are ready.
-            Event::SyncNeeded { .. } => {
-                // Runner handles this - should not reach state machine
-                tracing::warn!(
-                    "SyncNeeded event reached NodeStateMachine - should be handled by runner"
-                );
-            }
-
             Event::SyncBlockReceived { .. } => {
                 // Runner handles this - should not reach state machine
                 tracing::warn!("SyncBlockReceived event reached NodeStateMachine - should be handled by runner");
@@ -588,33 +582,10 @@ impl StateMachine for NodeStateMachine {
 
             // ═══════════════════════════════════════════════════════════════════════
             // Transaction Fetch Protocol
+            // Note: TransactionNeeded is now Action::FetchTransactions (emitted by BFT, handled by runner).
             // ═══════════════════════════════════════════════════════════════════════
             Event::TransactionTimer { block_hash } => {
                 return self.bft.on_transaction_fetch_timer(*block_hash);
-            }
-
-            Event::TransactionNeeded {
-                block_hash,
-                proposer,
-                missing_tx_hashes,
-            } => {
-                // The runner will handle this by making a request to the proposer or peers.
-                // Return an action that signals the runner to fetch transactions.
-                tracing::info!(
-                    block_hash = ?block_hash,
-                    proposer = ?proposer,
-                    missing_count = missing_tx_hashes.len(),
-                    "Transaction fetch needed - runner should request from peer"
-                );
-                // Return the event as-is in an action for the runner to handle.
-                // The runner will make the network request and deliver TransactionReceived.
-                return vec![Action::EnqueueInternal {
-                    event: Event::TransactionNeeded {
-                        block_hash: *block_hash,
-                        proposer: *proposer,
-                        missing_tx_hashes: missing_tx_hashes.clone(),
-                    },
-                }];
             }
 
             Event::TransactionReceived {
@@ -628,33 +599,10 @@ impl StateMachine for NodeStateMachine {
 
             // ═══════════════════════════════════════════════════════════════════════
             // Certificate Fetch Protocol
+            // Note: CertificateNeeded is now Action::FetchCertificates (emitted by BFT, handled by runner).
             // ═══════════════════════════════════════════════════════════════════════
             Event::CertificateTimer { block_hash } => {
                 return self.bft.on_certificate_fetch_timer(*block_hash);
-            }
-
-            Event::CertificateNeeded {
-                block_hash,
-                proposer,
-                missing_cert_hashes,
-            } => {
-                // The runner will handle this by making a request to the proposer or peers.
-                // Return an action that signals the runner to fetch certificates.
-                tracing::info!(
-                    block_hash = ?block_hash,
-                    proposer = ?proposer,
-                    missing_count = missing_cert_hashes.len(),
-                    "Certificate fetch needed - runner should request from peer"
-                );
-                // Return the event as-is in an action for the runner to handle.
-                // The runner will make the network request and deliver CertificateReceived.
-                return vec![Action::EnqueueInternal {
-                    event: Event::CertificateNeeded {
-                        block_hash: *block_hash,
-                        proposer: *proposer,
-                        missing_cert_hashes: missing_cert_hashes.clone(),
-                    },
-                }];
             }
 
             Event::CertificateReceived {

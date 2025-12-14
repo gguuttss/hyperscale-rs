@@ -476,6 +476,15 @@ impl SimNode {
             | Action::FetchEpochConfig { .. } => {
                 // Not yet implemented - will be handled by GlobalConsensusState
             }
+
+            // Runner I/O actions - the parallel simulator doesn't support sync/fetch
+            // These would require the full simulation runner infrastructure
+            Action::StartSync { .. }
+            | Action::FetchTransactions { .. }
+            | Action::FetchCertificates { .. } => {
+                // Not supported in parallel simulator - would need full runner infrastructure
+                tracing::warn!("Runner I/O action not supported in parallel simulator");
+            }
         }
     }
 }

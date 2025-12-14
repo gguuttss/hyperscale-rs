@@ -398,18 +398,8 @@ pub enum Event {
 
     // ═══════════════════════════════════════════════════════════════════════
     // Sync Protocol Events (priority varies by type)
+    // Note: SyncNeeded is now Action::StartSync (runner I/O request)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Detected that we're behind and need to sync (priority: Internal).
-    ///
-    /// Triggered when we receive a block header or QC ahead of our committed height.
-    /// The runner handles all sync I/O (peer selection, retries, timeouts).
-    SyncNeeded {
-        /// The height we need to sync to.
-        target_height: u64,
-        /// The hash of the target block (for verification).
-        target_hash: Hash,
-    },
-
     /// Received a block from sync (priority: Network).
     ///
     /// Delivered by the runner after fetching from a peer.
@@ -436,6 +426,7 @@ pub enum Event {
     // ═══════════════════════════════════════════════════════════════════════
     // Transaction Fetch Protocol (priority: Internal/Network)
     // Used when block header arrives but transactions are missing from mempool
+    // Note: TransactionNeeded is now Action::FetchTransactions (runner I/O request)
     // ═══════════════════════════════════════════════════════════════════════
     /// Timer fired for fetching missing transactions (priority: Timer).
     ///
@@ -444,19 +435,6 @@ pub enum Event {
     TransactionTimer {
         /// Hash of the block that needs transactions.
         block_hash: Hash,
-    },
-
-    /// Request to fetch missing transactions for a pending block (priority: Internal).
-    ///
-    /// Triggered when TransactionTimer fires and block is still incomplete.
-    /// The runner handles peer selection and makes the request.
-    TransactionNeeded {
-        /// Hash of the block that needs these transactions.
-        block_hash: Hash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing transactions.
-        missing_tx_hashes: Vec<Hash>,
     },
 
     /// Received transactions from a fetch request (priority: Network).
@@ -472,6 +450,7 @@ pub enum Event {
     // ═══════════════════════════════════════════════════════════════════════
     // Certificate Fetch Protocol (priority: Internal/Network)
     // Used when block header arrives but certificates are missing locally
+    // Note: CertificateNeeded is now Action::FetchCertificates (runner I/O request)
     // ═══════════════════════════════════════════════════════════════════════
     /// Timer fired for fetching missing certificates (priority: Timer).
     ///
@@ -480,19 +459,6 @@ pub enum Event {
     CertificateTimer {
         /// Hash of the block that needs certificates.
         block_hash: Hash,
-    },
-
-    /// Request to fetch missing certificates for a pending block (priority: Internal).
-    ///
-    /// Triggered when CertificateTimer fires and block is still incomplete.
-    /// The runner handles peer selection and makes the request.
-    CertificateNeeded {
-        /// Hash of the block that needs these certificates.
-        block_hash: Hash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing certificates (transaction hashes).
-        missing_cert_hashes: Vec<Hash>,
     },
 
     /// Received certificates from a fetch request (priority: Network).
@@ -573,20 +539,21 @@ impl Event {
             | Event::ShardMergeComplete { .. } => EventPriority::Internal,
 
             // Sync events have varying priorities
-            Event::SyncNeeded { .. }
-            | Event::SyncBlockReadyToApply { .. }
-            | Event::SyncComplete { .. } => EventPriority::Internal,
+            // Note: SyncNeeded is now Action::StartSync
+            Event::SyncBlockReadyToApply { .. } | Event::SyncComplete { .. } => {
+                EventPriority::Internal
+            }
 
             Event::SyncBlockReceived { .. } => EventPriority::Network,
 
             // Transaction fetch events
+            // Note: TransactionNeeded is now Action::FetchTransactions
             Event::TransactionTimer { .. } => EventPriority::Timer,
-            Event::TransactionNeeded { .. } => EventPriority::Internal,
             Event::TransactionReceived { .. } => EventPriority::Network,
 
             // Certificate fetch events
+            // Note: CertificateNeeded is now Action::FetchCertificates
             Event::CertificateTimer { .. } => EventPriority::Timer,
-            Event::CertificateNeeded { .. } => EventPriority::Internal,
             Event::CertificateReceived { .. } => EventPriority::Network,
             Event::FetchedCertificateVerified { .. } => EventPriority::Internal,
         }
@@ -667,20 +634,17 @@ impl Event {
             Event::ShardMergeInitiated { .. } => "ShardMergeInitiated",
             Event::ShardMergeComplete { .. } => "ShardMergeComplete",
 
-            // Sync Protocol
-            Event::SyncNeeded { .. } => "SyncNeeded",
+            // Sync Protocol (SyncNeeded is now Action::StartSync)
             Event::SyncBlockReceived { .. } => "SyncBlockReceived",
             Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             Event::SyncComplete { .. } => "SyncComplete",
 
-            // Transaction Fetch Protocol
+            // Transaction Fetch Protocol (TransactionNeeded is now Action::FetchTransactions)
             Event::TransactionTimer { .. } => "TransactionTimer",
-            Event::TransactionNeeded { .. } => "TransactionNeeded",
             Event::TransactionReceived { .. } => "TransactionReceived",
 
-            // Certificate Fetch Protocol
+            // Certificate Fetch Protocol (CertificateNeeded is now Action::FetchCertificates)
             Event::CertificateTimer { .. } => "CertificateTimer",
-            Event::CertificateNeeded { .. } => "CertificateNeeded",
             Event::CertificateReceived { .. } => "CertificateReceived",
             Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
         }

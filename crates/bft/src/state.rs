@@ -895,11 +895,9 @@ impl BftState {
                     "Missing parent block, triggering sync"
                 );
 
-                return vec![Action::EnqueueInternal {
-                    event: Event::SyncNeeded {
-                        target_height,
-                        target_hash,
-                    },
+                return vec![Action::StartSync {
+                    target_height,
+                    target_hash,
                 }];
             }
         }
@@ -2458,12 +2456,10 @@ impl BftState {
             "Transaction fetch timer fired - requesting missing transactions"
         );
 
-        vec![Action::EnqueueInternal {
-            event: Event::TransactionNeeded {
-                block_hash,
-                proposer,
-                missing_tx_hashes: missing,
-            },
+        vec![Action::FetchTransactions {
+            block_hash,
+            proposer,
+            tx_hashes: missing,
         }]
     }
 
@@ -2572,12 +2568,10 @@ impl BftState {
             "Certificate fetch timer fired - requesting missing certificates"
         );
 
-        vec![Action::EnqueueInternal {
-            event: Event::CertificateNeeded {
-                block_hash,
-                proposer,
-                missing_cert_hashes: missing,
-            },
+        vec![Action::FetchCertificates {
+            block_hash,
+            proposer,
+            cert_hashes: missing,
         }]
     }
 

@@ -475,8 +475,8 @@ impl Libp2pAdapter {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(1000); // Buffer for inbound sync requests
-        let (tx_request_tx, tx_request_rx) = mpsc::channel(1000); // Buffer for inbound transaction requests
-        let (cert_request_tx, cert_request_rx) = mpsc::channel(1000); // Buffer for inbound certificate requests
+        let (tx_request_tx, tx_request_rx) = mpsc::channel(5000); // Buffer for inbound transaction requests (high under load)
+        let (cert_request_tx, cert_request_rx) = mpsc::channel(5000); // Buffer for inbound certificate requests (high under load)
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {

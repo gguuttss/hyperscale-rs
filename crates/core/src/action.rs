@@ -4,7 +4,8 @@ use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate, VotePower,
+    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate, ValidatorId,
+    VotePower,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -345,6 +346,52 @@ pub enum Action {
     ///
     /// Returns `Event::ChainMetadataFetched { height, hash, qc }`.
     FetchChainMetadata,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Runner I/O Requests (network fetches handled by the runner)
+    // These request the runner to perform network I/O and deliver results
+    // back as Events (TransactionReceived, CertificateReceived, SyncBlockReadyToApply)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Request the runner to start syncing to a target height.
+    ///
+    /// Emitted when the state machine detects it's behind (e.g., receives a
+    /// block header or QC ahead of committed height). The runner handles
+    /// peer selection, fetching, validation, and delivers blocks via
+    /// `Event::SyncBlockReadyToApply`.
+    StartSync {
+        /// The height we need to sync to.
+        target_height: u64,
+        /// The hash of the target block (for verification).
+        target_hash: Hash,
+    },
+
+    /// Request the runner to fetch missing transactions for a pending block.
+    ///
+    /// Emitted when a block header arrives but transactions are missing from
+    /// mempool. The runner fetches from the proposer or peers and delivers
+    /// results via `Event::TransactionReceived`.
+    FetchTransactions {
+        /// Hash of the block that needs these transactions.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing transactions.
+        tx_hashes: Vec<Hash>,
+    },
+
+    /// Request the runner to fetch missing certificates for a pending block.
+    ///
+    /// Emitted when a block header arrives but certificates are missing locally.
+    /// The runner fetches from the proposer or peers and delivers results via
+    /// `Event::CertificateReceived`.
+    FetchCertificates {
+        /// Hash of the block that needs these certificates.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing certificates (transaction hashes).
+        cert_hashes: Vec<Hash>,
+    },
 }
 
 impl Action {
@@ -456,6 +503,11 @@ impl Action {
             Action::CompleteShardMerge { .. } => "CompleteShardMerge",
             Action::PersistEpochConfig { .. } => "PersistEpochConfig",
             Action::FetchEpochConfig { .. } => "FetchEpochConfig",
+
+            // Runner I/O Requests
+            Action::StartSync { .. } => "StartSync",
+            Action::FetchTransactions { .. } => "FetchTransactions",
+            Action::FetchCertificates { .. } => "FetchCertificates",
         }
     }
 }
