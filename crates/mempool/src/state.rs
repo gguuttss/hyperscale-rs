@@ -65,6 +65,19 @@ pub struct MempoolState {
     /// Allows O(1) lookup of all losers blocked by a winner.
     blocked_losers_by_winner: HashMap<Hash, Vec<Hash>>,
 
+    /// Pending deferrals for transactions not yet in the pool.
+    /// This handles sync scenarios where a deferral references a transaction
+    /// from an earlier block that hasn't been added to the pool yet.
+    /// Maps: loser_tx_hash -> (winner_tx_hash, block_height)
+    pending_deferrals: HashMap<Hash, (Hash, BlockHeight)>,
+
+    /// Pending retries for transactions not yet in the pool.
+    /// This handles sync scenarios where the winner's certificate arrives
+    /// before the deferred loser transaction. When the loser arrives,
+    /// we immediately create the retry.
+    /// Maps: loser_tx_hash -> (winner_tx_hash, cert_height)
+    pending_retries: HashMap<Hash, (Hash, BlockHeight)>,
+
     /// Current time.
     now: Duration,
 
@@ -82,6 +95,8 @@ impl MempoolState {
             pool: HashMap::new(),
             blocked_by: HashMap::new(),
             blocked_losers_by_winner: HashMap::new(),
+            pending_deferrals: HashMap::new(),
+            pending_retries: HashMap::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -211,6 +226,22 @@ impl MempoolState {
                     height = height.0,
                     "Added committed transaction to mempool"
                 );
+
+                // Check if this transaction has a pending retry (winner cert arrived first).
+                // If so, immediately create the retry transaction.
+                if let Some((winner_hash, cert_height)) = self.pending_retries.remove(&hash) {
+                    tracing::info!(
+                        tx_hash = %hash,
+                        winner = %winner_hash,
+                        "Processing pending retry for transaction that arrived after winner certificate"
+                    );
+                    actions.extend(self.create_retry_for_transaction(
+                        Arc::clone(tx),
+                        hash,
+                        winner_hash,
+                        cert_height,
+                    ));
+                }
             }
         }
 
@@ -254,11 +285,13 @@ impl MempoolState {
     /// Handle a deferral committed in a block.
     ///
     /// Updates the deferred TX's status to Blocked and tracks it for retry.
+    /// If the transaction is not yet in the pool (sync scenario), stores the
+    /// deferral for processing when the transaction arrives.
     fn on_deferral_committed(
         &mut self,
         tx_hash: Hash,
         reason: &DeferReason,
-        _height: BlockHeight,
+        height: BlockHeight,
     ) -> Vec<Action> {
         let DeferReason::LivelockCycle { winner_tx_hash } = reason;
 
@@ -292,6 +325,25 @@ impl MempoolState {
                     status: new_status,
                 }];
             }
+        } else {
+            // Transaction not in pool yet - this can happen during sync when
+            // processing blocks where the deferral references a transaction
+            // from an earlier block. Store for later processing.
+            tracing::debug!(
+                tx_hash = %tx_hash,
+                winner = %winner_tx_hash,
+                height = height.0,
+                "Storing pending deferral for transaction not yet in pool"
+            );
+            self.pending_deferrals
+                .insert(tx_hash, (*winner_tx_hash, height));
+
+            // Also set up the reverse index now, so that if the winner's certificate
+            // arrives before the deferred transaction, we know there's a pending loser
+            self.blocked_losers_by_winner
+                .entry(*winner_tx_hash)
+                .or_default()
+                .push(tx_hash);
         }
 
         vec![]
@@ -325,53 +377,127 @@ impl MempoolState {
             .unwrap_or_default();
 
         for loser_hash in loser_hashes {
-            // Get the loser transaction from blocked_by
-            let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) else {
-                continue;
-            };
-            // Create retry transaction
-            let retry_tx = loser_tx.create_retry(winner_hash, height);
-            let retry_hash = retry_tx.hash();
+            // First check if the loser is in blocked_by (normal case - tx was in pool when deferred)
+            if let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) {
+                // Create retry transaction
+                let retry_tx = loser_tx.create_retry(winner_hash, height);
+                let retry_hash = retry_tx.hash();
 
-            tracing::info!(
-                original = %loser_hash,
-                retry = %retry_hash,
-                winner = %winner_hash,
-                retry_count = retry_tx.retry_count(),
-                "Creating retry for deferred transaction"
-            );
-
-            // Update original's status to Retried and evict
-            if self.pool.contains_key(&loser_hash) {
-                actions.push(Action::EmitTransactionStatus {
-                    tx_hash: loser_hash,
-                    status: TransactionStatus::Retried { new_tx: retry_hash },
-                });
-                // Evict from pool - terminal state, no longer needed in state machine
-                self.pool.remove(&loser_hash);
-            }
-
-            // Add retry to mempool if not already present (dedup by hash)
-            if !self.pool.contains_key(&retry_hash) {
-                let retry_tx = Arc::new(retry_tx);
-                self.pool.insert(
-                    retry_hash,
-                    PoolEntry {
-                        tx: Arc::clone(&retry_tx),
-                        status: TransactionStatus::Pending,
-                        added_at: self.now,
-                    },
+                tracing::info!(
+                    original = %loser_hash,
+                    retry = %retry_hash,
+                    winner = %winner_hash,
+                    retry_count = retry_tx.retry_count(),
+                    "Creating retry for deferred transaction"
                 );
 
-                // Emit status for retry transaction
-                actions.push(Action::EmitTransactionStatus {
-                    tx_hash: retry_hash,
-                    status: TransactionStatus::Pending,
-                });
+                // Update original's status to Retried and evict
+                if self.pool.contains_key(&loser_hash) {
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: loser_hash,
+                        status: TransactionStatus::Retried { new_tx: retry_hash },
+                    });
+                    // Evict from pool - terminal state, no longer needed in state machine
+                    self.pool.remove(&loser_hash);
+                }
 
-                // Gossip the retry to relevant shards
-                actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
+                // Add retry to mempool if not already present (dedup by hash)
+                if !self.pool.contains_key(&retry_hash) {
+                    let retry_tx = Arc::new(retry_tx);
+                    self.pool.insert(
+                        retry_hash,
+                        PoolEntry {
+                            tx: Arc::clone(&retry_tx),
+                            status: TransactionStatus::Pending,
+                            added_at: self.now,
+                        },
+                    );
+
+                    // Emit status for retry transaction
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: retry_hash,
+                        status: TransactionStatus::Pending,
+                    });
+
+                    // Gossip the retry to relevant shards
+                    actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
+                }
+            } else if let Some((winner_hash, _deferral_height)) =
+                self.pending_deferrals.remove(&loser_hash)
+            {
+                // The loser was deferred but wasn't in the pool yet (sync scenario).
+                // The winner's certificate arrived before the loser transaction.
+                // We can't create a retry yet because we don't have the loser transaction.
+                // Store in a new structure to create retry when the loser arrives.
+                tracing::debug!(
+                    loser = %loser_hash,
+                    winner = %winner_hash,
+                    "Winner certificate arrived before deferred loser transaction - storing for later retry"
+                );
+                self.pending_retries
+                    .insert(loser_hash, (winner_hash, height));
             }
+        }
+
+        actions
+    }
+
+    /// Create a retry transaction for a deferred loser.
+    ///
+    /// This is extracted into a helper to handle both:
+    /// 1. Normal case: winner certificate arrives, loser is in pool
+    /// 2. Sync case: loser transaction arrives after winner certificate
+    fn create_retry_for_transaction(
+        &mut self,
+        loser_tx: Arc<RoutableTransaction>,
+        loser_hash: Hash,
+        winner_hash: Hash,
+        height: BlockHeight,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Create retry transaction
+        let retry_tx = loser_tx.create_retry(winner_hash, height);
+        let retry_hash = retry_tx.hash();
+
+        tracing::info!(
+            original = %loser_hash,
+            retry = %retry_hash,
+            winner = %winner_hash,
+            retry_count = retry_tx.retry_count(),
+            "Creating retry for deferred transaction"
+        );
+
+        // Update original's status to Retried and evict
+        if self.pool.contains_key(&loser_hash) {
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash: loser_hash,
+                status: TransactionStatus::Retried { new_tx: retry_hash },
+            });
+            // Evict from pool - terminal state, no longer needed in state machine
+            self.pool.remove(&loser_hash);
+        }
+
+        // Add retry to mempool if not already present (dedup by hash)
+        if !self.pool.contains_key(&retry_hash) {
+            let retry_tx = Arc::new(retry_tx);
+            self.pool.insert(
+                retry_hash,
+                PoolEntry {
+                    tx: Arc::clone(&retry_tx),
+                    status: TransactionStatus::Pending,
+                    added_at: self.now,
+                },
+            );
+
+            // Emit status for retry transaction
+            actions.push(Action::EmitTransactionStatus {
+                tx_hash: retry_hash,
+                status: TransactionStatus::Pending,
+            });
+
+            // Gossip the retry to relevant shards
+            actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
         }
 
         actions
@@ -1095,5 +1221,258 @@ mod tests {
         // Retry knows its original
         assert_eq!(retry.original_hash(), original_hash);
         assert_eq!(retry.retry_count(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync Scenario Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_deferral_for_transaction_not_in_pool() {
+        // Scenario: Node syncs a block containing a deferral for a transaction
+        // that was committed in an earlier block the node didn't have.
+        // The deferral should be stored and processed when the transaction arrives.
+
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        // Create transactions
+        let loser_tx = test_transaction(1);
+        let loser_hash = loser_tx.hash();
+        let winner_tx = test_transaction(2);
+        let winner_hash = winner_tx.hash();
+
+        // Process a synced block that contains ONLY the deferral and certificate
+        // (simulating: loser_tx was in an earlier block we don't have yet)
+        let deferral = TransactionDefer {
+            tx_hash: loser_hash,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner_hash,
+            },
+            block_height: BlockHeight(5),
+        };
+        let winner_cert = make_test_certificate(winner_hash);
+
+        // Process block with deferral and certificate, but WITHOUT the loser transaction
+        let sync_block = make_test_block(
+            5,
+            vec![winner_tx],
+            vec![deferral],
+            vec![winner_cert],
+            vec![],
+        );
+        let _actions = mempool.on_block_committed_full(&sync_block);
+
+        // The loser transaction is NOT in the pool
+        assert!(mempool.status(&loser_hash).is_none());
+
+        // But we should have a pending retry stored for it
+        assert!(
+            mempool.pending_retries.contains_key(&loser_hash),
+            "Should have stored pending retry for loser"
+        );
+
+        // Now the earlier block arrives with the loser transaction
+        let earlier_block = make_test_block(3, vec![loser_tx.clone()], vec![], vec![], vec![]);
+        let actions = mempool.on_block_committed_full(&earlier_block);
+
+        // The pending retry should have been processed - we should see retry creation actions
+        let retried_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+        });
+        assert!(
+            retried_action.is_some(),
+            "Should have created retry when deferred transaction arrived"
+        );
+
+        // Pending retry should be cleared
+        assert!(
+            !mempool.pending_retries.contains_key(&loser_hash),
+            "Pending retry should be cleared after processing"
+        );
+    }
+
+    #[test]
+    fn test_sync_deferral_before_certificate() {
+        // Scenario: Deferral arrives in block N, but loser tx is not in pool yet.
+        // Certificate arrives in block N+1.
+        // Then loser tx arrives in block N+2.
+        // Retry should be created when loser tx arrives.
+
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let loser_tx = test_transaction(1);
+        let loser_hash = loser_tx.hash();
+        let winner_tx = test_transaction(2);
+        let winner_hash = winner_tx.hash();
+
+        // Block N: Deferral without loser tx in pool
+        let deferral = TransactionDefer {
+            tx_hash: loser_hash,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner_hash,
+            },
+            block_height: BlockHeight(5),
+        };
+        let block_n = make_test_block(5, vec![], vec![deferral], vec![], vec![]);
+        mempool.on_block_committed_full(&block_n);
+
+        // Pending deferral should be stored
+        assert!(
+            mempool.pending_deferrals.contains_key(&loser_hash),
+            "Should have stored pending deferral"
+        );
+        // Reverse index should be set up
+        assert!(
+            mempool
+                .blocked_losers_by_winner
+                .get(&winner_hash)
+                .map_or(false, |losers| losers.contains(&loser_hash)),
+            "Reverse index should contain loser"
+        );
+
+        // Block N+1: Winner's certificate arrives
+        let winner_cert = make_test_certificate(winner_hash);
+        let block_n1 = make_test_block(6, vec![winner_tx], vec![], vec![winner_cert], vec![]);
+        mempool.on_block_committed_full(&block_n1);
+
+        // Pending deferral should be converted to pending retry
+        assert!(
+            !mempool.pending_deferrals.contains_key(&loser_hash),
+            "Pending deferral should be removed"
+        );
+        assert!(
+            mempool.pending_retries.contains_key(&loser_hash),
+            "Should have stored pending retry"
+        );
+
+        // Block N+2: Loser tx finally arrives
+        let block_n2 = make_test_block(7, vec![loser_tx.clone()], vec![], vec![], vec![]);
+        let actions = mempool.on_block_committed_full(&block_n2);
+
+        // Retry should be created
+        let retried_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+        });
+        assert!(
+            retried_action.is_some(),
+            "Should have created retry when loser tx arrived"
+        );
+
+        // All pending structures should be cleared
+        assert!(!mempool.pending_deferrals.contains_key(&loser_hash));
+        assert!(!mempool.pending_retries.contains_key(&loser_hash));
+    }
+
+    #[test]
+    fn test_sync_deferral_with_tx_in_same_block() {
+        // Scenario: Synced block contains both the transaction AND its deferral.
+        // This is the normal case - should work as before.
+
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let loser_tx = test_transaction(1);
+        let loser_hash = loser_tx.hash();
+        let winner_tx = test_transaction(2);
+        let winner_hash = winner_tx.hash();
+
+        // Block with both loser tx and deferral
+        let deferral = TransactionDefer {
+            tx_hash: loser_hash,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner_hash,
+            },
+            block_height: BlockHeight(5),
+        };
+        let block = make_test_block(
+            5,
+            vec![loser_tx.clone(), winner_tx],
+            vec![deferral],
+            vec![],
+            vec![],
+        );
+        let actions = mempool.on_block_committed_full(&block);
+
+        // Transaction should be in pool and blocked
+        let status = mempool.status(&loser_hash);
+        assert!(
+            matches!(status, Some(TransactionStatus::Blocked { by }) if by == winner_hash),
+            "Loser should be Blocked, got {:?}",
+            status
+        );
+
+        // Should have emitted Blocked status
+        let blocked_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Blocked { .. } } if *tx_hash == loser_hash)
+        });
+        assert!(
+            blocked_action.is_some(),
+            "Should have emitted Blocked status"
+        );
+
+        // Should NOT have pending deferral (it was processed immediately)
+        assert!(
+            !mempool.pending_deferrals.contains_key(&loser_hash),
+            "Should not have pending deferral when tx was in same block"
+        );
+    }
+
+    #[test]
+    fn test_sync_multiple_blocks_with_dependencies() {
+        // Scenario: Multi-block sync where:
+        // - Block N: TX_A committed
+        // - Block N+1: TX_A deferred (blocked by TX_B)
+        // - Block N+2: TX_B's certificate commits, retry created for TX_A
+
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx_a = test_transaction(1);
+        let tx_a_hash = tx_a.hash();
+        let tx_b = test_transaction(2);
+        let tx_b_hash = tx_b.hash();
+
+        // Process blocks in order
+        // Block N: TX_A committed
+        let block_n = make_test_block(5, vec![tx_a.clone(), tx_b.clone()], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&block_n);
+
+        assert!(mempool.pool.contains_key(&tx_a_hash));
+        assert!(mempool.pool.contains_key(&tx_b_hash));
+
+        // Block N+1: TX_A deferred
+        let deferral = TransactionDefer {
+            tx_hash: tx_a_hash,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: tx_b_hash,
+            },
+            block_height: BlockHeight(6),
+        };
+        let block_n1 = make_test_block(6, vec![], vec![deferral], vec![], vec![]);
+        mempool.on_block_committed_full(&block_n1);
+
+        // TX_A should be Blocked
+        assert!(matches!(
+            mempool.status(&tx_a_hash),
+            Some(TransactionStatus::Blocked { by }) if by == tx_b_hash
+        ));
+
+        // Block N+2: TX_B's certificate commits
+        let tx_b_cert = make_test_certificate(tx_b_hash);
+        let block_n2 = make_test_block(7, vec![], vec![], vec![tx_b_cert], vec![]);
+        let actions = mempool.on_block_committed_full(&block_n2);
+
+        // Retry should be created for TX_A
+        let retried_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == tx_a_hash)
+        });
+        assert!(
+            retried_action.is_some(),
+            "Should have created retry for TX_A when TX_B's cert committed"
+        );
+
+        // TX_A should be evicted from pool
+        assert!(
+            mempool.status(&tx_a_hash).is_none(),
+            "TX_A should be evicted after retry created"
+        );
     }
 }

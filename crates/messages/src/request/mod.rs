@@ -8,6 +8,6 @@ mod sync;
 mod transaction;
 
 pub use block::GetBlockRequest;
-pub use certificate::GetCertificatesRequest;
+pub use certificate::{GetCertificatesRequest, FETCH_TYPE_CERTIFICATE};
 pub use sync::SyncCompleteAnnouncement;
-pub use transaction::GetTransactionsRequest;
+pub use transaction::{GetTransactionsRequest, FETCH_TYPE_TRANSACTION};

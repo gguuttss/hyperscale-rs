@@ -1332,73 +1332,94 @@ impl Libp2pAdapter {
                         pending_response_channels.remove(&channel_id);
                     }
                 } else if request.len() > 8 {
-                    // Try to decode as transaction or certificate fetch request
+                    // Decode as transaction or certificate fetch request based on fetch_type tag.
+                    // The fetch_type is the first field (u8) after the SBOR tuple header.
+                    // Basic SBOR encoding: [0x5b (prefix), 0x21 (Tuple), 0x03 (field count), 0x07 (u8 type), value, ...]
+                    // So the fetch_type value is at byte index 4.
                     use hyperscale_messages::request::{
-                        GetCertificatesRequest, GetTransactionsRequest,
+                        GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE,
+                        FETCH_TYPE_TRANSACTION,
                     };
 
-                    if let Ok(tx_request) = sbor::basic_decode::<GetTransactionsRequest>(&request) {
-                        // Transaction fetch request
-                        let channel_id = *next_channel_id;
-                        *next_channel_id = next_channel_id.wrapping_add(1);
-                        pending_response_channels.insert(channel_id, channel);
+                    // Extract fetch_type from SBOR encoding (byte 4 after prefix and tuple header)
+                    let fetch_type = request.get(4).copied();
 
-                        debug!(
-                            peer = %peer,
-                            block_hash = ?tx_request.block_hash,
-                            tx_count = tx_request.tx_hashes.len(),
-                            channel_id = channel_id,
-                            is_validator = is_validator,
-                            "Received transaction fetch request"
-                        );
+                    match fetch_type {
+                        Some(FETCH_TYPE_TRANSACTION) => {
+                            if let Ok(tx_request) =
+                                sbor::basic_decode::<GetTransactionsRequest>(&request)
+                            {
+                                // Transaction fetch request
+                                let channel_id = *next_channel_id;
+                                *next_channel_id = next_channel_id.wrapping_add(1);
+                                pending_response_channels.insert(channel_id, channel);
 
-                        let inbound_request = InboundTransactionRequest {
-                            peer,
-                            block_hash: tx_request.block_hash,
-                            tx_hashes: tx_request.tx_hashes,
-                            channel_id,
-                        };
+                                debug!(
+                                    peer = %peer,
+                                    block_hash = ?tx_request.block_hash,
+                                    tx_count = tx_request.tx_hashes.len(),
+                                    channel_id = channel_id,
+                                    is_validator = is_validator,
+                                    "Received transaction fetch request"
+                                );
 
-                        if tx_request_tx.send(inbound_request).await.is_err() {
-                            warn!(
-                                channel_id,
-                                "Failed to send transaction request to runner (channel full or closed)"
-                            );
-                            pending_response_channels.remove(&channel_id);
+                                let inbound_request = InboundTransactionRequest {
+                                    peer,
+                                    block_hash: tx_request.block_hash,
+                                    tx_hashes: tx_request.tx_hashes,
+                                    channel_id,
+                                };
+
+                                if tx_request_tx.send(inbound_request).await.is_err() {
+                                    warn!(
+                                        channel_id,
+                                        "Failed to send transaction request to runner (channel full or closed)"
+                                    );
+                                    pending_response_channels.remove(&channel_id);
+                                }
+                            } else {
+                                warn!(peer = %peer, "Failed to decode transaction fetch request");
+                            }
                         }
-                    } else if let Ok(cert_request) =
-                        sbor::basic_decode::<GetCertificatesRequest>(&request)
-                    {
-                        // Certificate fetch request
-                        let channel_id = *next_channel_id;
-                        *next_channel_id = next_channel_id.wrapping_add(1);
-                        pending_response_channels.insert(channel_id, channel);
+                        Some(FETCH_TYPE_CERTIFICATE) => {
+                            if let Ok(cert_request) =
+                                sbor::basic_decode::<GetCertificatesRequest>(&request)
+                            {
+                                // Certificate fetch request
+                                let channel_id = *next_channel_id;
+                                *next_channel_id = next_channel_id.wrapping_add(1);
+                                pending_response_channels.insert(channel_id, channel);
 
-                        debug!(
-                            peer = %peer,
-                            block_hash = ?cert_request.block_hash,
-                            cert_count = cert_request.cert_hashes.len(),
-                            channel_id = channel_id,
-                            is_validator = is_validator,
-                            "Received certificate fetch request"
-                        );
+                                debug!(
+                                    peer = %peer,
+                                    block_hash = ?cert_request.block_hash,
+                                    cert_count = cert_request.cert_hashes.len(),
+                                    channel_id = channel_id,
+                                    is_validator = is_validator,
+                                    "Received certificate fetch request"
+                                );
 
-                        let inbound_request = InboundCertificateRequest {
-                            peer,
-                            block_hash: cert_request.block_hash,
-                            cert_hashes: cert_request.cert_hashes,
-                            channel_id,
-                        };
+                                let inbound_request = InboundCertificateRequest {
+                                    peer,
+                                    block_hash: cert_request.block_hash,
+                                    cert_hashes: cert_request.cert_hashes,
+                                    channel_id,
+                                };
 
-                        if cert_request_tx.send(inbound_request).await.is_err() {
-                            warn!(
-                                channel_id,
-                                "Failed to send certificate request to runner (channel full or closed)"
-                            );
-                            pending_response_channels.remove(&channel_id);
+                                if cert_request_tx.send(inbound_request).await.is_err() {
+                                    warn!(
+                                        channel_id,
+                                        "Failed to send certificate request to runner (channel full or closed)"
+                                    );
+                                    pending_response_channels.remove(&channel_id);
+                                }
+                            } else {
+                                warn!(peer = %peer, "Failed to decode certificate fetch request");
+                            }
                         }
-                    } else {
-                        warn!(peer = %peer, len = request.len(), "Failed to decode request (not tx or cert)");
+                        _ => {
+                            warn!(peer = %peer, len = request.len(), ?fetch_type, "Unknown fetch request type");
+                        }
                     }
                 } else {
                     warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
