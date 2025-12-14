@@ -1133,10 +1133,26 @@ impl SimulationRunner {
 
         // Only fetch the next block in sequence
         if next_height <= effective_target {
-            if let Some((block, qc)) = self.find_block_from_any_peer(next_height) {
-                // Deliver directly to BFT - bypasses SyncState entirely
-                let event = Event::SyncBlockReadyToApply { block, qc };
-                self.schedule_event(node, self.now, event);
+            if let Some((peer, block, qc)) = self.find_block_from_any_peer_with_index(next_height) {
+                // Simulate network round-trip to the peer
+                if let Some(delivery_time) = self.simulate_request_response(node, peer) {
+                    let event = Event::SyncBlockReadyToApply { block, qc };
+                    self.schedule_event(node, delivery_time, event);
+                    trace!(
+                        node = node,
+                        peer = peer,
+                        height = next_height,
+                        "Sync: scheduled block fetch with network latency"
+                    );
+                } else {
+                    trace!(
+                        node = node,
+                        peer = peer,
+                        height = next_height,
+                        "Sync: request dropped (partition or packet loss)"
+                    );
+                    // Request dropped - will retry on next timer or when triggered again
+                }
             } else {
                 trace!(
                     node = node,
@@ -1149,11 +1165,14 @@ impl SimulationRunner {
         }
     }
 
-    /// Find a block at a given height from any peer's storage.
-    fn find_block_from_any_peer(&self, height: u64) -> Option<(Block, QuorumCertificate)> {
-        for storage in &self.node_storage {
-            if let Some(block_qc) = storage.get_block(hyperscale_types::BlockHeight(height)) {
-                return Some(block_qc);
+    /// Find a block at a given height from any peer's storage, returning the peer index.
+    fn find_block_from_any_peer_with_index(
+        &self,
+        height: u64,
+    ) -> Option<(NodeIndex, Block, QuorumCertificate)> {
+        for (idx, storage) in self.node_storage.iter().enumerate() {
+            if let Some((block, qc)) = storage.get_block(hyperscale_types::BlockHeight(height)) {
+                return Some((idx as NodeIndex, block, qc));
             }
         }
         None
@@ -1161,8 +1180,7 @@ impl SimulationRunner {
 
     /// Handle transaction fetch needed: fetch missing transactions from proposer's mempool.
     ///
-    /// In production, this would make a network request to the proposer or peers.
-    /// In simulation, we look up transactions from the proposer's mempool directly.
+    /// Simulates a network request/response to the proposer with realistic latency.
     pub fn handle_transaction_fetch_needed(
         &mut self,
         node: NodeIndex,
@@ -1181,6 +1199,20 @@ impl SimulationRunner {
             );
             return;
         }
+
+        // Simulate network round-trip to proposer
+        let delivery_time = match self.simulate_request_response(node, proposer_node) {
+            Some(time) => time,
+            None => {
+                trace!(
+                    node = node,
+                    proposer = proposer_node,
+                    block_hash = ?block_hash,
+                    "Transaction fetch: request dropped (partition or packet loss)"
+                );
+                return;
+            }
+        };
 
         // Look up transactions from proposer's mempool
         let mut found_transactions = Vec::new();
@@ -1210,21 +1242,20 @@ impl SimulationRunner {
             block_hash = ?block_hash,
             found_count = found_transactions.len(),
             missing_count = missing_tx_hashes.len(),
-            "Transaction fetch: delivering fetched transactions"
+            "Transaction fetch: scheduling delivery with network latency"
         );
 
-        // Deliver the transactions to the requesting node
+        // Deliver the transactions to the requesting node with network delay
         let event = Event::TransactionReceived {
             block_hash,
             transactions: found_transactions,
         };
-        self.schedule_event(node, self.now, event);
+        self.schedule_event(node, delivery_time, event);
     }
 
     /// Handle certificate fetch needed: fetch missing certificates from proposer's execution state.
     ///
-    /// In production, this would make a network request to the proposer or peers.
-    /// In simulation, we look up certificates from the proposer's execution state directly.
+    /// Simulates a network request/response to the proposer with realistic latency.
     pub fn handle_certificate_fetch_needed(
         &mut self,
         node: NodeIndex,
@@ -1243,6 +1274,20 @@ impl SimulationRunner {
             );
             return;
         }
+
+        // Simulate network round-trip to proposer
+        let delivery_time = match self.simulate_request_response(node, proposer_node) {
+            Some(time) => time,
+            None => {
+                trace!(
+                    node = node,
+                    proposer = proposer_node,
+                    block_hash = ?block_hash,
+                    "Certificate fetch: request dropped (partition or packet loss)"
+                );
+                return;
+            }
+        };
 
         // Look up certificates from proposer's execution state
         let mut found_certificates = Vec::new();
@@ -1272,15 +1317,15 @@ impl SimulationRunner {
             block_hash = ?block_hash,
             found_count = found_certificates.len(),
             missing_count = missing_cert_hashes.len(),
-            "Certificate fetch: delivering fetched certificates"
+            "Certificate fetch: scheduling delivery with network latency"
         );
 
-        // Deliver the certificates to the requesting node for verification
+        // Deliver the certificates to the requesting node with network delay
         let event = Event::CertificateReceived {
             block_hash,
             certificates: found_certificates,
         };
-        self.schedule_event(node, self.now, event);
+        self.schedule_event(node, delivery_time, event);
     }
 
     /// Schedule an event.
@@ -1345,6 +1390,66 @@ impl SimulationRunner {
         let delivery_time = self.now + latency;
         self.schedule_event(to, delivery_time, event);
         self.stats.messages_sent += 1;
+    }
+
+    /// Simulate a request/response round-trip with network latency.
+    ///
+    /// This simulates:
+    /// 1. Request from `requester` to `responder` (one-way latency)
+    /// 2. Response from `responder` back to `requester` (one-way latency)
+    ///
+    /// Returns `None` if the request would be dropped due to partition or packet loss.
+    /// Returns `Some(delivery_time)` with the time the response would arrive.
+    fn simulate_request_response(
+        &mut self,
+        requester: NodeIndex,
+        responder: NodeIndex,
+    ) -> Option<Duration> {
+        // Check partition (either direction)
+        if self.network.is_partitioned(requester, responder) {
+            self.stats.messages_dropped_partition += 1;
+            trace!(
+                requester = requester,
+                responder = responder,
+                "Request dropped due to partition"
+            );
+            return None;
+        }
+
+        // Check packet loss for request
+        if self.network.should_drop_packet(&mut self.rng) {
+            self.stats.messages_dropped_loss += 1;
+            trace!(
+                requester = requester,
+                responder = responder,
+                "Request dropped due to packet loss"
+            );
+            return None;
+        }
+
+        // Check packet loss for response
+        if self.network.should_drop_packet(&mut self.rng) {
+            self.stats.messages_dropped_loss += 1;
+            trace!(
+                requester = requester,
+                responder = responder,
+                "Response dropped due to packet loss"
+            );
+            return None;
+        }
+
+        // Sample latency for request and response
+        let request_latency = self
+            .network
+            .sample_latency(requester, responder, &mut self.rng);
+        let response_latency = self
+            .network
+            .sample_latency(responder, requester, &mut self.rng);
+        let round_trip = request_latency + response_latency;
+
+        self.stats.messages_sent += 2; // Request + response
+
+        Some(self.now + round_trip)
     }
 
     /// Convert a timer ID to an event.

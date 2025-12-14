@@ -10,7 +10,8 @@
 //! 1. Advance time by 1ms and fire any due timers
 //! 2. Process events (single pass - no drain loop)
 //! 3. Collect and route messages
-//! 4. Collect status updates
+//! 4. Process fetch requests (sync, transactions, certificates)
+//! 5. Collect status updates
 //!
 //! Events enqueued during processing wait until the next step.
 
@@ -34,7 +35,106 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
+
+/// A fetch request emitted by a node that needs data from another node.
+///
+/// These are collected by the ParallelSimulator and processed with network
+/// latency simulation, similar to how outbound messages are handled.
+#[derive(Debug, Clone)]
+pub enum FetchRequest {
+    /// Request to sync blocks from peers.
+    Sync {
+        /// Target height to sync to.
+        target_height: u64,
+    },
+    /// Request to fetch missing transactions from proposer.
+    Transactions {
+        /// Block hash the transactions are needed for.
+        block_hash: Hash,
+        /// Proposer who has the transactions.
+        proposer: ValidatorId,
+        /// Hashes of missing transactions.
+        tx_hashes: Vec<Hash>,
+    },
+    /// Request to fetch missing certificates from proposer.
+    Certificates {
+        /// Block hash the certificates are needed for.
+        block_hash: Hash,
+        /// Proposer who has the certificates.
+        proposer: ValidatorId,
+        /// Hashes of missing certificates (transaction hashes).
+        cert_hashes: Vec<Hash>,
+    },
+}
+
+/// A pending fetch response waiting for delivery at a scheduled time.
+#[derive(Debug)]
+struct PendingFetchResponse {
+    /// When this response should be delivered (simulated time).
+    delivery_time: Duration,
+    /// Recipient node index.
+    recipient: u32,
+    /// The event to deliver.
+    event: Event,
+}
+
+/// Wrapper for ordering PendingFetchResponse by delivery_time.
+#[derive(Debug)]
+struct PendingFetchResponseOrd(PendingFetchResponse);
+
+impl PartialEq for PendingFetchResponseOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.delivery_time == other.0.delivery_time
+    }
+}
+
+impl Eq for PendingFetchResponseOrd {}
+
+impl PartialOrd for PendingFetchResponseOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingFetchResponseOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.delivery_time.cmp(&other.0.delivery_time)
+    }
+}
+
+/// Queue for pending fetch responses.
+struct FetchResponseQueue {
+    responses: BinaryHeap<std::cmp::Reverse<PendingFetchResponseOrd>>,
+}
+
+impl FetchResponseQueue {
+    fn new() -> Self {
+        Self {
+            responses: BinaryHeap::new(),
+        }
+    }
+
+    fn push(&mut self, resp: PendingFetchResponse) {
+        self.responses
+            .push(std::cmp::Reverse(PendingFetchResponseOrd(resp)));
+    }
+
+    /// Pop all responses ready for delivery at the given time.
+    fn pop_ready(&mut self, now: Duration) -> Vec<PendingFetchResponse> {
+        let mut ready = Vec::new();
+        while let Some(std::cmp::Reverse(PendingFetchResponseOrd(resp))) = self.responses.peek() {
+            if resp.delivery_time <= now {
+                let std::cmp::Reverse(PendingFetchResponseOrd(resp)) =
+                    self.responses.pop().unwrap();
+                ready.push(resp);
+            } else {
+                break;
+            }
+        }
+        ready
+    }
+}
 
 /// A pending message waiting for delivery at a scheduled time.
 #[derive(Debug)]
@@ -123,6 +223,8 @@ pub struct SimNode {
     tx_queue: VecDeque<Event>,
     /// Outbound messages to be routed after processing.
     outbound_messages: Vec<(Destination, Arc<OutboundMessage>)>,
+    /// Fetch requests to be processed by ParallelSimulator.
+    fetch_requests: Vec<FetchRequest>,
     /// Transaction status updates to report.
     status_updates: Vec<(Hash, TransactionStatus)>,
     /// Pending timers: timer_id -> fire_time
@@ -142,6 +244,7 @@ impl SimNode {
             internal_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
             outbound_messages: Vec::new(),
+            fetch_requests: Vec::new(),
             status_updates: Vec::new(),
             pending_timers: HashMap::new(),
             simulated_time: Duration::ZERO,
@@ -204,6 +307,11 @@ impl SimNode {
     /// Take outbound messages (clears the buffer).
     pub fn take_outbound_messages(&mut self) -> Vec<(Destination, Arc<OutboundMessage>)> {
         std::mem::take(&mut self.outbound_messages)
+    }
+
+    /// Take fetch requests (clears the buffer).
+    pub fn take_fetch_requests(&mut self) -> Vec<FetchRequest> {
+        std::mem::take(&mut self.fetch_requests)
     }
 
     /// Take status updates (clears the buffer).
@@ -477,13 +585,34 @@ impl SimNode {
                 // Not yet implemented - will be handled by GlobalConsensusState
             }
 
-            // Runner I/O actions - the parallel simulator doesn't support sync/fetch
-            // These would require the full simulation runner infrastructure
-            Action::StartSync { .. }
-            | Action::FetchTransactions { .. }
-            | Action::FetchCertificates { .. } => {
-                // Not supported in parallel simulator - would need full runner infrastructure
-                tracing::warn!("Runner I/O action not supported in parallel simulator");
+            // Runner I/O actions - emit as fetch requests for ParallelSimulator to handle
+            Action::StartSync { target_height, .. } => {
+                self.fetch_requests
+                    .push(FetchRequest::Sync { target_height });
+            }
+
+            Action::FetchTransactions {
+                block_hash,
+                proposer,
+                tx_hashes,
+            } => {
+                self.fetch_requests.push(FetchRequest::Transactions {
+                    block_hash,
+                    proposer,
+                    tx_hashes,
+                });
+            }
+
+            Action::FetchCertificates {
+                block_hash,
+                proposer,
+                cert_hashes,
+            } => {
+                self.fetch_requests.push(FetchRequest::Certificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes,
+                });
             }
         }
     }
@@ -519,6 +648,10 @@ pub struct ParallelSimulator {
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
     /// Pending messages waiting for delivery (with network latency).
     pending_messages: MessageQueue,
+    /// Pending fetch responses waiting for delivery (with network latency).
+    pending_fetch_responses: FetchResponseQueue,
+    /// Sync targets: node_index -> target_height
+    sync_targets: HashMap<u32, u64>,
     /// Simulated network for latency/loss/partition modeling.
     network: SimulatedNetwork,
     /// RNG for network latency jitter (seeded for determinism).
@@ -545,6 +678,8 @@ impl ParallelSimulator {
             submission_times: HashMap::new(),
             traffic_analyzer: None,
             pending_messages: MessageQueue::new(),
+            pending_fetch_responses: FetchResponseQueue::new(),
+            sync_targets: HashMap::new(),
             network,
             rng,
             simulation_cache: Arc::new(SimulationCache::new()),
@@ -877,6 +1012,14 @@ impl ParallelSimulator {
             self.nodes[msg.recipient as usize].deliver_message(msg.message);
         }
 
+        // Step 2b: Deliver fetch responses that have reached their delivery time
+        let ready_responses = self.pending_fetch_responses.pop_ready(self.simulated_time);
+        for resp in ready_responses {
+            self.nodes[resp.recipient as usize]
+                .internal_queue
+                .push_back(resp.event);
+        }
+
         // Step 3: Process all nodes in parallel (single pass)
         let cache = &self.simulation_cache;
         let events_processed: usize = self
@@ -887,9 +1030,13 @@ impl ParallelSimulator {
 
         // Step 4: Collect outbound messages from all nodes
         let mut all_messages: Vec<(u32, Destination, Arc<OutboundMessage>)> = Vec::new();
+        let mut all_fetch_requests: Vec<(u32, FetchRequest)> = Vec::new();
         for (i, node) in self.nodes.iter_mut().enumerate() {
             for (dest, msg) in node.take_outbound_messages() {
                 all_messages.push((i as u32, dest, msg));
+            }
+            for req in node.take_fetch_requests() {
+                all_fetch_requests.push((i as u32, req));
             }
         }
 
@@ -918,6 +1065,36 @@ impl ParallelSimulator {
                     recipient,
                     message: msg.clone(),
                 });
+            }
+        }
+
+        // Step 5b: Process fetch requests (sync, transaction fetch, certificate fetch)
+        for (requester, request) in all_fetch_requests {
+            match request {
+                FetchRequest::Sync { target_height } => {
+                    self.process_sync_request(requester, target_height);
+                }
+                FetchRequest::Transactions {
+                    block_hash,
+                    proposer,
+                    tx_hashes,
+                } => {
+                    self.process_transaction_fetch_request(
+                        requester, block_hash, proposer, tx_hashes,
+                    );
+                }
+                FetchRequest::Certificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes,
+                } => {
+                    self.process_certificate_fetch_request(
+                        requester,
+                        block_hash,
+                        proposer,
+                        cert_hashes,
+                    );
+                }
             }
         }
 
@@ -962,6 +1139,192 @@ impl ParallelSimulator {
             Destination::Global => (0..self.nodes.len() as u32).collect(),
             Destination::Validator(validator) => vec![validator.0 as u32],
         }
+    }
+
+    /// Simulate a request/response round-trip with network latency.
+    ///
+    /// Returns `None` if the request would be dropped due to partition or packet loss.
+    /// Returns `Some(delivery_time)` with the time the response would arrive.
+    fn simulate_request_response(&mut self, requester: u32, responder: u32) -> Option<Duration> {
+        // Check partition (either direction)
+        if self.network.is_partitioned(requester, responder) {
+            trace!(
+                requester,
+                responder,
+                "Fetch request dropped due to partition"
+            );
+            return None;
+        }
+
+        // Check packet loss for request
+        if self.network.should_drop_packet(&mut self.rng) {
+            trace!(
+                requester,
+                responder,
+                "Fetch request dropped due to packet loss"
+            );
+            return None;
+        }
+
+        // Check packet loss for response
+        if self.network.should_drop_packet(&mut self.rng) {
+            trace!(
+                requester,
+                responder,
+                "Fetch response dropped due to packet loss"
+            );
+            return None;
+        }
+
+        // Sample latency for request and response
+        let request_latency = self
+            .network
+            .sample_latency(requester, responder, &mut self.rng);
+        let response_latency = self
+            .network
+            .sample_latency(responder, requester, &mut self.rng);
+        let round_trip = request_latency + response_latency;
+
+        Some(self.simulated_time + round_trip)
+    }
+
+    /// Process a sync fetch request from a node.
+    fn process_sync_request(&mut self, requester: u32, target_height: u64) {
+        // Track the sync target
+        let current_target = self.sync_targets.get(&requester).copied().unwrap_or(0);
+        if target_height > current_target {
+            self.sync_targets.insert(requester, target_height);
+        }
+        let effective_target = target_height.max(current_target);
+
+        // Get node's current committed height
+        let committed_height = self.nodes[requester as usize]
+            .state
+            .bft()
+            .committed_height();
+        let next_height = committed_height + 1;
+
+        // Check if sync is complete
+        if committed_height >= effective_target {
+            self.sync_targets.remove(&requester);
+            return;
+        }
+
+        // Find a peer with the next block
+        if next_height <= effective_target {
+            if let Some((peer, block, qc)) = self.find_block_from_any_peer(next_height) {
+                // Simulate network round-trip
+                if let Some(delivery_time) = self.simulate_request_response(requester, peer) {
+                    let event = Event::SyncBlockReadyToApply { block, qc };
+                    self.pending_fetch_responses.push(PendingFetchResponse {
+                        delivery_time,
+                        recipient: requester,
+                        event,
+                    });
+                    trace!(requester, peer, next_height, "Sync: scheduled block fetch");
+                }
+            }
+        }
+    }
+
+    /// Find a block at a given height from any peer's storage.
+    fn find_block_from_any_peer(&self, height: u64) -> Option<(u32, Block, QuorumCertificate)> {
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some((block, qc)) = node.storage.get_block(BlockHeight(height)) {
+                return Some((idx as u32, block, qc));
+            }
+        }
+        None
+    }
+
+    /// Process a transaction fetch request from a node.
+    fn process_transaction_fetch_request(
+        &mut self,
+        requester: u32,
+        block_hash: Hash,
+        proposer: ValidatorId,
+        tx_hashes: Vec<Hash>,
+    ) {
+        let proposer_node = proposer.0 as u32;
+        if proposer_node as usize >= self.nodes.len() {
+            return;
+        }
+
+        // Simulate network round-trip
+        let delivery_time = match self.simulate_request_response(requester, proposer_node) {
+            Some(time) => time,
+            None => return,
+        };
+
+        // Look up transactions from proposer's mempool
+        let mut found_transactions = Vec::new();
+        {
+            let mempool = self.nodes[proposer_node as usize].state.mempool();
+            for tx_hash in &tx_hashes {
+                if let Some(tx) = mempool.get_transaction(tx_hash) {
+                    found_transactions.push(tx);
+                }
+            }
+        }
+
+        if found_transactions.is_empty() {
+            return;
+        }
+
+        let event = Event::TransactionReceived {
+            block_hash,
+            transactions: found_transactions,
+        };
+        self.pending_fetch_responses.push(PendingFetchResponse {
+            delivery_time,
+            recipient: requester,
+            event,
+        });
+    }
+
+    /// Process a certificate fetch request from a node.
+    fn process_certificate_fetch_request(
+        &mut self,
+        requester: u32,
+        block_hash: Hash,
+        proposer: ValidatorId,
+        cert_hashes: Vec<Hash>,
+    ) {
+        let proposer_node = proposer.0 as u32;
+        if proposer_node as usize >= self.nodes.len() {
+            return;
+        }
+
+        // Simulate network round-trip
+        let delivery_time = match self.simulate_request_response(requester, proposer_node) {
+            Some(time) => time,
+            None => return,
+        };
+
+        // Look up certificates from proposer's execution state
+        let mut found_certificates = Vec::new();
+        {
+            let execution = self.nodes[proposer_node as usize].state.execution();
+            for cert_hash in &cert_hashes {
+                if let Some(cert) = execution.get_finalized_certificate(cert_hash) {
+                    found_certificates.push((*cert).clone());
+                }
+            }
+        }
+
+        if found_certificates.is_empty() {
+            return;
+        }
+
+        let event = Event::CertificateReceived {
+            block_hash,
+            certificates: found_certificates,
+        };
+        self.pending_fetch_responses.push(PendingFetchResponse {
+            delivery_time,
+            recipient: requester,
+            event,
+        });
     }
 
     /// Get current metrics.
