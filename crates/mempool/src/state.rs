@@ -111,16 +111,12 @@ impl MempoolState {
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
-        // Broadcast to all shards involved in this transaction (consensus + provisioning)
-        // Note: We don't emit TransactionAccepted as an event - it was purely informational
-        // and would flood the consensus channel under high transaction load.
-        let mut actions = self.broadcast_to_transaction_shards(&tx);
-
-        actions.push(Action::EmitTransactionStatus {
+        // Note: Broadcasting is handled by NodeStateMachine which broadcasts to all
+        // involved shards. Mempool just manages state.
+        vec![Action::EmitTransactionStatus {
             tx_hash: hash,
             status: TransactionStatus::Pending,
-        });
-        actions
+        }]
     }
 
     /// Handle transaction submission from client.

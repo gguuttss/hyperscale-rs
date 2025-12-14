@@ -743,6 +743,18 @@ impl ProductionRunner {
                     let now = self.start_time.elapsed();
                     self.state.set_time(now);
 
+                    // Check for CertificateNeeded - handle specially (network fetch)
+                    // This can come through callbacks when BFT emits it as EnqueueInternal
+                    if let Event::CertificateNeeded {
+                        block_hash,
+                        proposer,
+                        missing_cert_hashes,
+                    } = event
+                    {
+                        self.handle_certificate_fetch_needed(block_hash, proposer, missing_cert_hashes).await;
+                        continue;
+                    }
+
                     // Process callback event - these go directly to state machine
                     let actions = self.state.handle(event);
 
@@ -751,9 +763,6 @@ impl ProductionRunner {
                             tracing::error!(error = ?e, "Error processing action from callback");
                         }
                     }
-
-                    // Don't reset batch counter - callbacks don't count toward the limit
-                    // as they're completing in-flight work, not adding new work
                 }
 
                 // HIGH PRIORITY: Handle incoming consensus events (BFT network messages, timers)

@@ -368,12 +368,14 @@ impl StateMachine for NodeStateMachine {
             Event::SubmitTransaction { tx } => {
                 let mut actions = self.mempool.on_submit_transaction_arc(Arc::clone(tx));
 
-                // Broadcast transaction to all validators in our shard
+                // Broadcast transaction to all shards involved in this transaction
                 let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
-                actions.push(Action::BroadcastToShard {
-                    message: OutboundMessage::TransactionGossip(Box::new(gossip)),
-                    shard: self.shard(),
-                });
+                for shard in self.topology.all_shards_for_transaction(tx) {
+                    actions.push(Action::BroadcastToShard {
+                        message: OutboundMessage::TransactionGossip(Box::new(gossip.clone())),
+                        shard,
+                    });
+                }
 
                 return actions;
             }
