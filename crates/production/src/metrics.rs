@@ -56,6 +56,14 @@ pub struct Metrics {
     pub sync_response_errors: CounterVec,
     pub sync_peers_banned: Counter,
 
+    // === Fetch (transactions/certificates) ===
+    pub fetch_started: CounterVec,
+    pub fetch_completed: CounterVec,
+    pub fetch_failed: CounterVec,
+    pub fetch_items_received: CounterVec,
+    pub fetch_latency: HistogramVec,
+    pub fetch_in_flight: Gauge,
+
     // === Livelock ===
     pub livelock_cycles_detected: Counter,
     pub livelock_deferrals: Counter,
@@ -253,6 +261,49 @@ impl Metrics {
             sync_peers_banned: register_counter!(
                 "hyperscale_sync_peers_banned_total",
                 "Total peers banned for malicious sync responses"
+            )
+            .unwrap(),
+
+            // Fetch (transactions/certificates)
+            fetch_started: register_counter_vec!(
+                "hyperscale_fetch_started_total",
+                "Total fetch operations started",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_completed: register_counter_vec!(
+                "hyperscale_fetch_completed_total",
+                "Total fetch operations completed successfully",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_failed: register_counter_vec!(
+                "hyperscale_fetch_failed_total",
+                "Total fetch operations failed",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_items_received: register_counter_vec!(
+                "hyperscale_fetch_items_received_total",
+                "Total items (transactions/certificates) received via fetch",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_latency: register_histogram_vec!(
+                "hyperscale_fetch_latency_seconds",
+                "Fetch operation latency",
+                &["kind"],
+                vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+            )
+            .unwrap(),
+
+            fetch_in_flight: register_gauge!(
+                "hyperscale_fetch_in_flight",
+                "Number of fetch requests currently in flight"
             )
             .unwrap(),
 
@@ -551,4 +602,57 @@ pub fn set_lock_contention(blocked: u64, ratio: f64) {
 /// from the mempool's LockContentionStats struct.
 pub fn set_lock_contention_from_stats(stats: &hyperscale_mempool::LockContentionStats) {
     set_lock_contention(stats.blocked_count, stats.contention_ratio());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fetch Metrics (transactions/certificates)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record a fetch operation started.
+///
+/// **Cardinality control**: `kind` must be one of:
+/// - `"transaction"` - fetching transactions for a pending block
+/// - `"certificate"` - fetching certificates for a pending block
+pub fn record_fetch_started(kind: crate::fetch::FetchKind) {
+    metrics()
+        .fetch_started
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Record a fetch operation completed successfully.
+pub fn record_fetch_completed(kind: crate::fetch::FetchKind) {
+    metrics()
+        .fetch_completed
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Record a fetch operation failed.
+pub fn record_fetch_failed(kind: crate::fetch::FetchKind) {
+    metrics()
+        .fetch_failed
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Record items received via fetch.
+pub fn record_fetch_items_received(kind: crate::fetch::FetchKind, count: usize) {
+    metrics()
+        .fetch_items_received
+        .with_label_values(&[kind.as_str()])
+        .inc_by(count as f64);
+}
+
+/// Record fetch operation latency.
+pub fn record_fetch_latency(kind: crate::fetch::FetchKind, latency: std::time::Duration) {
+    metrics()
+        .fetch_latency
+        .with_label_values(&[kind.as_str()])
+        .observe(latency.as_secs_f64());
+}
+
+/// Update the number of in-flight fetch requests.
+pub fn set_fetch_in_flight(count: usize) {
+    metrics().fetch_in_flight.set(count as f64);
 }

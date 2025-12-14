@@ -70,6 +70,7 @@
 //! let shared_pools = Arc::new(manager);
 //! ```
 
+mod fetch;
 pub mod metrics;
 pub mod network;
 pub mod rpc;
@@ -81,6 +82,7 @@ pub mod telemetry;
 mod thread_pools;
 mod timers;
 
+pub use fetch::{FetchConfig, FetchKind, FetchManager, FetchStatus};
 pub use sync::{SyncConfig, SyncManager};
 pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};

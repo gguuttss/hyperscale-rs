@@ -396,6 +396,22 @@ impl ProductionRunnerBuilder {
             }
         }
 
+        // Create fetch manager for transactions and certificates
+        let mut fetch_manager = crate::fetch::FetchManager::new(
+            crate::fetch::FetchConfig::default(),
+            network.clone(),
+            consensus_tx.clone(),
+        );
+
+        // Register local committee members with fetch manager
+        // (fetch only happens within shard, so we only need local committee)
+        for &validator_id in topology.committee_for_shard(local_shard).iter() {
+            if let Some(pk) = topology.public_key(validator_id) {
+                let peer_id = compute_peer_id_for_validator(&pk);
+                fetch_manager.register_committee_member(validator_id, peer_id);
+            }
+        }
+
         // Create executor
         let executor = Arc::new(RadixExecutor::new(network_definition));
 
@@ -414,6 +430,7 @@ impl ProductionRunnerBuilder {
             timer_manager,
             network,
             sync_manager,
+            fetch_manager,
             local_shard,
             topology,
             storage,
@@ -477,6 +494,8 @@ pub struct ProductionRunner {
     network: Arc<Libp2pAdapter>,
     /// Sync manager for fetching blocks from peers.
     sync_manager: SyncManager,
+    /// Fetch manager for fetching transactions and certificates from peers.
+    fetch_manager: crate::fetch::FetchManager,
     /// Local shard for network broadcasts.
     local_shard: ShardGroupId,
     /// Network topology (needed for cross-shard execution).
@@ -970,8 +989,8 @@ impl ProductionRunner {
                     consensus_batch_count = 0;
                 }
 
-                // MEDIUM PRIORITY: Periodic sync manager tick
-                // This drives outbound sync fetches, so give it some priority
+                // MEDIUM PRIORITY: Periodic sync and fetch manager tick
+                // This drives outbound sync/fetch operations, so give it some priority
                 _ = sync_tick.tick() => {
                     let tick_span = span!(Level::TRACE, "sync_tick");
                     let _tick_guard = tick_span.enter();
@@ -980,7 +999,10 @@ impl ProductionRunner {
                     let connected_peers = self.network.connected_peers().await;
                     self.sync_manager.update_peers(connected_peers);
 
+                    // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
+                    self.fetch_manager.tick().await;
+
                     // Reset batch counter - we yielded, now back to prioritizing consensus
                     consensus_batch_count = 0;
                 }
@@ -1028,6 +1050,10 @@ impl ProductionRunner {
                         self.sync_manager.blocks_behind(),
                         self.sync_manager.is_syncing(),
                     );
+
+                    // Update fetch status (non-blocking)
+                    let fetch_status = self.fetch_manager.status();
+                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_requests);
 
                     // Update peer count using cached value (non-blocking)
                     // The cache is updated by the network event loop on connection changes
@@ -1640,8 +1666,9 @@ impl ProductionRunner {
                 proposer,
                 tx_hashes,
             } => {
-                self.handle_transaction_fetch_needed(block_hash, proposer, tx_hashes)
-                    .await;
+                // Delegate to FetchManager for parallel, retry-capable fetching
+                self.fetch_manager
+                    .request_transactions(block_hash, proposer, tx_hashes);
             }
 
             Action::FetchCertificates {
@@ -1649,8 +1676,9 @@ impl ProductionRunner {
                 proposer,
                 cert_hashes,
             } => {
-                self.handle_certificate_fetch_needed(block_hash, proposer, cert_hashes)
-                    .await;
+                // Delegate to FetchManager for parallel, retry-capable fetching
+                self.fetch_manager
+                    .request_certificates(block_hash, proposer, cert_hashes);
             }
         }
 
@@ -1875,112 +1903,6 @@ impl ProductionRunner {
         }
     }
 
-    /// Handle a TransactionNeeded event - fetch missing transactions from the proposer.
-    ///
-    /// Makes an outbound request to the proposer to get the missing transactions,
-    /// then delivers them to the state machine via TransactionReceived.
-    async fn handle_transaction_fetch_needed(
-        &self,
-        block_hash: Hash,
-        proposer: ValidatorId,
-        missing_tx_hashes: Vec<Hash>,
-    ) {
-        use hyperscale_messages::response::GetTransactionsResponse;
-
-        tracing::info!(
-            block_hash = ?block_hash,
-            proposer = ?proposer,
-            missing_count = missing_tx_hashes.len(),
-            "Fetching missing transactions from proposer"
-        );
-
-        // Get the peer ID for the proposer
-        let Some(peer_id) = self.network.peer_for_validator(proposer).await else {
-            tracing::warn!(
-                proposer = ?proposer,
-                "Cannot fetch transactions: proposer peer ID not known"
-            );
-            // Re-arm timer to retry - proposer may become known later
-            self.log_transaction_fetch_retry_needed(block_hash);
-            return;
-        };
-
-        // Make the request to the proposer
-        match self
-            .network
-            .request_transactions(peer_id, block_hash, missing_tx_hashes.clone())
-            .await
-        {
-            Ok(response_bytes) => {
-                // Decode the response
-                match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
-                    Ok(response) => {
-                        let tx_count = response.count();
-                        tracing::info!(
-                            block_hash = ?block_hash,
-                            received = tx_count,
-                            requested = missing_tx_hashes.len(),
-                            "Received transactions from proposer"
-                        );
-
-                        if tx_count > 0 {
-                            // Send to state machine
-                            let event = Event::TransactionReceived {
-                                block_hash,
-                                transactions: response.into_transactions(),
-                            };
-
-                            if let Err(e) = self.consensus_tx.send(event).await {
-                                tracing::error!(error = ?e, "Failed to send TransactionReceived event");
-                            }
-                        }
-
-                        // If we didn't get all transactions, re-arm timer to retry
-                        if tx_count < missing_tx_hashes.len() {
-                            tracing::debug!(
-                                block_hash = ?block_hash,
-                                received = tx_count,
-                                requested = missing_tx_hashes.len(),
-                                "Partial transaction fetch - rearming timer for retry"
-                            );
-                            self.log_transaction_fetch_retry_needed(block_hash);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            block_hash = ?block_hash,
-                            error = ?e,
-                            "Failed to decode transaction fetch response"
-                        );
-                        // Re-arm timer to retry
-                        self.log_transaction_fetch_retry_needed(block_hash);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    block_hash = ?block_hash,
-                    proposer = ?proposer,
-                    error = ?e,
-                    "Failed to fetch transactions from proposer"
-                );
-                // Re-arm timer to retry
-                self.log_transaction_fetch_retry_needed(block_hash);
-            }
-        }
-    }
-
-    /// Log that a transaction fetch needs to be retried.
-    ///
-    /// Note: Retries are now driven by BFT re-emitting FetchTransactions when
-    /// it receives partial data (via on_transaction_fetch_received).
-    fn log_transaction_fetch_retry_needed(&self, block_hash: Hash) {
-        tracing::debug!(
-            ?block_hash,
-            "Transaction fetch incomplete - BFT will re-request when data arrives"
-        );
-    }
-
     /// Handle an inbound transaction fetch request from a peer.
     ///
     /// Looks up requested transactions from mempool and sends them back.
@@ -2036,112 +1958,6 @@ impl ProductionRunner {
                 "Failed to send transaction response"
             );
         }
-    }
-
-    /// Handle a CertificateNeeded event - fetch missing certificates from the proposer.
-    ///
-    /// Makes an outbound request to the proposer to get the missing certificates,
-    /// then delivers them to the state machine via CertificateReceived.
-    async fn handle_certificate_fetch_needed(
-        &self,
-        block_hash: Hash,
-        proposer: ValidatorId,
-        missing_cert_hashes: Vec<Hash>,
-    ) {
-        use hyperscale_messages::response::GetCertificatesResponse;
-
-        tracing::info!(
-            block_hash = ?block_hash,
-            proposer = ?proposer,
-            missing_count = missing_cert_hashes.len(),
-            "Fetching missing certificates from proposer"
-        );
-
-        // Get the peer ID for the proposer
-        let Some(peer_id) = self.network.peer_for_validator(proposer).await else {
-            tracing::warn!(
-                proposer = ?proposer,
-                "Cannot fetch certificates: proposer peer ID not known"
-            );
-            // Re-arm timer to retry - proposer may become known later
-            self.log_certificate_fetch_retry_needed(block_hash);
-            return;
-        };
-
-        // Make the request to the proposer
-        match self
-            .network
-            .request_certificates(peer_id, block_hash, missing_cert_hashes.clone())
-            .await
-        {
-            Ok(response_bytes) => {
-                // Decode the response
-                match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {
-                    Ok(response) => {
-                        let cert_count = response.count();
-                        tracing::info!(
-                            block_hash = ?block_hash,
-                            received = cert_count,
-                            requested = missing_cert_hashes.len(),
-                            "Received certificates from proposer"
-                        );
-
-                        if cert_count > 0 {
-                            // Send to state machine for verification
-                            let event = Event::CertificateReceived {
-                                block_hash,
-                                certificates: response.into_certificates(),
-                            };
-
-                            if let Err(e) = self.consensus_tx.send(event).await {
-                                tracing::error!(error = ?e, "Failed to send CertificateReceived event");
-                            }
-                        }
-
-                        // If we didn't get all certificates, re-arm timer to retry
-                        if cert_count < missing_cert_hashes.len() {
-                            tracing::debug!(
-                                block_hash = ?block_hash,
-                                received = cert_count,
-                                requested = missing_cert_hashes.len(),
-                                "Partial certificate fetch - rearming timer for retry"
-                            );
-                            self.log_certificate_fetch_retry_needed(block_hash);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            block_hash = ?block_hash,
-                            error = ?e,
-                            "Failed to decode certificate fetch response"
-                        );
-                        // Re-arm timer to retry
-                        self.log_certificate_fetch_retry_needed(block_hash);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    block_hash = ?block_hash,
-                    proposer = ?proposer,
-                    error = ?e,
-                    "Failed to fetch certificates from proposer"
-                );
-                // Re-arm timer to retry
-                self.log_certificate_fetch_retry_needed(block_hash);
-            }
-        }
-    }
-
-    /// Log that a certificate fetch needs to be retried.
-    ///
-    /// Note: Retries are now driven by BFT re-emitting FetchCertificates when
-    /// it receives partial data (via on_certificate_fetch_received).
-    fn log_certificate_fetch_retry_needed(&self, block_hash: Hash) {
-        tracing::debug!(
-            ?block_hash,
-            "Certificate fetch incomplete - BFT will re-request when data arrives"
-        );
     }
 
     /// Handle an inbound certificate fetch request from a peer.
