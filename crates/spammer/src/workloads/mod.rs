@@ -3,8 +3,10 @@
 //! Provides the `WorkloadGenerator` trait and implementations for various
 //! transaction types.
 
+mod swap;
 mod transfer;
 
+pub use swap::{PoolInfo, SwapWorkload, SwapWorkloadError};
 pub use transfer::TransferWorkload;
 
 use crate::accounts::AccountPool;

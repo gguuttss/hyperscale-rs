@@ -77,6 +77,22 @@ struct Args {
     /// Drain duration in seconds (parallel mode only)
     #[arg(long, default_value = "5")]
     drain: u64,
+
+    /// Enable swap workload (AMM transactions)
+    #[arg(long)]
+    enable_swaps: bool,
+
+    /// Ratio of swap transactions (0.0-1.0). Only used if --enable-swaps is set.
+    #[arg(long, default_value = "0.1")]
+    swap_ratio: f64,
+
+    /// Number of custom tokens for swaps (N tokens allows N*(N-1)/2 unique pools)
+    #[arg(long, default_value = "5")]
+    swap_tokens: usize,
+
+    /// Number of AMM pools to create for realistic load distribution
+    #[arg(long, default_value = "10")]
+    swap_pools: usize,
 }
 
 fn main() {
@@ -199,10 +215,18 @@ fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
     );
 
     // Configure workload
-    let mut workload = WorkloadConfig::transfers_only()
-        .with_batch_size(batch_size)
-        .with_batch_interval(Duration::from_millis(batch_interval_ms))
-        .with_cross_shard_ratio(cross_shard_ratio);
+    let mut workload = if args.enable_swaps {
+        WorkloadConfig::default()
+            .with_swap_ratio(args.swap_ratio)
+            .with_batch_size(batch_size)
+            .with_batch_interval(Duration::from_millis(batch_interval_ms))
+            .with_cross_shard_ratio(cross_shard_ratio)
+    } else {
+        WorkloadConfig::transfers_only()
+            .with_batch_size(batch_size)
+            .with_batch_interval(Duration::from_millis(batch_interval_ms))
+            .with_cross_shard_ratio(cross_shard_ratio)
+    };
 
     if args.no_contention {
         workload = workload.with_no_contention();
@@ -216,6 +240,19 @@ fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
 
     // Create and initialize simulator
     let mut simulator = Simulator::new(config).expect("Failed to create simulator");
+
+    // Enable swap workload if requested
+    if args.enable_swaps {
+        info!(
+            swap_ratio = args.swap_ratio,
+            swap_tokens = args.swap_tokens,
+            swap_pools = args.swap_pools,
+            "Enabling swap workload"
+        );
+        simulator
+            .with_swap_workload(args.swap_tokens, Some(args.swap_pools))
+            .expect("Failed to enable swap workload");
+    }
 
     // Enable traffic analysis if requested
     if args.network_analysis {

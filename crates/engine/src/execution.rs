@@ -123,6 +123,49 @@ pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpd
     }
 }
 
+/// Convert state entries to database updates.
+///
+/// This is useful for replicating state across shards or applying provisioned state.
+pub fn state_entries_to_database_updates(entries: &[hyperscale_types::StateEntry]) -> DatabaseUpdates {
+    let mut updates = DatabaseUpdates::default();
+
+    for entry in entries {
+        let radix_node_id = radix_common::types::NodeId(entry.node_id.0);
+        let radix_partition = radix_common::types::PartitionNumber(entry.partition.0);
+
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+        let db_sort_key = DbSortKey(entry.sort_key.clone());
+
+        // StateEntry value is Option<Vec<u8>>: None means delete, Some(v) means set
+        let update = match &entry.value {
+            None => DatabaseUpdate::Delete,
+            Some(v) if v.is_empty() => DatabaseUpdate::Delete,
+            Some(v) => DatabaseUpdate::Set(v.clone()),
+        };
+
+        let node_updates = updates
+            .node_updates
+            .entry(db_node_key)
+            .or_insert_with(|| NodeDatabaseUpdates {
+                partition_updates: indexmap::IndexMap::new(),
+            });
+
+        let partition_updates = node_updates
+            .partition_updates
+            .entry(db_partition_num)
+            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                substate_updates: indexmap::IndexMap::new(),
+            });
+
+        if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+            substate_updates.insert(db_sort_key, update);
+        }
+    }
+
+    updates
+}
+
 /// Check if a transaction receipt represents a successful commit.
 pub fn is_commit_success(receipt: &TransactionReceipt) -> bool {
     matches!(&receipt.result, TransactionResult::Commit(_))

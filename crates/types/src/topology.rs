@@ -130,9 +130,38 @@ pub trait Topology: Send + Sync {
         self.proposer_for(height, round) == self.local_validator_id()
     }
 
+    /// Get the creation shard for a NodeId, if known.
+    ///
+    /// Returns None if the entity's creation shard is not tracked.
+    /// Implementations can override this to provide creation-based shard assignment.
+    fn creation_shard_for_node(&self, _node_id: &NodeId) -> Option<ShardGroupId> {
+        None
+    }
+
+    /// Register that an entity was created on a specific shard.
+    ///
+    /// This enables creation-based shard assignment for the entity.
+    /// Default implementation does nothing (for topologies that don't support this).
+    fn register_entity_creation(&self, _node_id: NodeId, _shard: ShardGroupId) {
+        // Default: no-op
+    }
+
+    /// Register multiple entities created on a specific shard.
+    ///
+    /// Default implementation calls register_entity_creation for each entity.
+    fn register_entities_creation(&self, node_ids: &[NodeId], shard: ShardGroupId) {
+        for node_id in node_ids {
+            self.register_entity_creation(*node_id, shard);
+        }
+    }
+
     /// Determine which shard a NodeId belongs to.
+    ///
+    /// First checks if there's a known creation shard for the entity.
+    /// Falls back to hash-based assignment if not.
     fn shard_for_node_id(&self, node_id: &NodeId) -> ShardGroupId {
-        shard_for_node(node_id, self.num_shards())
+        self.creation_shard_for_node(node_id)
+            .unwrap_or_else(|| shard_for_node(node_id, self.num_shards()))
     }
 
     /// Compute write shards for a transaction.
@@ -276,6 +305,8 @@ pub struct StaticTopology {
     shard_committees: HashMap<ShardGroupId, ShardCommittee>,
     validator_info: HashMap<ValidatorId, ValidatorInfoInternal>,
     global_validator_set: ValidatorSet,
+    /// Maps NodeId to the shard that created it (for creation-based assignment)
+    creation_shard_map: Arc<std::sync::RwLock<HashMap<NodeId, ShardGroupId>>>,
 }
 
 impl StaticTopology {
@@ -328,6 +359,7 @@ impl StaticTopology {
             shard_committees,
             validator_info,
             global_validator_set: validator_set,
+            creation_shard_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -384,6 +416,7 @@ impl StaticTopology {
             shard_committees,
             validator_info,
             global_validator_set: validator_set,
+            creation_shard_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -441,6 +474,7 @@ impl StaticTopology {
             shard_committees: committees,
             validator_info,
             global_validator_set: global_validator_set.clone(),
+            creation_shard_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 }
@@ -488,6 +522,27 @@ impl Topology for StaticTopology {
 
     fn global_validator_set(&self) -> &ValidatorSet {
         &self.global_validator_set
+    }
+
+    fn creation_shard_for_node(&self, node_id: &NodeId) -> Option<ShardGroupId> {
+        self.creation_shard_map
+            .read()
+            .ok()
+            .and_then(|map| map.get(node_id).copied())
+    }
+
+    fn register_entity_creation(&self, node_id: NodeId, shard: ShardGroupId) {
+        if let Ok(mut map) = self.creation_shard_map.write() {
+            map.insert(node_id, shard);
+        }
+    }
+
+    fn register_entities_creation(&self, node_ids: &[NodeId], shard: ShardGroupId) {
+        if let Ok(mut map) = self.creation_shard_map.write() {
+            for node_id in node_ids {
+                map.insert(*node_id, shard);
+            }
+        }
     }
 }
 

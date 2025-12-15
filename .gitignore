@@ -48,3 +48,17 @@ cluster-data/
 
 # Modelling
 tla/
+
+# Scrypto build artifacts
+scrypto/**/target/*
+!scrypto/**/target/wasm32-unknown-unknown/
+scrypto/**/target/wasm32-unknown-unknown/*
+!scrypto/**/target/wasm32-unknown-unknown/release/
+scrypto/**/target/wasm32-unknown-unknown/release/*
+!scrypto/**/target/wasm32-unknown-unknown/release/*.wasm
+!scrypto/**/target/wasm32-unknown-unknown/release/*.rpd
+scrypto/**/Cargo.lock
+
+# LLM
+CLAUDE.md
+.claude/settings.local.json

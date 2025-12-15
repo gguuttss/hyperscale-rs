@@ -86,6 +86,11 @@ pub struct SimulationRunner {
     /// Per-node transaction status cache. Captures all emitted statuses.
     /// Maps (node_index, tx_hash) -> status for querying final transaction states.
     tx_status_cache: HashMap<(NodeIndex, TxHash), TransactionStatus>,
+
+    /// Execution results cache for transaction receipt access.
+    /// Maps: tx_hash -> ExecutionResult
+    /// Populated when transactions are executed, used for pool deployment.
+    execution_results: HashMap<hyperscale_types::Hash, hyperscale_types::ExecutionResult>,
 }
 
 /// Statistics collected during simulation.
@@ -232,6 +237,7 @@ impl SimulationRunner {
             seen_messages: HashSet::new(),
             sync_targets: HashMap::new(),
             tx_status_cache: HashMap::new(),
+            execution_results: HashMap::new(),
         }
     }
 
@@ -272,6 +278,16 @@ impl SimulationRunner {
         self.node_storage.get(node as usize)
     }
 
+    /// Get a mutable reference to a node's storage.
+    pub fn node_storage_mut(&mut self, node: NodeIndex) -> &mut SimStorage {
+        &mut self.node_storage[node as usize]
+    }
+
+    /// Get a reference to a node's executor.
+    pub fn node_executor(&self, node: NodeIndex) -> &RadixExecutor {
+        &self.node_executor[node as usize]
+    }
+
     /// Get the last emitted transaction status for a node.
     ///
     /// Unlike `node.mempool().status()`, this returns the last status that was
@@ -299,6 +315,14 @@ impl SimulationRunner {
     /// Get a reference to the network.
     pub fn network(&self) -> &SimulatedNetwork {
         &self.network
+    }
+
+    /// Get execution result for a transaction (used for pool deployment).
+    ///
+    /// Returns the execution result including receipt information (new packages, components, resources).
+    /// Returns None if the transaction hasn't been executed yet or the result has been cleared.
+    pub fn execution_result(&self, tx_hash: &hyperscale_types::Hash) -> Option<&hyperscale_types::ExecutionResult> {
+        self.execution_results.get(tx_hash)
     }
 
     /// Get a mutable reference to the network for partition/loss configuration.
@@ -786,7 +810,7 @@ impl SimulationRunner {
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
 
-                let results = match executor.execute_single_shard(storage, &transactions) {
+                let results: Vec<hyperscale_types::ExecutionResult> = match executor.execute_single_shard(storage, &transactions) {
                     Ok(output) => output
                         .results()
                         .iter()
@@ -796,6 +820,9 @@ impl SimulationRunner {
                             state_root: r.outputs_merkle_root,
                             writes: r.state_writes.clone(),
                             error: r.error.clone(),
+                            new_packages: r.receipt_info.new_packages.clone(),
+                            new_components: r.receipt_info.new_components.clone(),
+                            new_resources: r.receipt_info.new_resources.clone(),
                         })
                         .collect(),
                     Err(e) => {
@@ -809,10 +836,18 @@ impl SimulationRunner {
                                 state_root: hyperscale_types::Hash::ZERO,
                                 writes: vec![],
                                 error: Some(format!("{}", e)),
+                                new_packages: vec![],
+                                new_components: vec![],
+                                new_resources: vec![],
                             })
                             .collect()
                     }
                 };
+
+                // Store execution results for receipt access (used during pool deployment)
+                for result in results.iter() {
+                    self.execution_results.insert(result.transaction_hash.clone(), result.clone());
+                }
 
                 self.schedule_event(
                     from,
@@ -860,6 +895,9 @@ impl SimulationRunner {
                                 state_root: r.outputs_merkle_root,
                                 writes: r.state_writes.clone(),
                                 error: r.error.clone(),
+                                new_packages: r.receipt_info.new_packages.clone(),
+                                new_components: r.receipt_info.new_components.clone(),
+                                new_resources: r.receipt_info.new_resources.clone(),
                             }
                         } else {
                             hyperscale_types::ExecutionResult {
@@ -868,6 +906,9 @@ impl SimulationRunner {
                                 state_root: hyperscale_types::Hash::ZERO,
                                 writes: vec![],
                                 error: Some("No execution result".to_string()),
+                                new_packages: vec![],
+                                new_components: vec![],
+                                new_resources: vec![],
                             }
                         }
                     }
@@ -879,9 +920,15 @@ impl SimulationRunner {
                             state_root: hyperscale_types::Hash::ZERO,
                             writes: vec![],
                             error: Some(format!("{}", e)),
+                            new_packages: vec![],
+                            new_components: vec![],
+                            new_resources: vec![],
                         }
                     }
                 };
+
+                // Store execution result for receipt access (used during pool deployment)
+                self.execution_results.insert(result.transaction_hash, result.clone());
 
                 self.schedule_event(
                     from,
@@ -928,6 +975,57 @@ impl SimulationRunner {
             Action::PersistBlock { block, qc } => {
                 // Store block and QC in this node's storage
                 let height = block.header.height;
+                let local_shard = self.nodes[from as usize].shard();
+
+                debug!(
+                    height = height.0,
+                    shard = local_shard.0,
+                    num_certs = block.committed_certificates.len(),
+                    num_txs = block.transactions.len(),
+                    "Persisting block"
+                );
+
+                // CRITICAL: Apply all transaction certificate writes to ALL nodes in the shard.
+                // This is the deferred commit - writes are applied when the block commits.
+                // Do this BEFORE storing the block (which moves it).
+                for cert in &block.committed_certificates {
+                    debug!(
+                        tx_hash = ?cert.transaction_hash,
+                        decision = ?cert.decision,
+                        num_shard_proofs = cert.shard_proofs.len(),
+                        "Processing certificate in block"
+                    );
+
+                    // Extract writes for this shard from the certificate
+                    let writes = cert
+                        .shard_proofs
+                        .get(&local_shard)
+                        .map(|p| p.state_writes.as_slice())
+                        .unwrap_or(&[]);
+
+                    debug!(
+                        tx_hash = ?cert.transaction_hash,
+                        shard = local_shard.0,
+                        num_writes = writes.len(),
+                        "Extracted writes from shard proof"
+                    );
+
+                    if !writes.is_empty() {
+                        // Count how many nodes in this shard will get the writes
+                        let nodes_in_shard: Vec<_> = self.nodes.iter().enumerate()
+                            .filter(|(_, node)| node.shard() == local_shard)
+                            .map(|(idx, _)| idx)
+                            .collect();
+
+                        // Apply writes to ALL nodes in the shard
+                        for node_idx in nodes_in_shard {
+                            let node_storage = &mut self.node_storage[node_idx];
+                            node_storage.commit_certificate_with_writes(cert, writes);
+                        }
+                    }
+                }
+
+                // Now store the block and QC
                 let storage = &mut self.node_storage[from as usize];
                 storage.put_block(height, block, qc);
                 // Update committed height if this is the highest
@@ -952,10 +1050,13 @@ impl SimulationRunner {
                 }
             }
             Action::PersistTransactionCertificate { certificate } => {
-                // Store certificate AND commit state writes in this node's storage
+                // Store certificate AND commit state writes to ALL nodes in the shard.
                 // This is the deferred commit - state writes are only applied when
                 // the certificate is included in a committed block.
-                let storage = &mut self.node_storage[from as usize];
+                //
+                // IMPORTANT: In the simulation, each node has independent storage,
+                // but all nodes in a shard must have the same state after processing
+                // the same transactions. So we apply writes to all nodes in the shard.
                 let local_shard = self.nodes[from as usize].shard();
 
                 // Extract writes for local shard from the certificate's shard_proofs
@@ -965,8 +1066,21 @@ impl SimulationRunner {
                     .map(|p| p.state_writes.as_slice())
                     .unwrap_or(&[]);
 
-                // Commit certificate + writes atomically (mirrors production behavior)
-                storage.commit_certificate_with_writes(&certificate, writes);
+                // Commit to ALL nodes in the same shard (not just the node that persisted it)
+                let nodes_updated = self.nodes.iter().enumerate().filter(|(_, n)| n.shard() == local_shard).count();
+                debug!(
+                    tx_hash = ?certificate.transaction_hash,
+                    shard = local_shard.0,
+                    num_writes = writes.len(),
+                    nodes_updated,
+                    "Committing certificate writes to shard nodes"
+                );
+                for (node_idx, node) in self.nodes.iter().enumerate() {
+                    if node.shard() == local_shard {
+                        let storage = &mut self.node_storage[node_idx];
+                        storage.commit_certificate_with_writes(&certificate, writes);
+                    }
+                }
             }
             Action::PersistOwnVote {
                 height,

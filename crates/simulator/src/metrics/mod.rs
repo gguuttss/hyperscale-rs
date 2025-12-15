@@ -14,11 +14,20 @@ pub struct MetricsCollector {
     /// Completion count (transactions fully executed).
     completions: u64,
 
-    /// Rejection count.
+    /// Rejection count (excludes spurious rejections).
     rejections: u64,
+
+    /// Spurious rejection count (retries rejected because original succeeded).
+    spurious_rejections: u64,
 
     /// Retry count (transactions that entered Retried state).
     retries: u64,
+
+    /// Number of swap transactions submitted.
+    swap_submissions: u64,
+
+    /// Number of transfer transactions submitted.
+    transfer_submissions: u64,
 
     /// Latency histogram (microseconds).
     latency_histogram: Histogram<u64>,
@@ -62,7 +71,10 @@ impl MetricsCollector {
             submissions: 0,
             completions: 0,
             rejections: 0,
+            spurious_rejections: 0,
             retries: 0,
+            swap_submissions: 0,
+            transfer_submissions: 0,
             latency_histogram: Histogram::new(3).expect("histogram creation should succeed"),
             start_time,
             submission_end_time: None,
@@ -87,6 +99,18 @@ impl MetricsCollector {
         self.submissions += count;
     }
 
+    /// Record a swap transaction submission.
+    pub fn record_swap_submission(&mut self) {
+        self.submissions += 1;
+        self.swap_submissions += 1;
+    }
+
+    /// Record a transfer transaction submission.
+    pub fn record_transfer_submission(&mut self) {
+        self.submissions += 1;
+        self.transfer_submissions += 1;
+    }
+
     /// Record a transaction completion with its latency.
     pub fn record_completion(&mut self, latency: Duration) {
         self.completions += 1;
@@ -98,6 +122,11 @@ impl MetricsCollector {
     /// Record a transaction rejection.
     pub fn record_rejection(&mut self) {
         self.rejections += 1;
+    }
+
+    /// Record a spurious rejection (retry rejected because original succeeded).
+    pub fn record_spurious_rejection(&mut self) {
+        self.spurious_rejections += 1;
     }
 
     /// Record a transaction retry.
@@ -193,7 +222,10 @@ impl MetricsCollector {
             total_submitted: self.submissions,
             total_completed: self.completions,
             total_rejected: self.rejections,
+            total_spurious_rejections: self.spurious_rejections,
             total_retries: self.retries,
+            total_swap_submissions: self.swap_submissions,
+            total_transfer_submissions: self.transfer_submissions,
             in_flight_at_end: self.in_flight_at_end,
             average_tps,
             peak_tps: self.peak_tps,
@@ -237,10 +269,16 @@ pub struct SimulationReport {
     pub total_submitted: u64,
     /// Total transactions completed (fully executed).
     pub total_completed: u64,
-    /// Total transactions rejected.
+    /// Total transactions rejected (real failures).
     pub total_rejected: u64,
+    /// Total spurious rejections (retries rejected because original succeeded).
+    pub total_spurious_rejections: u64,
     /// Total retries (transactions that entered Retried state).
     pub total_retries: u64,
+    /// Total swap transactions submitted.
+    pub total_swap_submissions: u64,
+    /// Total transfer transactions submitted.
+    pub total_transfer_submissions: u64,
     /// Transactions still in-flight at simulation end.
     pub in_flight_at_end: u64,
     /// Average TPS over the submission period.
@@ -313,8 +351,21 @@ impl SimulationReport {
         println!();
         println!("Transactions:");
         println!("  Submitted:  {}", self.total_submitted);
+        if self.total_swap_submissions > 0 || self.total_transfer_submissions > 0 {
+            println!("    Swaps:      {} ({:.1}%)",
+                self.total_swap_submissions,
+                (self.total_swap_submissions as f64 / self.total_submitted as f64) * 100.0
+            );
+            println!("    Transfers:  {} ({:.1}%)",
+                self.total_transfer_submissions,
+                (self.total_transfer_submissions as f64 / self.total_submitted as f64) * 100.0
+            );
+        }
         println!("  Completed:  {}", self.total_completed);
-        println!("  Rejected:   {}", self.total_rejected);
+        println!("  Rejected:   {} (real failures)", self.total_rejected);
+        if self.total_spurious_rejections > 0 {
+            println!("    Spurious: {} (retries rejected, original succeeded)", self.total_spurious_rejections);
+        }
         println!("  Retries:    {}", self.total_retries);
         println!("  In-flight:  {} (at cutoff)", self.in_flight_at_end);
         println!();

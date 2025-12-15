@@ -51,14 +51,16 @@ mod error;
 pub mod execution;
 mod executor;
 mod genesis;
+mod receipt;
 mod result;
 mod storage;
 mod validation;
 
 pub use error::ExecutionError;
-pub use execution::{substate_writes_to_database_updates, ProvisionedExecutionContext};
+pub use execution::{substate_writes_to_database_updates, state_entries_to_database_updates, ProvisionedExecutionContext};
 pub use executor::RadixExecutor;
 pub use genesis::{GenesisBuilder, GenesisConfig, GenesisError};
+pub use receipt::ReceiptInfo;
 pub use result::{ExecutionOutput, SingleTxResult};
 pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::{BatchValidationResult, TransactionValidation, ValidationError};

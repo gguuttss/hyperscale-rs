@@ -150,6 +150,17 @@ impl CertificateTracker {
         let decision = if all_succeeded {
             TransactionDecision::Accept
         } else {
+            // Log which shards failed for debugging
+            let failed_shards: Vec<_> = self.certificates.iter()
+                .filter(|(_, cert)| !cert.success)
+                .map(|(shard_id, _)| shard_id)
+                .collect();
+            tracing::warn!(
+                tx_hash = ?self.tx_hash,
+                ?failed_shards,
+                total_shards = self.certificates.len(),
+                "Transaction certificate formed with REJECT decision (some shards failed execution)"
+            );
             TransactionDecision::Reject
         };
 

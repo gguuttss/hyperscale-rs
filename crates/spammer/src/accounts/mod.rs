@@ -248,9 +248,9 @@ impl AccountPool {
     }
 
     /// Get a pair of accounts on the same shard.
-    pub fn same_shard_pair(
+    pub fn same_shard_pair<R: rand::Rng + ?Sized>(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut R,
         mode: SelectionMode,
     ) -> Option<(&FundedAccount, &FundedAccount)> {
         let shard = ShardGroupId(rng.gen_range(0..self.num_shards));
@@ -267,9 +267,9 @@ impl AccountPool {
     }
 
     /// Get a pair of accounts on different shards (for cross-shard transactions).
-    pub fn cross_shard_pair(
+    pub fn cross_shard_pair<R: rand::Rng + ?Sized>(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut R,
         mode: SelectionMode,
     ) -> Option<(&FundedAccount, &FundedAccount)> {
         if self.num_shards < 2 {
@@ -300,11 +300,11 @@ impl AccountPool {
     }
 
     /// Select a pair of distinct account indices based on selection mode.
-    fn select_pair_indices(
+    fn select_pair_indices<R: rand::Rng + ?Sized>(
         &self,
         shard: ShardGroupId,
         num_accounts: usize,
-        rng: &mut impl rand::Rng,
+        rng: &mut R,
         mode: SelectionMode,
     ) -> (usize, usize) {
         use std::sync::atomic::Ordering;
@@ -352,11 +352,11 @@ impl AccountPool {
     }
 
     /// Select a single account index based on selection mode.
-    fn select_single_index(
+    fn select_single_index<R: rand::Rng + ?Sized>(
         &self,
         shard: ShardGroupId,
         num_accounts: usize,
-        rng: &mut impl rand::Rng,
+        rng: &mut R,
         mode: SelectionMode,
     ) -> usize {
         use std::sync::atomic::Ordering;
@@ -393,7 +393,7 @@ impl AccountPool {
     }
 
     /// Generate a Zipf-distributed index.
-    fn zipf_index(&self, n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
+    fn zipf_index<R: rand::Rng + ?Sized>(&self, n: usize, exponent: f64, rng: &mut R) -> usize {
         let exp = exponent.max(1.0);
         let u: f64 = rng.gen();
         let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;

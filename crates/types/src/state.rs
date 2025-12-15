@@ -316,6 +316,15 @@ pub struct ExecutionResult {
 
     /// Error message if execution failed.
     pub error: Option<String>,
+
+    /// Newly created package addresses from this transaction (as NodeId bytes).
+    pub new_packages: Vec<NodeId>,
+
+    /// Newly created component addresses from this transaction (as NodeId bytes).
+    pub new_components: Vec<NodeId>,
+
+    /// Newly created resource addresses from this transaction (as NodeId bytes).
+    pub new_resources: Vec<NodeId>,
 }
 
 #[cfg(test)]

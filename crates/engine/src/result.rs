@@ -1,5 +1,6 @@
 //! Execution result types.
 
+use crate::ReceiptInfo;
 use hyperscale_types::{Hash, SubstateWrite};
 
 /// Output from executing a batch of transactions.
@@ -63,6 +64,9 @@ pub struct SingleTxResult {
 
     /// Error message if execution failed.
     pub error: Option<String>,
+
+    /// Receipt information (new entity addresses, etc.).
+    pub receipt_info: ReceiptInfo,
 }
 
 impl SingleTxResult {
@@ -71,6 +75,7 @@ impl SingleTxResult {
         tx_hash: Hash,
         outputs_merkle_root: Hash,
         state_writes: Vec<SubstateWrite>,
+        receipt_info: ReceiptInfo,
     ) -> Self {
         Self {
             tx_hash,
@@ -78,17 +83,19 @@ impl SingleTxResult {
             outputs_merkle_root,
             state_writes,
             error: None,
+            receipt_info,
         }
     }
 
     /// Create a failed result.
-    pub fn failure(tx_hash: Hash, error: impl Into<String>) -> Self {
+    pub fn failure(tx_hash: Hash, error: impl Into<String>, receipt_info: ReceiptInfo) -> Self {
         Self {
             tx_hash,
             success: false,
             outputs_merkle_root: Hash::ZERO,
             state_writes: vec![],
             error: Some(error.into()),
+            receipt_info,
         }
     }
 

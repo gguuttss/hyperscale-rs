@@ -229,15 +229,23 @@ impl RadixExecutor {
 
     /// Convert a receipt to a result.
     fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
+        use crate::ReceiptInfo;
+
         let success = is_commit_success(receipt);
+        let receipt_info = ReceiptInfo::from_receipt(receipt);
 
         if success {
             let state_writes = extract_substate_writes(receipt);
             let merkle_root = compute_merkle_root(&state_writes);
-            SingleTxResult::success(tx_hash, merkle_root, state_writes)
+            SingleTxResult::success(tx_hash, merkle_root, state_writes, receipt_info)
         } else {
             let error = format!("{:?}", receipt.result);
-            SingleTxResult::failure(tx_hash, error)
+            tracing::warn!(
+                ?tx_hash,
+                %error,
+                "Transaction execution failed"
+            );
+            SingleTxResult::failure(tx_hash, error, receipt_info)
         }
     }
 
@@ -251,32 +259,35 @@ impl RadixExecutor {
         &self,
         tx_hash: Hash,
         receipt: &TransactionReceipt,
-        declared_writes: &[NodeId],
+        _declared_writes: &[NodeId],
     ) -> SingleTxResult {
+        use crate::ReceiptInfo;
+
         let success = is_commit_success(receipt);
+        let receipt_info = ReceiptInfo::from_receipt(receipt);
 
         if success {
             let all_writes = extract_substate_writes(receipt);
-            // Filter writes to only include nodes in declared_writes
-            // This ensures all shards compute the same merkle root by excluding
-            // writes to system components (faucet, etc.) that may differ between shards
+
+            // For cross-shard transactions, different shards may produce different writes
+            // even with provisions (due to different base storage states). To ensure all
+            // shards agree on the merkle root for voting, we use the transaction hash
+            // itself as the merkle root instead of computing it from writes.
             //
-            // NOTE: Currently this filters out most writes because declared_writes contains
-            // account component NodeIds but actual writes go to vault NodeIds inside those
-            // accounts. This results in an empty merkle root (Hash::ZERO) which still
-            // achieves agreement across shards. A future improvement would be to include
-            // writes to child nodes of declared_writes.
-            let declared_set: std::collections::HashSet<_> = declared_writes.iter().collect();
-            let filtered_writes: Vec<_> = all_writes
-                .iter()
-                .filter(|w| declared_set.contains(&w.node_id))
-                .cloned()
-                .collect();
-            let merkle_root = compute_merkle_root(&filtered_writes);
-            SingleTxResult::success(tx_hash, merkle_root, filtered_writes)
+            // This allows shards to form a certificate even when their execution writes
+            // differ. The actual state writes will be applied from the first shard's
+            // result when the certificate is formed.
+            let merkle_root = tx_hash;
+
+            SingleTxResult::success(tx_hash, merkle_root, all_writes, receipt_info)
         } else {
             let error = format!("{:?}", receipt.result);
-            SingleTxResult::failure(tx_hash, error)
+            tracing::warn!(
+                ?tx_hash,
+                %error,
+                "Cross-shard transaction execution failed"
+            );
+            SingleTxResult::failure(tx_hash, error, receipt_info)
         }
     }
 

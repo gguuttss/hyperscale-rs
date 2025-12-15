@@ -357,6 +357,20 @@ impl MempoolState {
         // has already been executed and its certificate committed.
         if let Some(&cert_height) = self.completed_winners.get(winner_tx_hash) {
             if let Some(entry) = self.pool.get(&tx_hash) {
+                // Check if loser already completed successfully - if so, skip retry
+                match &entry.status {
+                    TransactionStatus::Completed(TransactionDecision::Accept)
+                    | TransactionStatus::Executed(TransactionDecision::Accept) => {
+                        tracing::debug!(
+                            tx_hash = %tx_hash,
+                            winner = %winner_tx_hash,
+                            "Skipping retry for deferral - transaction already completed successfully"
+                        );
+                        return vec![];
+                    }
+                    _ => {} // Transaction not completed yet, proceed with retry
+                }
+
                 // Loser is in pool and winner already completed - create retry immediately
                 tracing::info!(
                     tx_hash = %tx_hash,
@@ -370,6 +384,14 @@ impl MempoolState {
                     *winner_tx_hash,
                     cert_height,
                 );
+            } else if self.is_tombstoned(&tx_hash) {
+                // Loser was evicted from pool (reached terminal state) - don't retry
+                tracing::debug!(
+                    tx_hash = %tx_hash,
+                    winner = %winner_tx_hash,
+                    "Skipping retry for deferral - transaction already tombstoned (reached terminal state)"
+                );
+                return vec![];
             } else {
                 // Loser not in pool yet but winner already completed - store for later retry
                 tracing::debug!(
@@ -470,6 +492,59 @@ impl MempoolState {
         for loser_hash in loser_hashes {
             // First check if the loser is in blocked_by (normal case - tx was in pool when deferred)
             if let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) {
+                // Check if loser already reached a terminal state - if so, skip retry
+                if let Some(entry) = self.pool.get(&loser_hash) {
+                    match &entry.status {
+                        TransactionStatus::Completed(TransactionDecision::Accept)
+                        | TransactionStatus::Executed(TransactionDecision::Accept) => {
+                            tracing::debug!(
+                                original = %loser_hash,
+                                winner = %winner_hash,
+                                "Skipping retry - transaction already completed successfully"
+                            );
+                            continue;
+                        }
+                        _ => {} // Transaction not completed yet, proceed with retry
+                    }
+                } else if self.is_tombstoned(&loser_hash) {
+                    // Transaction was evicted from pool (reached terminal state) - don't retry
+                    tracing::debug!(
+                        original = %loser_hash,
+                        winner = %winner_hash,
+                        "Skipping retry - transaction already tombstoned (reached terminal state)"
+                    );
+                    continue;
+                }
+
+                // Also check if the original transaction (for cross-shard retries) has completed
+                let original_hash = loser_tx.original_hash();
+                if original_hash != loser_hash {
+                    if let Some(entry) = self.pool.get(&original_hash) {
+                        match &entry.status {
+                            TransactionStatus::Completed(TransactionDecision::Accept)
+                            | TransactionStatus::Executed(TransactionDecision::Accept) => {
+                                tracing::debug!(
+                                    loser = %loser_hash,
+                                    original = %original_hash,
+                                    winner = %winner_hash,
+                                    "Skipping retry - original transaction already completed successfully"
+                                );
+                                continue;
+                            }
+                            _ => {} // Original not completed yet, proceed with retry
+                        }
+                    } else if self.is_tombstoned(&original_hash) {
+                        // Original was evicted from pool (reached terminal state) - don't retry
+                        tracing::debug!(
+                            loser = %loser_hash,
+                            original = %original_hash,
+                            winner = %winner_hash,
+                            "Skipping retry - original transaction already tombstoned (reached terminal state)"
+                        );
+                        continue;
+                    }
+                }
+
                 // Create retry transaction
                 let retry_tx = loser_tx.create_retry(winner_hash, height);
                 let retry_hash = retry_tx.hash();
@@ -653,6 +728,60 @@ impl MempoolState {
             let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) else {
                 continue;
             };
+
+            // Check if loser already completed successfully - if so, skip retry
+            if let Some(entry) = self.pool.get(&loser_hash) {
+                match &entry.status {
+                    TransactionStatus::Completed(TransactionDecision::Accept)
+                    | TransactionStatus::Executed(TransactionDecision::Accept) => {
+                        tracing::debug!(
+                            original = %loser_hash,
+                            winner = %winner_hash,
+                            "Skipping retry - transaction already completed successfully"
+                        );
+                        continue;
+                    }
+                    _ => {} // Transaction not completed yet, proceed with retry
+                }
+            } else if self.is_tombstoned(&loser_hash) {
+                // Transaction was evicted from pool (reached terminal state) - don't retry
+                tracing::debug!(
+                    original = %loser_hash,
+                    winner = %winner_hash,
+                    "Skipping retry - transaction already tombstoned (reached terminal state)"
+                );
+                continue;
+            }
+
+            // Also check if the original transaction (for cross-shard retries) has completed
+            let original_hash = loser_tx.original_hash();
+            if original_hash != loser_hash {
+                if let Some(entry) = self.pool.get(&original_hash) {
+                    match &entry.status {
+                        TransactionStatus::Completed(TransactionDecision::Accept)
+                        | TransactionStatus::Executed(TransactionDecision::Accept) => {
+                            tracing::debug!(
+                                loser = %loser_hash,
+                                original = %original_hash,
+                                winner = %winner_hash,
+                                "Skipping retry - original transaction already completed successfully"
+                            );
+                            continue;
+                        }
+                        _ => {} // Original not completed yet, proceed with retry
+                    }
+                } else if self.is_tombstoned(&original_hash) {
+                    // Original was evicted from pool (reached terminal state) - don't retry
+                    tracing::debug!(
+                        loser = %loser_hash,
+                        original = %original_hash,
+                        winner = %winner_hash,
+                        "Skipping retry - original transaction already tombstoned (reached terminal state)"
+                    );
+                    continue;
+                }
+            }
+
             // Create retry transaction
             let retry_tx = loser_tx.create_retry(winner_hash, height);
             let retry_hash = retry_tx.hash();

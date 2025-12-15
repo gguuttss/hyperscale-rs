@@ -93,9 +93,9 @@ impl Default for SimulatorConfig {
 /// Workload configuration.
 #[derive(Clone, Debug)]
 pub struct WorkloadConfig {
-    /// Ratio of transfer transactions (vs other types in future).
-    /// 1.0 = all transfers.
-    pub transfer_ratio: f64,
+    /// Ratio of swap transactions (vs transfers).
+    /// 0.0 = all transfers, 1.0 = all swaps, 0.3 = 30% swaps, 70% transfers.
+    pub swap_ratio: f64,
 
     /// Ratio of cross-shard transactions (vs same-shard).
     /// 1.0 = all cross-shard, 0.0 = all same-shard.
@@ -114,7 +114,7 @@ pub struct WorkloadConfig {
 impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
-            transfer_ratio: 1.0,
+            swap_ratio: 0.0, // Default to transfers only
             cross_shard_ratio: 0.3,
             batch_size: 10,
             batch_interval: Duration::from_millis(500),
@@ -127,9 +127,23 @@ impl WorkloadConfig {
     /// Create a transfer-only workload.
     pub fn transfers_only() -> Self {
         Self {
-            transfer_ratio: 1.0,
+            swap_ratio: 0.0,
             ..Default::default()
         }
+    }
+
+    /// Create a swap-only workload.
+    pub fn swaps_only() -> Self {
+        Self {
+            swap_ratio: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Set the swap ratio (percentage of swap transactions vs transfers).
+    pub fn with_swap_ratio(mut self, ratio: f64) -> Self {
+        self.swap_ratio = ratio.clamp(0.0, 1.0);
+        self
     }
 
     /// Set the cross-shard ratio.

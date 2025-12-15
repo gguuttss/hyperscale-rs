@@ -27,4 +27,4 @@ pub use client::RpcClient;
 pub use config::SpammerConfig;
 pub use latency::{LatencyReport, LatencyTracker};
 pub use runner::{Spammer, SpammerReport, SpammerStats};
-pub use workloads::{TransferWorkload, WorkloadGenerator};
+pub use workloads::{SwapWorkload, TransferWorkload, WorkloadGenerator};

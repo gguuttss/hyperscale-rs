@@ -1336,6 +1336,9 @@ impl ProductionRunner {
                                 state_root: r.outputs_merkle_root,
                                 writes: r.state_writes.clone(),
                                 error: r.error.clone(),
+                                new_packages: r.receipt_info.new_packages.clone(),
+                                new_components: r.receipt_info.new_components.clone(),
+                                new_resources: r.receipt_info.new_resources.clone(),
                             })
                             .collect(),
                         Err(e) => {
@@ -1348,6 +1351,9 @@ impl ProductionRunner {
                                     state_root: hyperscale_types::Hash::ZERO,
                                     writes: vec![],
                                     error: Some(format!("{}", e)),
+                                    new_packages: vec![],
+                                    new_components: vec![],
+                                    new_resources: vec![],
                                 })
                                 .collect()
                         }
@@ -1395,6 +1401,9 @@ impl ProductionRunner {
                                     state_root: r.outputs_merkle_root,
                                     writes: r.state_writes.clone(),
                                     error: r.error.clone(),
+                                    new_packages: r.receipt_info.new_packages.clone(),
+                                    new_components: r.receipt_info.new_components.clone(),
+                                    new_resources: r.receipt_info.new_resources.clone(),
                                 }
                             } else {
                                 hyperscale_types::ExecutionResult {
@@ -1403,6 +1412,9 @@ impl ProductionRunner {
                                     state_root: hyperscale_types::Hash::ZERO,
                                     writes: vec![],
                                     error: Some("No execution result".to_string()),
+                                    new_packages: vec![],
+                                    new_components: vec![],
+                                    new_resources: vec![],
                                 }
                             }
                         }
@@ -1414,6 +1426,9 @@ impl ProductionRunner {
                                 state_root: hyperscale_types::Hash::ZERO,
                                 writes: vec![],
                                 error: Some(format!("{}", e)),
+                                new_packages: vec![],
+                                new_components: vec![],
+                                new_resources: vec![],
                             }
                         }
                     };

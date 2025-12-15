@@ -104,6 +104,10 @@ pub struct ExecutionState {
     /// Maps tx_hash -> StateCertificate
     state_certificates: HashMap<Hash, StateCertificate>,
 
+    /// Execution results for transactions (used to populate state_writes in certificates).
+    /// Maps tx_hash -> ExecutionResult
+    execution_results: HashMap<Hash, ExecutionResult>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 5: Finalization)
     // ═══════════════════════════════════════════════════════════════════════
@@ -159,6 +163,7 @@ impl ExecutionState {
             pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
             state_certificates: HashMap::new(),
+            execution_results: HashMap::new(),
             certificate_trackers: HashMap::new(),
             early_provisions: HashMap::new(),
             early_votes: HashMap::new(),
@@ -424,7 +429,7 @@ impl ExecutionState {
         // Identify all participating shards
         let participating_shards = self.all_shards_for_tx(&tx);
 
-        tracing::debug!(
+        tracing::info!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
             participating = ?participating_shards,
@@ -626,6 +631,14 @@ impl ExecutionState {
 
             // Get state root from execution result (zero if no result)
             let state_root = result.map(|r| r.state_root).unwrap_or(Hash::ZERO);
+
+            // Store execution result for later retrieval when creating state certificate
+            if let Some(result) = result {
+                self.execution_results.insert(tx_hash, (*result).clone());
+
+                // Register newly created entities with the topology for creation-based shard assignment
+                self.register_created_entities(result, local_shard);
+            }
 
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -832,6 +845,12 @@ impl ExecutionState {
             state_root = ?result.state_root,
             "Cross-shard execution complete, creating vote"
         );
+
+        // Store execution result for later retrieval when creating state certificate
+        self.execution_results.insert(tx_hash, result.clone());
+
+        // Register newly created entities with the topology for creation-based shard assignment
+        self.register_created_entities(&result, local_shard);
 
         // Create vote from execution result
         let vote = self.create_vote(tx_hash, result.state_root, result.success);
@@ -1096,11 +1115,18 @@ impl ExecutionState {
 
         let success = votes.first().map(|v| v.success).unwrap_or(false);
 
+        // Retrieve state writes from stored execution results
+        let state_writes = self
+            .execution_results
+            .get(&tx_hash)
+            .map(|result| result.writes.clone())
+            .unwrap_or_default();
+
         StateCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes,
-            state_writes: vec![], // Would be populated from execution
+            state_writes,
             outputs_merkle_root: merkle_root,
             success,
             aggregated_signature,
@@ -1643,6 +1669,22 @@ impl ExecutionState {
 
         actions
     }
+
+    /// Register newly created entities with the topology for creation-based shard assignment.
+    ///
+    /// This ensures that entities created on this shard will be assigned back to this shard
+    /// in future transactions, rather than being randomly hashed to a different shard.
+    fn register_created_entities(&self, result: &ExecutionResult, shard: ShardGroupId) {
+        // Collect all newly created entities
+        let mut all_entities = Vec::new();
+        all_entities.extend(result.new_packages.iter());
+        all_entities.extend(result.new_components.iter());
+        all_entities.extend(result.new_resources.iter());
+
+        if !all_entities.is_empty() {
+            self.topology.register_entities_creation(&all_entities, shard);
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecutionState {
@@ -1658,6 +1700,7 @@ impl std::fmt::Debug for ExecutionState {
             .field("finalized_certificates", &self.finalized_certificates.len())
             .field("provisioning_trackers", &self.provisioning_trackers.len())
             .field("vote_trackers", &self.vote_trackers.len())
+            .field("execution_results", &self.execution_results.len())
             .field("certificate_trackers", &self.certificate_trackers.len())
             .finish()
     }
